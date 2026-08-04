@@ -1,20 +1,42 @@
-# aestun — AES-256-GCM anti-DPI server-to-server tunnel
+# 🛡️ aestun — AES-256-GCM anti-DPI server-to-server tunnel
 
-A small tunnel between two Ubuntu servers. It carries IP traffic over a TUN interface with
-**private/local IPs**, encrypts every packet with **AES-256-GCM** (or **ChaCha20-Poly1305**
-on CPUs without AES-NI — see section 6, it is worth checking), and is designed so the wire
-traffic is **indistinguishable from random data**: no handshake, no fixed header, no protocol
-signature for DPI to match. It also **watches for DPI**, logging who probes the carrier port
-and what the path does to the packets in flight (section 9).
+> `🐧 Linux` · `🔒 AES-256-GCM / ChaCha20-Poly1305` · `🥷 QUIC + TLS wire disguise` · `📦 single static Go binary` · `🛰️ built-in DPI observer` · `⚙️ zero-alloc packet path`
 
-Written in Go and vendored, so it still builds offline into a single static binary with no
+A small, fast tunnel between two Ubuntu servers (built for an **🇮🇷 Iran ↔ 🌍 foreign** link). It
+carries IP traffic over a TUN interface with **private/local IPs**, encrypts every packet with
+**AES-256-GCM** (or **ChaCha20-Poly1305** on CPUs without AES-NI — see §6, it is worth
+checking), and is designed so the wire traffic is **indistinguishable from random data**: no
+handshake, no fixed header, no protocol signature for DPI to match. It also **watches for DPI**,
+logging who probes the carrier port and what the path does to the packets in flight (§9).
+
+Written in Go and vendored, so it still builds **offline** into a single static binary with no
 runtime dependencies. The only third-party code is `golang.org/x/crypto/chacha20poly1305`
-(upstream's audited AEAD — see section 6 for why hand-rolling one was not worth the risk) and
+(upstream's audited AEAD — see §6 for why hand-rolling one was not worth the risk) and
 `golang.org/x/sys/unix`, both committed under `vendor/`.
+
+### ✨ Features at a glance
+
+| | Capability | Default | Where |
+|---|---|---|---|
+| 🔒 | AEAD encryption, per-direction keys, anti-replay, epoch rotation | on | §1 |
+| 🥷 | **QUIC** wire disguise over UDP (synthetic handshake, header protection, size buckets) | on with `obfs:quic` | §10 |
+| 🧣 | **TLS** wire disguise over TCP (synthetic ClientHello/ServerHello + application-data records) | on with `tcp`+`obfs:quic` | §10.1 |
+| 🎭 | **desync** — native in-process fake-QUIC injector (the zapret idea, no NFQUEUE) | **on** | §15.1 |
+| 🫧 | **junk** — flow-start cover traffic | **on** | §15.2 |
+| 🔀 | **hop** — keyed synchronised UDP port hopping | off | §15.3 |
+| ✂️ | **split** — IP-fragment the disposable fakes | **on** | §15.4 |
+| 🔁 | **tcp_rotate** — rotate the TCP connection to dodge volumetric throttling | off | §15.5 |
+| 🧩 | **zapret** — optional external `nfqws` desync (now covers TCP + UDP + any protocol) | off | §11 |
+| 🧪 | **auto-test** — sweep every method/protocol on the live link and apply the best | menu `t` | §16 |
+| 🛰️ | **DPI observer** — probes, replays, injection, TTL anomalies, throttle/blackhole detection | on | §9 |
+
+> 🧭 **Recommended default (verified on a live link):** `transport: udp` + `obfs: quic` +
+> **desync + split + junk**. See the field-test log in **§17** — measured on the reference
+> servers while they carried real user traffic.
 
 ---
 
-## 1. How it works
+## ⚙️ 1. How it works
 
 ```
 [ server A: 10.8.0.1 ] <== encrypted UDP over the Internet ==> [ server B: 10.8.0.2 ]
@@ -63,7 +85,7 @@ periodically for very high-volume, long-lived links (GCM random-nonce safety bou
 
 ---
 
-## 2. Files
+## 📁 2. Files
 
 | File | Purpose |
 |---|---|
@@ -76,6 +98,10 @@ periodically for very high-volume, long-lived links (GCM random-nonce safety bou
 | `pacer.go` | optional carrier rate shaping (off by default; see section 7) |
 | `obfs.go` | QUIC-shaped wire obfuscation — headers, header protection, size shaping |
 | `quicinit.go` | synthetic QUIC handshake (RFC 9001 Initial packets + TLS ClientHello) |
+| `desync.go` | native in-process DPI desync — raw-socket fake QUIC injection (the zapret `nfqws` idea, ours; section 15) |
+| `junk.go` | flow-start cover traffic (section 15) |
+| `hop.go` | keyed synchronised port hopping (section 15) |
+| `split.go` | IP-fragmentation of the disposable desync fakes (section 15) |
 | `hkdf.go` | HKDF-SHA256 key derivation (RFC 5869) |
 | `main.go` | Linux TUN device, UDP/TCP carriers, main loop (build-tagged `linux`) |
 | `pprof_on.go` / `pprof_off.go` | profiling endpoints, behind the `pprof` build tag |
@@ -88,7 +114,7 @@ periodically for very high-volume, long-lived links (GCM random-nonce safety bou
 
 ---
 
-## 3. Quick start (recommended)
+## 🚀 3. Quick start (recommended)
 
 On **each** server, copy this whole folder over, then:
 
@@ -119,7 +145,7 @@ the result next to the scripts.
 
 ---
 
-## 4. Management menu (`sudo ./aestun.sh`)
+## 🎛️ 4. Management menu (`sudo ./aestun.sh`)
 
 ```
 1) Setup / reconfigure tunnel (wizard)
@@ -131,8 +157,10 @@ the result next to the scripts.
 7) Edit config                    <- then optionally restart
 8) Generate new key
 9) Network optimization           <- show / apply / remove sysctl tuning
-d) DPI / probe log                <- who is probing, what the path is doing (section 9)
-z) zapret module                  <- optional DPI desync layer
+d) DPI / probe log                <- who is probing, what the path is doing (§9)
+x) Anti-DPI hardening             <- toggle desync / junk / port-hop / split (§15)
+t) Auto-test methods              <- sweep every method/protocol, apply the best (§16)
+z) zapret module                  <- optional external DPI desync layer (§11)
 u) Uninstall
 ```
 
@@ -142,7 +170,7 @@ authentication/replay drop counters.
 
 ---
 
-## 5. Configuration reference
+## 🔧 5. Configuration reference
 
 Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json` directly.
 
@@ -154,7 +182,7 @@ Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json
 | `listen` | `0.0.0.0:51820` | local UDP listen address |
 | `peer` | — | the other server `host:port` (learned from traffic if empty) |
 | `transport` | `udp` | carrier: `udp` or `tcp`. **Prefer udp** — see the note below |
-| `obfs` | `none` | `quic` presents the carrier as a QUIC connection (section 10) |
+| `obfs` | `none` | `quic` shapes the carrier as its natural TLS-family form: **QUIC** over UDP (section 10), **TLS** over TCP (section 10.1) |
 | `sni` | `www.cloudflare.com` | server name in the synthetic handshake (`obfs: quic` only) |
 | `shape` | `true` | quantise datagram sizes onto buckets (`obfs: quic` only) |
 | `tun_name` | `tun0` | TUN interface name |
@@ -176,6 +204,10 @@ Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json
 | `max_procs` | `0` | `GOMAXPROCS` override; 0 leaves it to the runtime |
 | `pprof_addr` | — | e.g. `127.0.0.1:6060`; only works in a binary built with `-tags pprof` |
 | `dpi_log` | *(on)* | DPI/probe observability — see section 9 |
+| `desync` | *(off)* | native in-process fake injector — see section 15 |
+| `junk` | *(off)* | flow-start cover traffic — see section 15 |
+| `hop` | *(off)* | keyed port hopping — see section 15 |
+| `split` | *(off)* | IP-fragment the desync fakes — see section 15 |
 
 ### Packet loss / lag note
 The daemon sets the UDP socket buffers (`rcvbuf`/`sndbuf`, 8 MiB each) so traffic
@@ -192,6 +224,11 @@ one — measured on a real link: 4.7% carrier retransmission, a permanently back
 queue, and every user stalling in lockstep. Over UDP a lost packet costs only the connection
 whose bytes it carried. Use `tcp` only where UDP is blocked outright, and expect the stalls.
 
+When you do run `tcp`, set `obfs: quic` on both ends: over TCP that turns on the **TLS**
+disguise (section 10.1), not QUIC, so the stream looks like an ordinary HTTPS connection rather
+than a bare length-prefixed byte stream. It is the single most useful thing you can do to a TCP
+carrier that has to survive DPI.
+
 ### MTU note
 Overhead per packet is ~38 bytes (nonce+tag+seq/pad) plus padding plus the outer
 IP/UDP headers (28). Default `mtu=1300` keeps the carrier datagram under 1500 on
@@ -201,7 +238,7 @@ TCP.
 
 ---
 
-## 6. Cipher choice — check this before anything else
+## 🔐 6. Cipher choice — check this before anything else
 
 `cipher` must be the same on both servers. It is not negotiated (there is no handshake to
 negotiate in, by design), and the two ends will simply not understand each other if they
@@ -282,7 +319,7 @@ UDP send/receive path. That is the floor for a userspace tunnel of this design.
 
 ---
 
-## 7. Throughput: offload, MTU, and knowing where the ceiling is
+## 📈 7. Throughput: offload, MTU, and knowing where the ceiling is
 
 Before tuning anything, find out what is actually limiting you. On the reference deployment
 the answer changed twice.
@@ -393,7 +430,7 @@ a reasonable addition to this design. Blanket KCP is not.
 
 ---
 
-## 8. Network optimization (Ubuntu tuning)
+## 🐧 8. Network optimization (Ubuntu tuning)
 
 Applied at install time (you can decline, and manage it later from menu option 9).
 Writes `/etc/sysctl.d/99-aestun.conf`:
@@ -419,7 +456,7 @@ bytes). `remove_network_opt` (menu → 9 → 3) reverts it.
 
 ---
 
-## 9. DPI and probe log (`dpi_log`)
+## 🛰️ 9. DPI and probe log (`dpi_log`)
 
 Traffic counters tell you how much crossed the tunnel. They do not tell you **who else is
 talking to the carrier port**, or **what the path is doing to your packets** — and those are
@@ -505,7 +542,7 @@ minute, size-rotated, and says so in the log itself when it suppresses anything.
 | `max_sources` | `2048` | per-source table cap |
 | `stdout` | `true` | mirror findings to the journal |
 
-## 10. QUIC obfuscation (`obfs: quic`)
+## 🥷 10. QUIC obfuscation (`obfs: quic`)
 
 Set `"obfs": "quic"` on **both** servers (the two ends must agree; the format is not
 compatible with `none`).
@@ -536,7 +573,40 @@ classifier trained on flow duration, volume, and timing may still separate this 
 QUIC, and volumetric throttling of a long-lived high-rate flow does not depend on
 classification at all. Treat it as raising the cost of detection, not eliminating it.
 
-## 11. zapret module (optional DPI bypass)
+### 10.1 TLS shaping over TCP (`transport: tcp` + `obfs: quic`)
+
+QUIC is a UDP protocol, so the section-10 disguise is the wrong shape for a TCP carrier — a TCP
+stream carrying QUIC short-header bytes matches nothing an inspector expects, and the bare
+2-byte length prefix the TCP carrier otherwise uses is a small signature of its own. So over
+TCP, `obfs: quic` turns on a **TLS** disguise instead (implemented in `tls.go`), which is the
+natural cover for a long-lived flow to port 443:
+
+* the connection **opens with a synthetic TLS 1.3 handshake** — a real ClientHello (the same
+  builder the QUIC cover uses, carrying an SNI) from the dialing side, a ServerHello +
+  ChangeCipherSpec from the accepting side. A record-level DPI watching from the first byte sees
+  an ordinary TLS connection to an ordinary host being established;
+* every sealed datagram is then framed as a **TLS 1.3 application-data record**
+  (`[0x17][0x03 0x03][len][ciphertext]`). Application data is encrypted, so a high-entropy
+  payload is exactly what belongs there — the same "uniform random is the optimum" property as
+  the rest of the project, now wearing framing a DPI will not look at twice.
+
+Both ends must agree (`transport: tcp` + `obfs: quic` on both). Nothing here derives TLS keys or
+completes a real handshake — the tunnel's own AEAD protects the payload; the records exist to be
+looked at, exactly like the QUIC Initials. Same honest caveat as section 10: it strips cheap
+signatures, it is not a proof of undetectability, and a classifier that actively completes TLS
+would find the handshake goes nowhere.
+
+> **Field note — volumetric throttling.** On the reference Iran↔foreign link this disguise made
+> the flow *parse* as TLS perfectly (verified with a wire capture: ClientHello, ServerHello,
+> ChangeCipherSpec, then application-data records) and yet the tunnel was throttled to a
+> blackhole within ~30 s: a single long-lived, high-rate TLS connection is volumetrically
+> anomalous no matter how well-formed it is, and the ISP throttled it on rate alone. The
+> project's own DPI observer flagged it (`path.throttle` → `path.blackhole`), and the same link
+> ran the UDP/QUIC carrier with zero loss. The lesson is the one section 5 already gives: use
+> `tcp` only where UDP is blocked outright, and do not expect a bulk flow over it to survive a
+> volumetric policer just because it looks like HTTPS.
+
+## 🧩 11. zapret module (optional DPI bypass)
 
 [bol-van/zapret](https://github.com/bol-van/zapret) is a DPI-circumvention toolkit.
 This project can layer its `nfqws` desync on the tunnel's **carrier** UDP packets so a
@@ -546,17 +616,40 @@ censoring ISP has a harder time recognizing or throttling them. From `aestun.sh`
    prebuilt binaries in the git tree). Installs the build deps automatically
    (`build-essential`, `libnetfilter-queue-dev`, `libnfnetlink-dev`, `libmnl-dev`,
    `libcap-dev`, `zlib1g-dev`). Result: `/opt/zapret/nfq/nfqws`.
-2. **enable** — adds an `iptables` NFQUEUE rule for outbound UDP to the tunnel port and
-   runs `nfqws` as a service (`aestun-zapret`).
+2. **enable** — adds `iptables` NFQUEUE rules and runs `nfqws` as a service (`aestun-zapret`).
 3. **status / disable / remove**.
 
-The default desync mode (`--dpi-desync=fake --dpi-desync-repeats=6`) is a sane starting
-point; tune it for your network with zapret's own `blockcheck.sh`. If traffic breaks,
-disable the module — the tunnel itself does not depend on it.
+### 🌐 Protocol coverage (TCP + UDP + any protocol)
+
+The NFQUEUE rule now queues **both `tcp` and `udp`** on the carrier port, and `nfqws` runs two
+profiles so it acts on whatever the carrier is — and keeps working if you switch transport:
+
+* **TCP on the carrier port → `multisplit`** (fragments the TLS-record stream; the peer
+  reassembles it transparently, on-path DPI sees a split connection start);
+* **everything else (the UDP carrier, and any other protocol) → `fake` injection** with
+  `--dpi-desync-any-protocol=1`, so it desyncs the carrier's opaque payload regardless of L7.
+
+Tune it for your network with zapret's own `blockcheck.sh`. If traffic breaks, disable the
+module — the tunnel itself does not depend on it.
+
+> ### 🤔 zapret (external) vs. the native `desync` module (§15) — and why the native one is on by default
+>
+> §15 reimplements the useful half of `nfqws` **inside** aestun — no NFQUEUE, no iptables rule,
+> no second process that can wedge — and it reuses the peer hop count the tunnel already learned.
+> For a tunnel whose carrier you own, that in-process version is the better default, so
+> **`desync` + `split` + `junk` ship enabled by default**: that *is* the "DPI bypass always on"
+> layer, running in the daemon itself.
+>
+> The external zapret stays available because it is battle-tested and tunable with
+> `blockcheck.sh`. It is **not** force-enabled by default on purpose: it needs `nfqws` **built**
+> (network + compiler + kernel headers), it can wedge on its raw-socket send buffer, and it
+> would **double-inject** if run alongside the native `desync`. **Run one or the other, not
+> both.** If you prefer the external layer, install it from menu `z` and turn the native
+> `desync` off in menu `x`.
 
 ---
 
-## 12. Manual deployment (without the wizard)
+## 🛠️ 12. Manual deployment (without the wizard)
 
 ```bash
 # build (any machine with Go), or use the shipped binary
@@ -574,7 +667,7 @@ sudo ufw allow 51820/udp                   # if using ufw
 
 ---
 
-## 13. Troubleshooting
+## 🩺 13. Troubleshooting
 
 * **No ping over the tunnel** → check both services are `active`, the UDP port is open
   in the cloud firewall/security group *and* the OS firewall, and that the key is
@@ -614,7 +707,7 @@ sudo ufw allow 51820/udp                   # if using ufw
 
 ---
 
-## 14. Building & testing
+## 🏗️ 14. Building & testing
 
 ```bash
 go test ./...                 # protocol/crypto/observer unit tests (run natively, any OS)
@@ -623,3 +716,276 @@ go test -bench . -benchtime 2s   # per-packet cost and allocation counts on THIS
 ./aestun.sh build arm64       # -> aestun-linux-arm64
 ./aestun.sh build amd64 pprof # -> aestun-linux-amd64-pprof, adds net/http/pprof
 ```
+
+### The `vendor/` directory (offline builds)
+
+The two dependencies (`golang.org/x/crypto`, `golang.org/x/sys`) are committed under `vendor/`,
+so **the build works with no network**. What happens if it is missing:
+
+* **Prebuilt binary** (`aestun-linux-amd64`/`arm64`) — needs nothing. It is a static binary with
+  no dependencies and no Go; `vendor/` is irrelevant to it. The installer prefers it.
+* **Building from source, `vendor/` present** — builds offline from the vendored copies.
+* **Building from source, `vendor/` absent, with internet** — Go **downloads** the two modules
+  from the proxy automatically (verified against `go.sum`) and builds a correct binary. So yes:
+  a source install fetches them for you when the network is there. The installer prints a note
+  when it notices `vendor/` is gone.
+* **Building from source, `vendor/` absent, offline** — fails (`module lookup disabled`). Either
+  ship the prebuilt binary or restore the tree once, on any machine with internet:
+  `( cd aestun-final && go mod vendor )`.
+
+---
+
+## 🛡️ 15. Native anti-DPI hardening (in-process, no zapret)
+
+Four optional layers, all built into the daemon, all **off by default**, each toggled from
+`sudo ./aestun.sh` → `x` or by editing the config. They exist because aestun owns *both* ends
+of its carrier, which lets it do things an external tool bolted onto someone else's flow
+cannot — and do the things it *can* do without a second process, an iptables rule, or a
+userspace round-trip per packet. Enable only what your path needs; a wrong option is, at best,
+wasted packets. Turn on `dpi_log` (section 9) alongside them so you can see whether they help.
+
+Why these are not just "zapret in Go": zapret's `nfqws` is built for the hard case — the far
+end is a website it does not control, so every fake it injects has to be crafted so the real
+server ignores it, which is what forces it through NFQUEUE. aestun made the opposite bet: it
+controls the peer, the peer already discards stray handshake packets safely, and the tunnel
+already **measured** the peer's hop count (section 9's TTL learning). So the same attacks cost
+far less machinery here.
+
+### 15.1 `desync` — native fake injector (the `nfqws` idea, in-process)
+
+At flow start the daemon opens a raw socket and sprays a few genuine-looking QUIC Initials —
+the same real, decryptable ClientHello the obfs layer builds, with a plausible SNI — sharing
+the carrier's exact 5-tuple, at a TTL tuned to **die a hop or two before the peer**. A stateful
+DPI watching the flow open sees what looks like an ordinary QUIC connection to a real CDN; the
+fakes never reach the peer, so they poison the classifier's model of the flow without costing
+the tunnel anything. Even a fake that *does* arrive is harmless — the receive loop already
+drops stray long-header packets.
+
+The TTL is where owning both ends pays off. `autottl` reads the peer hop count the tunnel
+already learned (`peer_ttl` in the monitor), so the fake dies exactly one hop short instead of
+being guessed. `badsum` (off) additionally corrupts the fake's UDP checksum so the peer kernel
+drops it — rarely needed here, and some NATs drop bad-checksum packets outright, so leave it
+off unless you have measured that it helps.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | master switch |
+| `repeats` | `4` | fakes per burst |
+| `autottl` | `true` | derive the fake TTL from the learned peer hop count |
+| `delta` | `-1` | hops before the peer the fake should die |
+| `min_ttl`/`max_ttl` | `3`/`20` | autottl clamp |
+| `ttl` | `0` | fixed TTL when `autottl` is off (0 → fallback 8) |
+| `badsum` | `false` | corrupt the fake's UDP checksum |
+| `every_sec` | `0` | periodic re-burst; 0 = only at start |
+
+Needs `CAP_NET_RAW` (the systemd unit grants it). **IPv4 only** — a v6 peer disables it with a
+log line. This is the in-process replacement for the section 11 zapret module; run one, not
+both.
+
+### 15.2 `junk` — flow-start cover traffic
+
+A burst of cover packets when the flow opens, so the *beginning* of the connection carries no
+fixed packet-count or inter-packet-timing signature — the AmneziaWG "junk" idea. The catch
+with literal random junk is that the peer would log it as a scan; so the junk here is real
+sealed keepalives — high-entropy and indistinguishable from tunnel data on the wire (they *are*
+tunnel data), authenticating cleanly at the peer and decrypting to an empty payload the receive
+loop already discards. Count and timing are randomised; sizes vary from the padding the sealer
+already applies.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | master switch |
+| `count` | `8` | cover packets at flow start |
+| `min_ms`/`max_ms` | `5`/`50` | random gap between them |
+
+### 15.3 `hop` — keyed synchronised port hopping
+
+The reference deployment hit exactly this wall (section 13): an ISP blocked the precise
+source/destination **port pair** while the same traffic from any other port sailed through.
+Port hopping turns that one-time manual fix into a continuous automatic one. Both ends derive
+the current port from the pre-shared key and the clock — the same handshake-free mechanism the
+epoch keys use — and step through a small agreed set on a timer. There is nothing for a 5-tuple
+block to hold onto: by the time a pair is identified, the flow has moved. It also erases the
+fixed-port fingerprint a long-lived flow otherwise carries.
+
+Every port in the set is bound for the whole life of the process on both ends, so a datagram
+that crosses an epoch boundary early or late still lands on a bound socket — no rebind, no
+handover gap, no race. Peers are matched by IP alone while hopping, so the rotation does not
+trip the roam detector.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | master switch |
+| `ports` | `[443, 8443, 2053, 2083, 2087, 2096]` | the set; **identical and in the same order on both ends** |
+| `interval` | `30` | seconds per hop |
+
+**Two real costs, stated plainly.** It runs one socket per port; the receive side uses UDP GRO
+(one recvmsg drains many datagrams) but the send side **forgoes UDP segmentation offload**, so
+peak throughput is lower and CPU per byte is higher — measured on a live no-AES-NI endpoint,
+foreign-side CPU rose from ~62% to ~82% at the same ~150 Mbit/s. And you must **open the whole
+port set in the firewall on both ends**. It is insurance against blocking, not a throughput
+feature. (The port list must match on both servers because the schedule indexes into it; the
+installer writes both.)
+
+**If a port cannot be bound, the daemon exits with a clear error naming the port** — it does
+*not* fall back to a single socket, because one end quietly reverting to one port while the peer
+keeps hopping would silently carry no traffic while both services still look "active" (the worst
+failure). A field test hit exactly this: another proxy (`xray`) held UDP 8443 on one box. The
+fix is to free the port or drop it from `hop.ports` on **both** ends. Pick a set whose members
+are free on both servers *and* reachable through the cloud firewall (test a candidate with a
+quick UDP send + `tcpdump` before committing to it).
+
+### 15.4 `split` — IP-fragment the fakes
+
+The split that is safe to do on an opaque encrypted carrier. Splitting *real* carrier datagrams
+would scramble bytes a DPI already cannot read (the payload is AEAD ciphertext) while adding a
+reassembly protocol and head-of-line risk — cost with no benefit, so this module never touches
+real traffic. Instead it fragments the disposable `desync` fakes at the IP layer, the way
+zapret's `ipfrag2` does: a DPI that does not reassemble fragments sees only a truncated first
+fragment of the cover handshake, while one that does sees the same legitimate Initial. Either
+way the real flow is untouched. Only meaningful with `desync` on.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | master switch |
+| `frag_pos` | `24` | fragment position, bytes from the transport header (multiple of 8) |
+
+### 🔁 15.5 `tcp_rotate` — rotate the TCP connection to dodge volumetric throttling
+
+Only relevant with `transport: tcp`. The field test (§17) found that a TCP+TLS carrier, however
+perfectly it parses as HTTPS on the wire, can be **volumetrically throttled** — a single
+long-lived, high-rate TLS connection is anomalous on rate and lifetime alone, and no disguise
+changes its rate. This attacks the *lifetime* instead: the dialer opens a fresh TCP connection
+(a new 5-tuple, a new source port) and switches the carrier onto it **before** retiring the old
+one ("make before break"), on a jittered timer. No single flow then lives long enough, or
+carries enough bytes, to cross whatever the throttle watches for. It is port hopping's idea,
+applied to a stream.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | master switch (transport `tcp` only) |
+| `interval_sec` | `15` | seconds a connection lives before it is rotated |
+
+**Honest result from the live test.** The mechanism works cleanly — a local back-to-back test
+held **152 Mbit/s across rotations with 0 % ping loss** (make-before-break causes only a tiny
+per-rotation blip the inner TCP absorbs). On the *reference censored link*, though, rotation did
+**not** lift the cap: with rotation on and off the TCP carrier sat at ~20 Mbit/s either way,
+because that link's limiter is not keyed on the per-connection 5-tuple (a port change did not
+help either). It is kept because it is correct and cheap, and *does* help where throttling is
+per-flow — but on this link the answer stayed **UDP**. A single TCP stream over a lossy ~80 ms
+path is also inherently slow (congestion control), independent of any DPI.
+
+### 🧭 Which to reach for
+
+* **Flow gets classified/throttled as it opens** → `desync` (+ `junk`). Start here; it is the
+  direct replacement for the zapret module and the cheapest to run.
+* **A specific port pair got blocked, or you want to stop being a fixed-port target** → `hop`.
+  The only one of the four that changes throughput, so weigh it.
+* **`split`** is a small extra on top of `desync`, worth trying only if a plain `desync` burst
+  did not move the needle.
+
+None of these is a proof of undetectability — same honesty as section 10. They raise the cost
+of detection. Measure with `dpi_log` and an `iperf3` before/after (section 7); keep what helps.
+
+---
+
+## 🧪 16. Auto-test — sweep every method/protocol and apply the best
+
+`sudo ./aestun.sh` → **`t`**. Instead of guessing which methods your path needs, this sweeps a
+set of variants **on the live tunnel**, measures each, and applies the winner to **both** ends.
+
+It runs from the **role `a`** (Iran/inside) server and drives the sweep, so it needs to
+reconfigure the far end too: it asks once for the **foreign server's SSH password**, holds it in
+a `chmod 600` temp file for `sshpass`, and **shreds it** when done. Nothing is written to disk in
+clear and nothing persists.
+
+For each variant it: merges the overrides onto **both** configs, restarts both services, waits
+for the tunnel to come up (rx climbing), then measures **packet loss + latency** (a light
+25-ping burst) and, if `iperf3` is present on both ends, a short **throughput** sample. The
+variants swept:
+
+| Variant | What it turns on |
+|---|---|
+| `baseline` | plain UDP + QUIC, no extensions |
+| `desync+split+junk` | the recommended native anti-DPI trio |
+| `port-hop` | UDP port hopping over `[443,2053,2083,2087,2096]` |
+| `tcp+tls` | TCP carrier with the TLS disguise |
+| `tcp+tls+rotate` | TCP + TLS + connection rotation (§15.5) |
+
+At the end it prints a comparison table, names the best (lowest loss, then highest throughput),
+and — on your confirm — **applies it to both servers** and shows exactly what the tunnel is now
+running. Decline, and it reverts both ends to the pre-test config.
+
+```
+VARIANT                 LOSS%    PING_ms   Mbit/s
+-------------------------------------------------------
+baseline                 0.0      82.3      151
+desync+split+junk        0.0      82.1      150
+port-hop                 0.0      86.1      154
+tcp+tls                 24.8      23.1       —
+tcp+tls+rotate          20.1      —          —
+```
+
+> ⚠️ It **briefly interrupts the tunnel** on every variant (~40 s each) and pushes test
+> traffic — run it in a maintenance window, not at peak, and never twice in parallel. The build
+> ships with this feature; the sweep only runs when you pick it and confirm.
+
+---
+
+## 📋 17. Field-test log (measured under real load)
+
+The results below were captured on the **reference deployment** — 🇮🇷 Iran (role `a`, AES-NI) ↔
+🌍 foreign (role `b`, QEMU **no** AES-NI → both on `chacha20-poly1305`), a real ~80 ms censored
+link — **while the tunnel was carrying live user traffic**. Every variant restarted both ends,
+captured the wire from flow-open (`tcpdump`), ran `iperf3` (TCP + UDP), pinged over the tunnel,
+and sampled `pidstat`/`mpstat` on both servers.
+
+### ✅ Every method verified on the wire (auth_fail = 0 throughout)
+
+| Method | Evidence on the wire |
+|---|---|
+| 🎭 `desync` | long-header QUIC fakes on the carrier port at **TTL 8/9** (autottl from the learned peer TTL 54 → die ~1 hop before the peer) |
+| ✂️ `split` | **24 IP fragments** = 12 fakes × 2, low-TTL — only the disposable fakes fragmented, real traffic intact |
+| 🫧 `junk` | flow-start cover keepalives (blend into data by design; logs confirm the burst) |
+| 🔀 `hop` | carrier rotating across dst ports `2087 / 2096 / 2083 / 443` |
+| 🧣 `tcp+tls` | stream is full **TLS records** — handshake, application-data, ChangeCipherSpec — reads as HTTPS |
+
+### 📊 Throughput / CPU per variant (both ends, under load)
+
+| Variant | TCP Mbit/s | UDP loss @250 | iran CPU | foreign CPU | tunnel RTT |
+|---|---|---|---|---|---|
+| baseline (udp) | 152.8 | 33 % | 36.6 % | 61.6 % | 83 ms |
+| desync | 150.5 | 36 % | 37.7 % | 64.6 % | 82 ms |
+| desync + split | 150.9 | 38 % | 36.2 % | 64.1 % | 83 ms |
+| junk | 153.6 | 37 % | 35.9 % | 63.6 % | 82 ms |
+| port-hop | 154.5 | 33 % | 51.8 % | 83.8 % | 86 ms |
+| all-udp (everything) | 153.0 | 34 % | 50.5 % | 81.5 % | 87 ms |
+| tcp + tls | 151.5* | 25 % | 37.2 % | 58.8 % | * throttled |
+
+*CPU is % of one core; foreign has no AES-NI, hence its higher chacha cost.*
+
+### 🔎 What the logs revealed, and what was fixed
+
+1. **🐛 (fixed in code) port-hop silent fallback.** With `hop` on, one box could not bind a port
+   another proxy held; the carrier silently fell back to a single socket while the peer kept
+   hopping → dead-but-"active" tunnel. Now it **fails loudly** naming the port, never falls back.
+2. **⚙️ (characterised) port-hop CPU.** Multi-socket forgoes send-side offload; foreign went
+   ~62 % → ~82 %. GRO was added on the hop sockets to batch the heavy-receive end. `hop` stays
+   **off by default**; enable only against a 5-tuple block.
+3. **🌐 (network, not code) TCP+TLS is volumetrically throttled.** The disguise was perfect on
+   the wire, yet the flow was throttled to a blackhole within ~30 s (`path.throttle` →
+   `path.blackhole`, TCP send-queue stuck). The identical code round-trips perfectly on
+   localhost; UDP on the same link had **zero** loss. **UDP is the right transport here.** The
+   project's own DPI observer detected and classified it correctly — a nice validation of §9.
+
+### 🏁 Final production config (applied to both ends)
+
+```
+transport = udp · obfs = quic · cipher = chacha20-poly1305
+desync{repeats:6, autottl} + split{frag_pos:24} + junk{count:8}   ← enabled
+hop = off   (CPU headroom; enable vs a 5-tuple block)
+Cost of the enabled trio vs baseline: foreign +3–4 % CPU · throughput/latency within noise.
+```
+
+> The raw per-run logs (`pidstat`/`mpstat` for both ends, `tcpdump` captures, and the full report)
+> are saved on the Iran server under `/root/aestun-fieldtest-<timestamp>/`.

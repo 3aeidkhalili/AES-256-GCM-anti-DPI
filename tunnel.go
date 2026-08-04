@@ -80,7 +80,154 @@ type Config struct {
 
 	// --- observability ---
 	DPILog DPILogConfig `json:"dpi_log"`
+
+	// --- anti-DPI extensions (all off by default; see desync.go/junk.go/hop.go/split.go) ---
+	Desync    DesyncConfig    `json:"desync"`     // native in-process fake injector (zapret nfqws, but ours)
+	Junk      JunkConfig      `json:"junk"`       // flow-start cover traffic
+	Hop       HopConfig       `json:"hop"`        // keyed synchronised port hopping
+	Split     SplitConfig     `json:"split"`      // IP-fragment the disposable desync fakes
+	TCPRotate TCPRotateConfig `json:"tcp_rotate"` // rotate the TCP carrier connection to dodge volumetric throttling
 }
+
+// ---------------------------------------------------------------------------
+// anti-DPI extension config. The runtime for each lives in its own file; the types and their
+// defaults live here, next to Config, so the OS-independent core never depends on the
+// Linux-only files that implement them.
+// ---------------------------------------------------------------------------
+
+// DesyncConfig configures the native fake injector (desync.go).
+type DesyncConfig struct {
+	Enabled  *bool  `json:"enabled"`   // master switch; default false
+	Repeats  int    `json:"repeats"`   // fakes per burst; default 4
+	TTL      int    `json:"ttl"`       // fixed TTL for fakes; 0 = use autottl
+	AutoTTL  *bool  `json:"autottl"`   // derive TTL from the learned peer hop count; default true
+	Delta    int    `json:"delta"`     // autottl delta added to the hop count; default -1 (die one hop early)
+	MinTTL   int    `json:"min_ttl"`   // autottl clamp floor; default 3
+	MaxTTL   int    `json:"max_ttl"`   // autottl clamp ceiling; default 20
+	Badsum   *bool  `json:"badsum"`    // corrupt the fake's UDP checksum; default false
+	SNI      string `json:"sni"`       // server name inside the fake Initials; default = top-level sni
+	EverySec int    `json:"every_sec"` // periodic re-burst interval; 0 = only at start
+}
+
+func (c *DesyncConfig) applyDefaults() {
+	if c.Enabled == nil {
+		v := false
+		c.Enabled = &v
+	}
+	if c.Repeats == 0 {
+		c.Repeats = 4
+	}
+	if c.AutoTTL == nil {
+		v := true
+		c.AutoTTL = &v
+	}
+	if c.Delta == 0 {
+		c.Delta = -1
+	}
+	if c.MinTTL == 0 {
+		c.MinTTL = 3
+	}
+	if c.MaxTTL == 0 {
+		c.MaxTTL = 20
+	}
+	if c.Badsum == nil {
+		v := false
+		c.Badsum = &v
+	}
+}
+
+func (c *DesyncConfig) on() bool { return c != nil && c.Enabled != nil && *c.Enabled }
+
+// JunkConfig configures flow-start cover traffic (junk.go).
+type JunkConfig struct {
+	Enabled *bool `json:"enabled"` // master switch; default false
+	Count   int   `json:"count"`   // cover packets at flow start; default 8
+	MinMs   int   `json:"min_ms"`  // minimum gap between cover packets; default 5
+	MaxMs   int   `json:"max_ms"`  // maximum gap between cover packets; default 50
+}
+
+func (c *JunkConfig) applyDefaults() {
+	if c.Enabled == nil {
+		v := false
+		c.Enabled = &v
+	}
+	if c.Count == 0 {
+		c.Count = 8
+	}
+	if c.MinMs == 0 {
+		c.MinMs = 5
+	}
+	if c.MaxMs == 0 {
+		c.MaxMs = 50
+	}
+}
+
+func (c *JunkConfig) on() bool { return c != nil && c.Enabled != nil && *c.Enabled }
+
+// HopConfig configures keyed port hopping (hop.go).
+type HopConfig struct {
+	Enabled  *bool  `json:"enabled"`  // master switch; default false
+	Ports    []int  `json:"ports"`    // the port set, identical and in the same order on both ends
+	Interval uint64 `json:"interval"` // seconds per hop epoch; default 30
+}
+
+func (c *HopConfig) applyDefaults() {
+	if c.Enabled == nil {
+		v := false
+		c.Enabled = &v
+	}
+	if c.Interval == 0 {
+		c.Interval = 30
+	}
+	if len(c.Ports) == 0 {
+		// A small set of common TLS-alternate ports, so opening them in a firewall draws
+		// no attention. Both ends must carry the same list; the installer writes both.
+		c.Ports = []int{443, 8443, 2053, 2083, 2087, 2096}
+	}
+}
+
+func (c *HopConfig) on() bool { return c != nil && c.Enabled != nil && *c.Enabled }
+
+// SplitConfig configures IP fragmentation of the desync fakes (split.go).
+type SplitConfig struct {
+	Enabled *bool `json:"enabled"`  // master switch; default false
+	FragPos int   `json:"frag_pos"` // fragment position, bytes from the transport header (multiple of 8); default 24
+}
+
+func (c *SplitConfig) applyDefaults() {
+	if c.Enabled == nil {
+		v := false
+		c.Enabled = &v
+	}
+	if c.FragPos == 0 {
+		c.FragPos = 24
+	}
+}
+
+func (c *SplitConfig) on() bool { return c != nil && c.Enabled != nil && *c.Enabled }
+
+// TCPRotateConfig configures periodic rotation of the TCP carrier connection (tcprotate.go).
+// It is the answer to Problem 3 from the field test: a single long-lived, high-rate TLS
+// connection is volumetrically throttled by the DPI no matter how well it is disguised, because
+// the throttle keys on the flow's rate and lifetime, not its bytes. Rotating the connection
+// (a fresh 5-tuple, make-before-break) every interval keeps any one flow below whatever
+// volume/duration the throttle is watching for. Only consulted when transport is tcp.
+type TCPRotateConfig struct {
+	Enabled     *bool `json:"enabled"`      // master switch; default false
+	IntervalSec int   `json:"interval_sec"` // seconds a connection lives before it is rotated; default 15
+}
+
+func (c *TCPRotateConfig) applyDefaults() {
+	if c.Enabled == nil {
+		v := false
+		c.Enabled = &v
+	}
+	if c.IntervalSec == 0 {
+		c.IntervalSec = 15
+	}
+}
+
+func (c *TCPRotateConfig) on() bool { return c != nil && c.Enabled != nil && *c.Enabled }
 
 func (c *Config) applyDefaults() {
 	if c.TunName == "" {
@@ -152,6 +299,11 @@ func (c *Config) applyDefaults() {
 		c.MemLimit = 64 << 20
 	}
 	c.DPILog.applyDefaults()
+	c.Desync.applyDefaults()
+	c.Junk.applyDefaults()
+	c.Hop.applyDefaults()
+	c.Split.applyDefaults()
+	c.TCPRotate.applyDefaults()
 }
 
 // derefOr returns *p, or def when p is nil (for callers that skip applyDefaults, e.g. tests).
@@ -260,6 +412,15 @@ type Tunnel struct {
 	// 12-byte-random-nonce one and remains compatible with peers that predate this layer.
 	obfs *obfuscator
 
+	// When port hopping is on the peer's port changes every epoch by design, so peer identity
+	// is matched by IP alone; otherwise every hop would look like a roam. Set once at startup.
+	hopMode bool
+
+	// TCP-only: obfs=quic over a TCP carrier is shaped as TLS instead of QUIC (see tls.go),
+	// because QUIC is a UDP protocol. When set, obfs is nil (the seal stays the plain format)
+	// and the TLS disguise lives entirely at the tcpCarrier's framing layer.
+	tlsShape bool
+
 	sendSeq uint64
 	replay  *replayWindow
 
@@ -313,17 +474,25 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 		sendSeq: uint64(time.Now().UnixMicro()),
 		replay:  newReplayWindow(4096),
 		dpi:     newDPILogger(&cfg.DPILog),
+		hopMode: cfg.Hop.on(),
 	}
 	if cfg.Obfs == "quic" {
-		shape := true
-		if cfg.Shape != nil {
-			shape = *cfg.Shape
+		if cfg.Transport == "tcp" {
+			// QUIC is a UDP protocol; over TCP the coherent disguise is TLS. The seal stays
+			// the plain format (obfs nil) and the tcpCarrier wraps each datagram in a TLS
+			// application-data record, opening with a synthetic TLS handshake (tls.go).
+			t.tlsShape = true
+		} else {
+			shape := true
+			if cfg.Shape != nil {
+				shape = *cfg.Shape
+			}
+			o, err := newObfuscator(psk, sendDir, recvDir, shape)
+			if err != nil {
+				log.Fatalf("obfs init: %v", err)
+			}
+			t.obfs = o
 		}
-		o, err := newObfuscator(psk, sendDir, recvDir, shape)
-		if err != nil {
-			log.Fatalf("obfs init: %v", err)
-		}
-		t.obfs = o
 	}
 	// Fail at startup rather than on the first packet if the suite name is wrong.
 	if _, err := newAEAD(t.suite, hkdf(psk, nil, []byte("probe"), 32)); err != nil {
@@ -657,16 +826,34 @@ func (t *Tunnel) getPeer() (netip.AddrPort, bool) {
 
 // samePeer reports whether src is the address the tunnel is currently talking to. On the
 // receive path this runs for every datagram, so it is deliberately a pointer load and a
-// value comparison and nothing else.
+// value comparison and nothing else. Under port hopping the port is expected to change every
+// epoch, so identity is matched by IP alone.
 func (t *Tunnel) samePeer(src netip.AddrPort) bool {
 	p := t.peer.Load()
-	return p != nil && *p == src
+	if p == nil {
+		return false
+	}
+	if t.hopMode {
+		return p.Addr() == src.Addr()
+	}
+	return *p == src
 }
 
 func (t *Tunnel) maybeRoam(src netip.AddrPort) {
 	p := t.peer.Load()
-	if p != nil && *p == src {
-		return
+	if p != nil {
+		if t.hopMode {
+			// Same host, different port each epoch — expected, not a roam. Keep the stored
+			// port in step (so getPeer stays current for any non-hopping consumer) silently.
+			if p.Addr() == src.Addr() {
+				if *p != src {
+					t.setPeer(src)
+				}
+				return
+			}
+		} else if *p == src {
+			return
+		}
 	}
 	old := ""
 	if p != nil {

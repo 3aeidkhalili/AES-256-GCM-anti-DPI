@@ -263,9 +263,18 @@ type tcpCarrier struct {
 	// its own connection to end without racing against a replacement.
 	done chan struct{}
 
-	hdr [2]byte
-	buf []byte
+	// tlsShape wraps each datagram in a TLS application-data record instead of the bare
+	// 2-byte length prefix, and makes Recv skip the synthetic handshake records (tls.go).
+	tlsShape bool
+
+	hdr  [2]byte // length prefix, plain framing
+	rhdr [5]byte // record header, TLS framing
+	buf  []byte
 }
+
+// errTLSDesync means the record framing read a length that cannot be right, so the stream is
+// out of sync and the only safe recovery is to drop the connection and start a fresh one.
+var errTLSDesync = fmt.Errorf("tls framing desynchronised")
 
 func setTCPOpts(c net.Conn) {
 	tc, ok := c.(*net.TCPConn)
@@ -309,6 +318,15 @@ func (c *tcpCarrier) current() net.Conn {
 	return c.conn
 }
 
+// rotatedOut reports whether conn has been superseded by a newer active connection — a
+// rotation or a reconnect installed a replacement. A read error on a rotated-out connection is
+// expected (the old socket was closed on purpose) and must not tear the carrier down; the
+// reader just moves on to the new connection.
+func (c *tcpCarrier) rotatedOut(conn net.Conn) bool {
+	cur := c.current()
+	return cur != nil && cur != conn
+}
+
 func (c *tcpCarrier) Send(pkt []byte) error {
 	conn := c.current()
 	if conn == nil {
@@ -317,14 +335,24 @@ func (c *tcpCarrier) Send(pkt []byte) error {
 	if len(pkt) > 65535 {
 		return fmt.Errorf("datagram too large for framing: %d", len(pkt))
 	}
-	var hdr [2]byte
-	binary.BigEndian.PutUint16(hdr[:], uint16(len(pkt)))
+	var hdr []byte
+	if c.tlsShape {
+		// TLS application-data record header: type 0x17, version 0x0303, 2-byte length.
+		var h [tlsRecordHeaderLen]byte
+		h[0], h[1], h[2] = tlsRecAppData, 0x03, 0x03
+		binary.BigEndian.PutUint16(h[3:5], uint16(len(pkt)))
+		hdr = h[:]
+	} else {
+		var h [2]byte
+		binary.BigEndian.PutUint16(h[:], uint16(len(pkt)))
+		hdr = h[:]
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn != conn {
 		return nil // replaced under us; drop rather than write to a dead socket
 	}
-	if _, err := c.conn.Write(hdr[:]); err != nil {
+	if _, err := c.conn.Write(hdr); err != nil {
 		return err
 	}
 	_, err := c.conn.Write(pkt)
@@ -332,6 +360,9 @@ func (c *tcpCarrier) Send(pkt []byte) error {
 }
 
 func (c *tcpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
+	if c.tlsShape {
+		return c.recvTLS()
+	}
 	for {
 		conn := c.current()
 		if conn == nil {
@@ -339,6 +370,9 @@ func (c *tcpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
 			continue
 		}
 		if _, err := io.ReadFull(conn, c.hdr[:]); err != nil {
+			if c.rotatedOut(conn) {
+				continue
+			}
 			return nil, netip.AddrPort{}, 0, err
 		}
 		n := int(binary.BigEndian.Uint16(c.hdr[:]))
@@ -349,9 +383,53 @@ func (c *tcpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
 			c.buf = make([]byte, n)
 		}
 		if _, err := io.ReadFull(conn, c.buf[:n]); err != nil {
+			if c.rotatedOut(conn) {
+				continue
+			}
 			return nil, netip.AddrPort{}, 0, err
 		}
 		return c.buf[:n], netip.AddrPort{}, 0, nil
+	}
+}
+
+// recvTLS reads TLS records, returning the payload of the next application-data record and
+// silently consuming the synthetic handshake records (ClientHello/ServerHello/ChangeCipherSpec)
+// the peer sends to open the connection.
+func (c *tcpCarrier) recvTLS() ([]byte, netip.AddrPort, uint8, error) {
+	for {
+		conn := c.current()
+		if conn == nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		if _, err := io.ReadFull(conn, c.rhdr[:]); err != nil {
+			if c.rotatedOut(conn) {
+				continue
+			}
+			return nil, netip.AddrPort{}, 0, err
+		}
+		n := int(binary.BigEndian.Uint16(c.rhdr[3:5]))
+		// A length no real TLS record can carry means the framing has slipped; there is no
+		// resynchronising a byte stream, so surface it and let the loop drop the connection.
+		if n > tlsRecordReadCeiling {
+			return nil, netip.AddrPort{}, 0, errTLSDesync
+		}
+		if n == 0 {
+			continue
+		}
+		if cap(c.buf) < n {
+			c.buf = make([]byte, n)
+		}
+		if _, err := io.ReadFull(conn, c.buf[:n]); err != nil {
+			if c.rotatedOut(conn) {
+				continue
+			}
+			return nil, netip.AddrPort{}, 0, err
+		}
+		if c.rhdr[0] == tlsRecAppData {
+			return c.buf[:n], netip.AddrPort{}, 0, nil
+		}
+		// Handshake, ChangeCipherSpec or Alert: cover records, not tunnel data — skip.
 	}
 }
 
@@ -577,7 +655,72 @@ func cpuModel() string {
 // runUDP / runTCP
 // ---------------------------------------------------------------------------
 
-func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
+// setPeerFromConfig parses cfg.Peer (if set) and installs it as the tunnel peer, unmapped so a
+// v4 peer compares equal to the v4-mapped form a dual-stack socket reports.
+func setPeerFromConfig(cfg *Config, t *Tunnel) {
+	if cfg.Peer == "" {
+		return
+	}
+	paddr, err := net.ResolveUDPAddr("udp", cfg.Peer)
+	if err != nil {
+		log.Fatalf("invalid peer: %v", err)
+	}
+	ap, ok := netip.AddrFromSlice(paddr.IP)
+	if !ok {
+		log.Fatalf("invalid peer address: %s", cfg.Peer)
+	}
+	t.setPeer(netip.AddrPortFrom(ap.Unmap(), uint16(paddr.Port)))
+}
+
+// startDesync launches the native fake injector once the peer address is known (role b may
+// learn it from the first authenticated packet rather than from config). It never blocks the
+// data path — the whole thing runs in its own goroutine and disables itself on any problem.
+func startDesync(cfg *Config, t *Tunnel) {
+	if !cfg.Desync.on() {
+		return
+	}
+	go func() {
+		for i := 0; i < 60; i++ {
+			if _, ok := t.getPeer(); ok {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if a := newDesyncAgent(t, cfg); a != nil {
+			defer a.close()
+			a.run()
+		}
+	}()
+}
+
+// startJunk sends flow-start cover traffic once the carrier can actually reach the peer, in its
+// own goroutine so a jittered burst never delays bringing the tunnel up. "Can reach" differs by
+// transport: UDP needs the peer address known; TCP needs a live connection (it never populates
+// the peer address, so waiting on that would stall the burst for the whole timeout).
+func startJunk(cfg *Config, t *Tunnel, c carrier) {
+	if !cfg.Junk.on() {
+		return
+	}
+	ready := func() bool {
+		if tc, ok := c.(*tcpCarrier); ok {
+			return tc.current() != nil
+		}
+		_, ok := t.getPeer()
+		return ok
+	}
+	go func() {
+		for i := 0; i < 60; i++ {
+			if ready() {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		junkBurst(t, c, &cfg.Junk)
+	}()
+}
+
+// newUDPCarrier builds the ordinary single-socket carrier with its buffers, offload and pacer.
+func newUDPCarrier(cfg *Config, t *Tunnel) *udpCarrier {
 	laddr, err := net.ResolveUDPAddr("udp", cfg.Listen)
 	if err != nil {
 		log.Fatalf("invalid listen: %v", err)
@@ -586,7 +729,6 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 	if err != nil {
 		log.Fatalf("UDP listen failed: %v", err)
 	}
-	defer conn.Close()
 
 	// Enlarge the socket buffers so traffic bursts are absorbed instead of dropped
 	// (kernel UDP RcvbufErrors). The kernel caps these at net.core.rmem_max / wmem_max.
@@ -598,19 +740,6 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 	}
 	if t.dpi.enabled() {
 		enableTTLInfo(conn)
-	}
-
-	if cfg.Peer != "" {
-		paddr, err := net.ResolveUDPAddr("udp", cfg.Peer)
-		if err != nil {
-			log.Fatalf("invalid peer: %v", err)
-		}
-		ap, ok := netip.AddrFromSlice(paddr.IP)
-		if !ok {
-			log.Fatalf("invalid peer address: %s", cfg.Peer)
-		}
-		// Unmap so a v4 peer compares equal to the v4-mapped form the socket reports.
-		t.setPeer(netip.AddrPortFrom(ap.Unmap(), uint16(paddr.Port)))
 	}
 
 	c := &udpCarrier{
@@ -628,6 +757,37 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 		c.pacer = newPacer(cfg.RateMbps)
 		log.Printf("carrier shaped to %.0f Mbit/s", cfg.RateMbps)
 	}
+	return c
+}
+
+func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
+	// The peer is needed by every carrier (hopping sends to peer.IP:hop_port, the single
+	// socket sends to the whole AddrPort), so install it before either is built.
+	setPeerFromConfig(cfg, t)
+
+	// Carrier selection: keyed port hopping when configured, otherwise the single socket.
+	// Port hopping trades the segmentation offload for the ability to move off a blocked
+	// 5-tuple automatically, so it is opt-in.
+	var c carrier
+	if cfg.Hop.on() {
+		hc, err := newHopCarrier(cfg, t, cfg.RcvBuf, cfg.SndBuf, t.dpi.enabled())
+		if err != nil {
+			// Do NOT fall back to a single socket. If this end quietly reverts to one port
+			// while the peer keeps hopping, the peer sends to ports this end is not listening
+			// on and the tunnel silently carries nothing while both services look "active" —
+			// the worst possible failure. A clean fatal is diagnosable; the operator frees the
+			// port (or drops it from hop.ports) and systemd restarts. The port set must be
+			// bindable and identical on both ends.
+			log.Fatalf("port hopping is enabled but a port could not be bound: %v\n"+
+				"free that port (something else is using it) or remove it from hop.ports on BOTH servers.", err)
+		}
+		c = hc
+	}
+	if c == nil {
+		c = newUDPCarrier(cfg, t)
+	}
+	defer c.Close()
+
 	log.Printf("tunnel up - traffic ready to flow.")
 
 	// Role a opens the flow, so it plays the client half of the synthetic handshake; role b
@@ -639,6 +799,10 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 			log.Printf("sent synthetic QUIC Initial (sni=%s)", cfg.SNI)
 		}
 	}
+
+	// Anti-DPI extensions (all no-ops unless configured on).
+	startDesync(cfg, t)
+	startJunk(cfg, t, c)
 
 	if *cfg.Keepalive > 0 {
 		go keepaliveLoop(c, t, *cfg.Keepalive)
@@ -753,27 +917,16 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 }
 
 func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
-	c := &tcpCarrier{buf: make([]byte, maxPktSize)}
+	c := &tcpCarrier{buf: make([]byte, maxPktSize), tlsShape: t.tlsShape}
+	if t.tlsShape {
+		log.Printf("tcp carrier shaped as TLS (records + synthetic handshake, sni=%s)", cfg.SNI)
+	}
 
 	// Role a dials out, role b accepts. Whoever is behind the more restrictive network
-	// should be the dialer; role a (the inside server) is that side by construction.
+	// should be the dialer; role a (the inside server) is that side by construction. The dial
+	// loop optionally rotates the connection to dodge volumetric throttling (tcprotate.go).
 	if cfg.Role == "a" {
-		go func() {
-			for {
-				conn, err := net.DialTimeout("tcp", cfg.Peer, 15*time.Second)
-				if err != nil {
-					log.Printf("tcp dial failed: %v", err)
-					time.Sleep(3 * time.Second)
-					continue
-				}
-				setTCPOpts(conn)
-				log.Printf("tcp connected: %s", conn.RemoteAddr())
-				// Wait for this connection specifically to be retired by the reader.
-				<-c.set(conn)
-				log.Printf("tcp disconnected")
-				time.Sleep(1 * time.Second)
-			}
-		}()
+		go tcpDialLoop(cfg, t, c)
 	} else {
 		ln, err := net.Listen("tcp", cfg.Listen)
 		if err != nil {
@@ -788,6 +941,15 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 					continue
 				}
 				setTCPOpts(conn)
+				// Answer with a ServerHello + ChangeCipherSpec flight, so a record-level
+				// inspector sees a TLS handshake being established rather than opaque bytes.
+				if t.tlsShape {
+					if _, err := conn.Write(buildTLSServerFlight()); err != nil {
+						log.Printf("tcp: TLS ServerHello write failed: %v", err)
+						conn.Close()
+						continue
+					}
+				}
 				log.Printf("tcp accepted: %s", conn.RemoteAddr())
 				// A new connection supersedes the old one: after a peer restart the
 				// stale socket may never produce an error on this side.
@@ -797,6 +959,7 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 	}
 
 	log.Printf("tunnel up - traffic ready to flow.")
+	startJunk(cfg, t, c)
 	if *cfg.Keepalive > 0 {
 		go keepaliveLoop(c, t, *cfg.Keepalive)
 	}

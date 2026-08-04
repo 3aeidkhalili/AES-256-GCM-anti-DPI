@@ -158,6 +158,16 @@ ensure_deps() {
   command -v jq >/dev/null 2>&1 || apt-get install -y jq >/dev/null 2>&1 || true
 }
 
+# check_build_deps — a source build needs either the vendored deps (offline) or network access
+# to fetch them. The prebuilt binaries need neither; this only matters when building from source.
+check_build_deps() {
+  if [[ ! -d "${LIB_DIR}/vendor" ]]; then
+    warn "vendor/ is absent — the build will fetch golang.org/x/crypto and golang.org/x/sys from"
+    warn "the Go module proxy (needs internet; go.sum verifies them). To build fully offline,"
+    warn "restore the vendor tree once with:  ( cd '${LIB_DIR}' && go mod vendor )"
+  fi
+}
+
 # ---------------------------------------------------------------------- install bin
 ensure_binary() {
   local tag; tag="$(arch_tag)"
@@ -169,6 +179,7 @@ ensure_binary() {
   fi
   if command -v go >/dev/null 2>&1 && [[ -f "${LIB_DIR}/main.go" ]]; then
     warn "No prebuilt binary found; building from source with Go..."
+    check_build_deps
     ( cd "$LIB_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$tag" go build -trimpath -ldflags "-s -w" -o "$BIN_DST" . )
     [[ -f "$BIN_DST" ]] && { msg "Built and installed."; return 0; }
   fi
@@ -191,8 +202,9 @@ ExecStart=${BIN_DST} -config ${CONF}
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# CAP_NET_RAW is only used by the optional native desync module; harmless when it is off.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 RuntimeDirectory=aestun
 # Gives the DPI observer a place to write that survives ProtectSystem=full, created with
 # the right ownership before the daemon starts.
@@ -236,7 +248,12 @@ write_config() {
     "enabled": ${CFG_DPI:-true},
     "path": "${DPI_LOG}",
     "probe": ${CFG_DPI_PROBE:-true}
-  }
+  },
+
+  "desync": { "enabled": ${CFG_DESYNC:-false}, "repeats": ${CFG_DESYNC_REP:-4}, "autottl": true, "delta": -1, "badsum": ${CFG_DESYNC_BADSUM:-false} },
+  "junk":   { "enabled": ${CFG_JUNK:-false}, "count": ${CFG_JUNK_COUNT:-8}, "min_ms": 5, "max_ms": 50 },
+  "hop":    { "enabled": ${CFG_HOP:-false}, "ports": [${CFG_HOP_PORTS:-443, 8443, 2053, 2083, 2087, 2096}], "interval": ${CFG_HOP_INT:-30} },
+  "split":  { "enabled": ${CFG_SPLIT:-false}, "frag_pos": 24 }
 }
 EOF
   chmod 600 "$CONF"
@@ -410,7 +427,8 @@ interactive_setup() {
   # opens the flow with a real Initial packet, so it reads as an ordinary QUIC connection.
   printf '\n%sWire obfuscation%s — must match on BOTH servers.\n' "$BOLD" "$N"
   printf '  %snone%s: raw high-entropy datagrams (compatible with older builds)\n' "$C" "$N"
-  printf '  %squic%s: presents as QUIC — short headers, synthetic handshake, shaped sizes\n' "$C" "$N"
+  printf '  %squic%s: shapes the carrier as its natural TLS-family form — QUIC over UDP,\n' "$C" "$N"
+  printf '        TLS (records + synthetic handshake) over TCP\n'
   CFG_OBFS="$(ask "Obfuscation (none/quic)" "quic")"
   [[ "$CFG_OBFS" == "none" || "$CFG_OBFS" == "quic" ]] || {
     warn "Unknown obfs '$CFG_OBFS' — using none."; CFG_OBFS="none"; }
@@ -455,11 +473,35 @@ interactive_setup() {
     CFG_DPI_PROBE=false
   fi
 
+  # --- Anti-DPI hardening (optional; all OFF by default) ---
+  # These layer on top of the tunnel. Enable only what your path needs — a wrong option is at
+  # best wasted packets. Full explanation in README section 15. They can also be toggled later
+  # from the management menu (option x) without re-running this wizard.
+  CFG_DESYNC=false; CFG_DESYNC_BADSUM=false; CFG_JUNK=false; CFG_HOP=false; CFG_SPLIT=false
+  CFG_HOP_PORTS="443, 8443, 2053, 2083, 2087, 2096"
+  printf '\n%sAnti-DPI hardening%s — optional, all off by default (README §15).\n' "$BOLD" "$N"
+  if ask_yn "Native desync (in-process fake QUIC injector, replaces the zapret module)" "N"; then
+    CFG_DESYNC=true
+    ask_yn "  also corrupt the fakes' checksum (badsum: peer kernel drops them)" "N" && CFG_DESYNC_BADSUM=true
+    ask_yn "  also IP-fragment the fakes (split)" "N" && CFG_SPLIT=true
+  fi
+  ask_yn "Flow-start cover traffic (junk: a burst of cover packets when the flow opens)" "N" && CFG_JUNK=true
+  if ask_yn "Keyed port hopping (rotate the UDP port; defeats 5-tuple blocks; needs the ports open on BOTH ends; disables offload)" "N"; then
+    CFG_HOP=true
+    local hp; hp="$(ask "  port set — comma separated, IDENTICAL and in the same order on both servers" "443,8443,2053,2083,2087,2096")"
+    CFG_HOP_PORTS="$(printf '%s' "$hp" | tr -d ' ' | sed 's/,/, /g')"
+    printf '  %sRemember to open these ports in the cloud/OS firewall on BOTH servers.%s\n' "$Y" "$N"
+  fi
+
   write_config
   write_service
   systemctl daemon-reload
   systemctl enable --now aestun >/dev/null 2>&1 && msg "Service enabled and started."
   open_firewall "$CFG_LISTEN_PORT"
+  if [[ "$CFG_HOP" == true ]]; then
+    local p
+    for p in ${CFG_HOP_PORTS//,/ }; do open_firewall "$p"; done
+  fi
 
   # --- network optimization ---
   printf '\n'
@@ -706,15 +748,16 @@ zap_enable() {
   [[ -z "$host" ]] && { err "Could not read peer host from config."; pause; return; }
   transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
 
-  if [[ "$transport" == "tcp" ]]; then
-    # multisplit only fragments the TCP payload: the peer reassembles transparently so the
-    # raw tunnel stream is never corrupted, while on-path DPI sees a split connection start.
-    desync="--dpi-desync=multisplit --dpi-desync-split-pos=1,4,8"
-  else
-    # Every one of these three flags is load-bearing; see the unit comments below.
-    desync="--dpi-desync=fake --dpi-desync-any-protocol=1 --dpi-desync-cutoff=n8 --dpi-desync-repeats=2 --dpi-desync-fooling=badsum"
-  fi
-  printf 'Carrier = %s%s / %s:%s%s (from config transport)\n' "$W" "$transport" "$host" "$port" "$N"
+  # Cover ALL protocols in one nfqws using two profiles (matched first-to-last):
+  #   1) TCP on the carrier port -> multisplit (fragments the TLS-record stream; the peer
+  #      reassembles transparently so the tunnel is never corrupted, on-path DPI sees a split).
+  #   2) everything else (the UDP carrier, and any other protocol) -> fake injection with
+  #      --dpi-desync-any-protocol so it acts on the carrier's opaque payload regardless of L7.
+  # The NFQUEUE rule (zap_rule) queues both tcp and udp, so whichever transport the tunnel
+  # uses is desynced — and it keeps working if you switch transport later.
+  desync="--filter-tcp=${port} --dpi-desync=multisplit --dpi-desync-split-pos=1,4,8"
+  desync+=" --new --dpi-desync=fake --dpi-desync-any-protocol=1 --dpi-desync-cutoff=n8 --dpi-desync-repeats=2 --dpi-desync-fooling=badsum"
+  printf 'Carrier = %s%s / %s:%s%s — desync covers TCP (multisplit) + UDP/any (fake)\n' "$W" "$transport" "$host" "$port" "$N"
 
   command -v conntrack >/dev/null 2>&1 || apt-get install -y conntrack >/dev/null 2>&1 || \
     warn "conntrack not installed — zapret will arm but never fire (see the 'rearm' step)."
@@ -981,6 +1024,238 @@ dpi_selftest() {
   pause
 }
 
+# =============================================================================
+#  Anti-DPI hardening menu (desync / junk / port-hop / split)
+# =============================================================================
+antidpi_state() { # prints e.g. "desync=on junk=off hop=off split=off"
+  [[ -f "$CONF" ]] || { printf 'no-config'; return; }
+  python3 - "$CONF" 2>/dev/null <<'PY' || printf 'parse-error'
+import json,sys
+c=json.load(open(sys.argv[1]))
+def st(k):
+    v=c.get(k,{})
+    return "on" if isinstance(v,dict) and v.get("enabled") else "off"
+print("desync=%s junk=%s hop=%s split=%s"%(st("desync"),st("junk"),st("hop"),st("split")))
+PY
+}
+
+antidpi_set() { # antidpi_set MODULE true|false
+  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; return 1; }
+  python3 - "$CONF" "$1" "$2" <<'PY'
+import json,sys
+p,mod,want=sys.argv[1],sys.argv[2],sys.argv[3]=="true"
+c=json.load(open(p))
+c.setdefault(mod,{})["enabled"]=want
+# fill sane defaults if the block was absent, so a first enable is complete
+d=c[mod]
+if mod=="desync": d.setdefault("repeats",4); d.setdefault("autottl",True); d.setdefault("delta",-1); d.setdefault("badsum",False)
+if mod=="junk":   d.setdefault("count",8); d.setdefault("min_ms",5); d.setdefault("max_ms",50)
+if mod=="hop":    d.setdefault("ports",[443,8443,2053,2083,2087,2096]); d.setdefault("interval",30)
+if mod=="split":  d.setdefault("frag_pos",24)
+json.dump(c,open(p,"w"),indent=2)
+PY
+  chmod 600 "$CONF"
+}
+
+antidpi_set_hop_ports() {
+  local hp; hp="$(ask "Port set (comma separated, IDENTICAL and same order on BOTH servers)" "443,8443,2053,2083,2087,2096")"
+  hp="$(printf '%s' "$hp" | tr -d ' ')"
+  python3 - "$CONF" "$hp" <<'PY'
+import json,sys
+p,ports=sys.argv[1],[int(x) for x in sys.argv[2].split(',') if x.strip().isdigit()]
+c=json.load(open(p))
+c.setdefault("hop",{})["ports"]=ports or [443,8443,2053,2083,2087,2096]
+json.dump(c,open(p,"w"),indent=2)
+PY
+  chmod 600 "$CONF"
+  local p
+  for p in ${hp//,/ }; do open_firewall "$p"; done
+  msg "hop ports set. Open them in the cloud firewall on BOTH servers."
+}
+
+antidpi_menu() {
+  while true; do
+    clear
+    local state; state="$(antidpi_state)"
+    printf '%s\n' "${BOLD}${C}+-- Anti-DPI hardening --------------------------------+${N}"
+    printf '  current: %s%s%s\n\n' "$W" "$state" "$N"
+    printf '%s\n' "${D}  All off by default. Enable only what your path needs (README §15).${N}"
+    printf '%s\n' "${D}  desync = in-process fake QUIC injector (replaces zapret)${N}"
+    printf '%s\n' "${D}  junk   = flow-start cover traffic${N}"
+    printf '%s\n' "${D}  hop    = keyed UDP port hopping (open ports on BOTH ends; disables offload)${N}"
+    printf '%s\n' "${D}  split  = IP-fragment the desync fakes${N}"
+    cat <<EOF
+
+  ${C}1${N}) toggle desync
+  ${C}2${N}) toggle junk
+  ${C}3${N}) toggle port hopping
+  ${C}4${N}) toggle split
+  ${C}5${N}) set port-hopping ports
+  ${C}0${N}) back (restart to apply)
+EOF
+    local c; c="$(ask 'Choose' '')" || return
+    case "$c" in
+      1) if [[ "$state" == *desync=on* ]]; then antidpi_set desync false; else antidpi_set desync true; fi ;;
+      2) if [[ "$state" == *junk=on* ]]; then antidpi_set junk false; else antidpi_set junk true; fi ;;
+      3) if [[ "$state" == *hop=on* ]]; then antidpi_set hop false; else
+           antidpi_set hop true
+           warn "Port hopping needs the whole port set open on BOTH servers, and disables kernel offload."
+           antidpi_set_hop_ports
+         fi ;;
+      4) if [[ "$state" == *split=on* ]]; then antidpi_set split false; else antidpi_set split true; fi ;;
+      5) antidpi_set_hop_ports ;;
+      0) if confirm "Restart aestun now to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
+         return ;;
+      *) warn "invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+# =============================================================================
+#  Auto-test — sweep every method/protocol on the LIVE tunnel, measure each, pick the
+#  best, and apply it. Reconfigures BOTH ends, so it needs SSH to the foreign server;
+#  the password is asked once, held in a 0600 temp file for sshpass, and shredded after.
+# =============================================================================
+autotest() {
+  clear; hdr "Auto-test: sweep methods & protocols, apply the best"
+  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
+  local role; role="$(json_get "$CONF" role)"
+  [[ "$role" == "a" ]] || { err "Run auto-test from the role 'a' (Iran/inside) server — it drives the sweep."; pause; return; }
+  command -v jq >/dev/null 2>&1 || { err "jq is required."; pause; return; }
+  command -v python3 >/dev/null 2>&1 || { err "python3 is required."; pause; return; }
+  command -v sshpass >/dev/null 2>&1 || apt-get install -y sshpass >/dev/null 2>&1
+  command -v sshpass >/dev/null 2>&1 || { err "sshpass is required (apt-get install sshpass)."; pause; return; }
+
+  local peer host peerip; peer="$(json_get "$CONF" peer)"; host="${peer%:*}"
+  printf '\n%sThis reconfigures BOTH servers repeatedly and briefly interrupts the tunnel\n' "$Y"
+  printf '(~40s per variant). Run it during a maintenance window, not peak hours.%s\n\n' "$N"
+  local fuser fhost fpass
+  fhost="$(ask 'Foreign (role b) SSH host' "$host")"
+  fuser="$(ask 'Foreign SSH user' 'root')"
+  printf '%sForeign SSH password%s (hidden): ' "$W" "$N"; read -rs fpass; printf '\n'
+  [[ -n "$fpass" ]] || { err "No password."; pause; return; }
+
+  local pwf; pwf="$(mktemp)"; chmod 600 "$pwf"; printf '%s' "$fpass" > "$pwf"; unset fpass
+  local RSSH="sshpass -f $pwf ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 $fuser@$fhost"
+  local RSCP="sshpass -f $pwf scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+  if ! $RSSH 'echo ok' >/dev/null 2>&1; then err "SSH to foreign failed."; shred -u "$pwf" 2>/dev/null||rm -f "$pwf"; pause; return; fi
+  msg "SSH to foreign OK."
+
+  # remote config path (assume the same /etc/aestun/config.json)
+  local RCONF="/etc/aestun/config.json"
+  # back up both configs
+  cp -a "$CONF" "${CONF}.autotest.bak"
+  $RSSH "cp -a $RCONF ${RCONF}.autotest.bak" >/dev/null 2>&1
+  local peer_ip; peer_ip="$(json_get "$CONF" peer_ip)"; peer_ip="${peer_ip:-10.8.0.2}"
+
+  # variant table: name|overrides(JSON merged onto BOTH ends)
+  local variants=(
+    "baseline|{}"
+    "desync+split+junk|{\"transport\":\"udp\",\"obfs\":\"quic\",\"desync\":{\"enabled\":true,\"repeats\":6},\"split\":{\"enabled\":true},\"junk\":{\"enabled\":true}}"
+    "port-hop|{\"transport\":\"udp\",\"obfs\":\"quic\",\"hop\":{\"enabled\":true,\"ports\":[443,2053,2083,2087,2096],\"interval\":20}}"
+    "tcp+tls|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true}}"
+    "tcp+tls+rotate|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true},\"tcp_rotate\":{\"enabled\":true,\"interval_sec\":15}}"
+  )
+
+  local results="" best_name="" best_loss=101 best_rate=0
+  local RESULTFILE; RESULTFILE="$(mktemp)"
+  printf '%-20s %8s %10s %8s\n' "VARIANT" "LOSS%" "PING_ms" "Mbit/s" | tee "$RESULTFILE"
+  printf '%s\n' "-------------------------------------------------------" | tee -a "$RESULTFILE"
+
+  local v name over
+  for v in "${variants[@]}"; do
+    name="${v%%|*}"; over="${v#*|}"
+    # build + push configs (merge onto each end's OWN base backup, preserving role/ip/peer)
+    python3 - "$CONF" "$over" > "${CONF}.try" <<'PY'
+import json,sys
+c=json.load(open(sys.argv[1])); o=json.loads(sys.argv[2])
+def m(a,b):
+    for k,v in b.items():
+        a[k]=m(a[k],v) if isinstance(v,dict) and isinstance(a.get(k),dict) else v
+    return a
+# reset the four method blocks to off first, so each variant is clean
+for blk in ("desync","junk","hop","split","tcp_rotate"):
+    c.setdefault(blk,{})["enabled"]=False
+c["transport"]="udp"; c["obfs"]="quic"
+m(c,o); json.dump(c,sys.stdout)
+PY
+    cp "${CONF}.try" "$CONF"
+    # foreign: same merge onto its own config
+    $RSSH "python3 - $RCONF '$over' > ${RCONF}.try" <<'PY' 2>/dev/null
+import json,sys
+c=json.load(open(sys.argv[1])); o=json.loads(sys.argv[2])
+def m(a,b):
+    for k,v in b.items():
+        a[k]=m(a[k],v) if isinstance(v,dict) and isinstance(a.get(k),dict) else v
+    return a
+for blk in ("desync","junk","hop","split","tcp_rotate"):
+    c.setdefault(blk,{})["enabled"]=False
+c["transport"]="udp"; c["obfs"]="quic"
+m(c,o); json.dump(c,sys.stdout)
+PY
+    $RSSH "cp ${RCONF}.try $RCONF" >/dev/null 2>&1
+    printf '%s testing %-20s%s ' "$D" "$name" "$N"
+    $RSSH 'systemctl restart aestun' >/dev/null 2>&1
+    systemctl restart aestun >/dev/null 2>&1
+    # wait up to ~16s for rx to climb
+    local up=0 r1 r2 i
+    for i in 1 2 3 4 5 6 7 8; do
+      r1="$(json_get "$STATS" rx_packets)"; sleep 2; r2="$(json_get "$STATS" rx_packets)"
+      [[ "${r2:-0}" -gt "${r1:-0}" ]] && { up=1; break; }
+    done
+    local loss pingms rate
+    if [[ "$up" == 1 ]]; then
+      # light measurement: 25 pings for loss+latency
+      local pout; pout="$(ping -c 25 -i 0.2 -W 2 "$peer_ip" 2>/dev/null)"
+      loss="$(printf '%s' "$pout" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
+      pingms="$(printf '%s' "$pout" | sed -nE 's#.*= [0-9.]+/([0-9.]+)/.*#\1#p' | head -1)"
+      # optional short throughput if an iperf3 server is reachable on the peer tunnel IP
+      rate="-"
+      if command -v iperf3 >/dev/null 2>&1 && $RSSH "command -v iperf3 >/dev/null 2>&1"; then
+        $RSSH "pkill -x iperf3 2>/dev/null; (iperf3 -s -B $peer_ip -D 2>/dev/null || true)" >/dev/null 2>&1
+        sleep 1
+        rate="$(iperf3 -c "$peer_ip" -t 5 -O 1 2>/dev/null | awk '/receiver/{print $7}')"
+        [[ -z "$rate" ]] && rate="-"
+      fi
+    else
+      loss="100"; pingms="-"; rate="0"
+    fi
+    : "${loss:=100}" "${pingms:=-}" "${rate:=-}"
+    printf '%-20s %8s %10s %8s\n' "$name" "$loss" "$pingms" "$rate" | tee -a "$RESULTFILE"
+    # score: prefer lowest loss, then highest rate
+    awk "BEGIN{exit !($loss < $best_loss - 0.5 || ($loss <= $best_loss + 0.5 && \"${rate}\" != \"-\" && ${rate:-0} > $best_rate))}" && {
+      best_name="$name"; best_loss="$loss"; best_rate="${rate:-0}"; cp "$CONF" "${CONF}.best"
+    }
+  done
+
+  $RSSH 'pkill -x iperf3 2>/dev/null' >/dev/null 2>&1
+  echo
+  hdr "Auto-test result"
+  cat "$RESULTFILE"
+  echo
+  if [[ -n "$best_name" && -f "${CONF}.best" ]]; then
+    msg "Best variant: ${BOLD}${best_name}${N} (loss ${best_loss}%, ~${best_rate} Mbit/s)"
+    if ask_yn "Apply '${best_name}' to BOTH servers now" "Y"; then
+      cp "${CONF}.best" "$CONF"
+      $RSCP "${CONF}.best" "$fuser@$fhost:${RCONF}" >/dev/null 2>&1
+      $RSSH 'systemctl restart aestun' >/dev/null 2>&1; systemctl restart aestun >/dev/null 2>&1
+      msg "Applied. The tunnel is now running: ${best_name}."
+      echo "Enabled: $(jq -c '{transport,obfs,desync:.desync.enabled,split:.split.enabled,junk:.junk.enabled,hop:.hop.enabled,tcp_rotate:.tcp_rotate.enabled}' "$CONF")"
+    else
+      cp "${CONF}.autotest.bak" "$CONF"; $RSSH "cp ${RCONF}.autotest.bak $RCONF" >/dev/null 2>&1
+      $RSSH 'systemctl restart aestun' >/dev/null 2>&1; systemctl restart aestun >/dev/null 2>&1
+      warn "Reverted to the pre-test config on both ends."
+    fi
+  else
+    err "No variant came up cleanly; reverting."
+    cp "${CONF}.autotest.bak" "$CONF"; $RSSH "cp ${RCONF}.autotest.bak $RCONF" >/dev/null 2>&1
+    $RSSH 'systemctl restart aestun' >/dev/null 2>&1; systemctl restart aestun >/dev/null 2>&1
+  fi
+  shred -u "$pwf" 2>/dev/null || rm -f "$pwf"
+  rm -f "${CONF}.try" "${CONF}.best" "$RESULTFILE"
+  pause
+}
+
 status_line() {
   local st ins peer
   st="$(svc_active aestun)"
@@ -1009,6 +1284,8 @@ main_menu() {
   ${C}8${N}) Generate new key
   ${C}9${N}) Network optimization
   ${C}d${N}) DPI / probe log            <- who is probing, what the path is doing
+  ${C}x${N}) Anti-DPI hardening         <- desync / junk / port-hop / split (native, §15)
+  ${C}t${N}) Auto-test methods          <- sweep every method/protocol, apply the best (§16)
   ${C}z${N}) zapret module (DPI bypass)
   ${C}u${N}) Uninstall tunnel
   ${C}0${N}) Exit
@@ -1025,6 +1302,8 @@ EOF
       8) do_keygen ;;
       9) netopt_menu ;;
       d|D) dpi_menu ;;
+      x|X) antidpi_menu ;;
+      t|T) autotest ;;
       z|Z) zapret_menu ;;
       u|U) uninstall_all ;;
       0) clear; exit 0 ;;
@@ -1040,27 +1319,36 @@ EOF
 #  so it is identical on both ends. Was the standalone zapret-rules.sh.
 # =============================================================================
 zap_rule() {
-  local peer host port proto qnum=200
+  local peer host port qnum=200
   peer="$(json_get "$CONF" peer)"; host="${peer%:*}"; port="${peer##*:}"
-  proto="$(json_get "$CONF" transport)"; proto="${proto:-udp}"
   [[ -n "$host" && -n "$port" ]] || { echo "zap-rule: cannot read peer from $CONF" >&2; return 1; }
 
-  # Scope to the peer host; connbytes keeps nfqws on the opening packets only (DPI
-  # classifies a flow at its start, and round-tripping a multi-hundred-Mbit carrier
-  # through userspace on every packet costs real CPU and latency). --connbytes-dir both
-  # because after a flush whichever side sends first becomes conntrack's "original".
-  local match=(-d "$host" -p "$proto" --dport "$port"
-               -m connbytes --connbytes-dir both --connbytes-mode packets --connbytes 1:8)
-  # --queue-bypass is load-bearing: a dead/wedged nfqws then lets the carrier flow
-  # untouched instead of every packet hitting an unread queue and being dropped.
+  # Cover BOTH transports on the carrier port. The tunnel uses one at a time, but queuing tcp
+  # AND udp means the desync applies whatever the carrier is (and keeps working if you switch
+  # transport) — and with --dpi-desync-any-protocol nfqws acts on the carrier's opaque payload
+  # regardless of the L7 protocol. connbytes keeps nfqws on the opening packets only (DPI
+  # classifies a flow at its start; round-tripping a multi-hundred-Mbit carrier through
+  # userspace per packet costs real CPU). --queue-bypass lets a dead/wedged nfqws pass traffic
+  # untouched rather than dropping every packet on an unread queue.
   local target=(-j NFQUEUE --queue-num "$qnum" --queue-bypass)
+  _zap_match() { # _zap_match PROTO -> echoes the iptables match args
+    printf '%s ' -d "$host" -p "$1" --dport "$port" \
+      -m connbytes --connbytes-dir both --connbytes-mode packets --connbytes 1:8
+  }
 
+  local pr
   case "${1:-}" in
     add)
-      iptables -t mangle -C OUTPUT "${match[@]}" "${target[@]}" 2>/dev/null \
-        || iptables -t mangle -A OUTPUT "${match[@]}" "${target[@]}" ;;
+      for pr in tcp udp; do
+        # shellcheck disable=SC2046
+        iptables -t mangle -C OUTPUT $(_zap_match "$pr") "${target[@]}" 2>/dev/null \
+          || iptables -t mangle -A OUTPUT $(_zap_match "$pr") "${target[@]}"
+      done ;;
     del)
-      iptables -t mangle -D OUTPUT "${match[@]}" "${target[@]}" 2>/dev/null || true ;;
+      for pr in tcp udp; do
+        # shellcheck disable=SC2046
+        iptables -t mangle -D OUTPUT $(_zap_match "$pr") "${target[@]}" 2>/dev/null || true
+      done ;;
     rearm)
       # The carrier is one permanently-active fixed-5-tuple flow, so its conntrack entry
       # is refreshed forever and its packet counter never returns to the 1:8 window --
@@ -1073,8 +1361,10 @@ zap_rule() {
         awk -v q="$qnum" '$1==q {f=1} END{exit !f}' /proc/net/netfilter/nfnetlink_queue 2>/dev/null && break
         sleep 0.1
       done
-      conntrack -D -p "$proto" --src "$host" --dport "$port" >/dev/null 2>&1
-      conntrack -D -p "$proto" --dst "$host" --dport "$port" >/dev/null 2>&1
+      for pr in tcp udp; do
+        conntrack -D -p "$pr" --src "$host" --dport "$port" >/dev/null 2>&1
+        conntrack -D -p "$pr" --dst "$host" --dport "$port" >/dev/null 2>&1
+      done
       return 0 ;;
     *) echo "usage: $0 zap-rule {add|del|rearm}" >&2; return 1 ;;
   esac
@@ -1093,6 +1383,7 @@ zap_rule() {
 do_build() {
   local arch="${1:-amd64}" mode="${2:-plain}"
   command -v go >/dev/null 2>&1 || { err "Go is not installed."; return 1; }
+  check_build_deps
   local out="aestun-linux-${arch}"
 
   if [[ "$mode" == "obfuscate" || "$mode" == "garble" ]]; then

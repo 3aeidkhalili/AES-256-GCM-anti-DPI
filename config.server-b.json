@@ -26,5 +26,10 @@
     "enabled": true,
     "path": "/var/log/aestun/dpi.jsonl",
     "probe": true
-  }
+  },
+
+  "desync": { "enabled": false, "repeats": 4, "autottl": true, "delta": -1, "badsum": false },
+  "junk":   { "enabled": false, "count": 8, "min_ms": 5, "max_ms": 50 },
+  "hop":    { "enabled": false, "ports": [443, 8443, 2053, 2083, 2087, 2096], "interval": 30 },
+  "split":  { "enabled": false, "frag_pos": 24 }
 }
