@@ -1128,7 +1128,9 @@ autotest() {
 
   local peer host peerip; peer="$(json_get "$CONF" peer)"; host="${peer%:*}"
   printf '\n%sThis reconfigures BOTH servers repeatedly and briefly interrupts the tunnel\n' "$Y"
-  printf '(~40s per variant). Run it during a maintenance window, not peak hours.%s\n\n' "$N"
+  printf '(~70s per variant, ~6 min total — the window is long ON PURPOSE so a delayed\n'
+  printf 'volumetric throttle shows up and a doomed variant is not picked). Maintenance\n'
+  printf 'window only, not peak hours.%s\n\n' "$N"
   local fuser fhost fpass
   fhost="$(ask 'Foreign (role b) SSH host' "$host")"
   fuser="$(ask 'Foreign SSH user' 'root')"
@@ -1157,10 +1159,10 @@ autotest() {
     "tcp+tls+rotate|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true},\"tcp_rotate\":{\"enabled\":true,\"interval_sec\":15}}"
   )
 
-  local results="" best_name="" best_loss=101 best_rate=0
+  local best_name="" best_loss=100 best_rate="-" best_score=-1000000 best_over="{}"
   local RESULTFILE; RESULTFILE="$(mktemp)"
-  printf '%-20s %8s %10s %8s\n' "VARIANT" "LOSS%" "PING_ms" "Mbit/s" | tee "$RESULTFILE"
-  printf '%s\n' "-------------------------------------------------------" | tee -a "$RESULTFILE"
+  printf '%-18s %6s %8s %8s  %s\n' "VARIANT" "LOSS%" "PING_ms" "Mbit/s" "NOTE" | tee "$RESULTFILE"
+  printf '%s\n' "--------------------------------------------------------------" | tee -a "$RESULTFILE"
 
   local v name over
   for v in "${variants[@]}"; do
@@ -1203,28 +1205,55 @@ PY
       r1="$(json_get "$STATS" rx_packets)"; sleep 2; r2="$(json_get "$STATS" rx_packets)"
       [[ "${r2:-0}" -gt "${r1:-0}" ]] && { up=1; break; }
     done
-    local loss pingms rate
+    local loss pingms rate transport throttled=0
+    transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
     if [[ "$up" == 1 ]]; then
-      # light measurement: 25 pings for loss+latency
-      local pout; pout="$(ping -c 25 -i 0.2 -W 2 "$peer_ip" 2>/dev/null)"
-      loss="$(printf '%s' "$pout" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
-      pingms="$(printf '%s' "$pout" | sed -nE 's#.*= [0-9.]+/([0-9.]+)/.*#\1#p' | head -1)"
-      # optional short throughput if an iperf3 server is reachable on the peer tunnel IP
-      rate="-"
+      # SUSTAINED measurement, not a quick burst. A volumetric throttle (the kind that kills a
+      # long-lived TCP+TLS flow) only engages after ~30s, so a short test would rank a
+      # doomed variant as "best" — which is exactly the trap that must be avoided. Measure
+      # over a 45s window in 15s slices and treat a flow that STARTS fast then COLLAPSES as
+      # throttled (disqualified), and rank on the SUSTAINED (last-slice) rate, not the peak.
+      rate="-"; local r_start="-" r_end="-"
       if command -v iperf3 >/dev/null 2>&1 && $RSSH "command -v iperf3 >/dev/null 2>&1"; then
         $RSSH "pkill -x iperf3 2>/dev/null; (iperf3 -s -B $peer_ip -D 2>/dev/null || true)" >/dev/null 2>&1
         sleep 1
-        rate="$(iperf3 -c "$peer_ip" -t 5 -O 1 2>/dev/null | awk '/receiver/{print $7}')"
-        [[ -z "$rate" ]] && rate="-"
+        # Rate-limited (60 Mbit) and shorter, so the sweep does NOT hammer the link at line
+        # rate — sustained max-rate testing is exactly what trips an ISP volumetric block, and
+        # the UDP preference in the scoring is the real safeguard against picking a TCP variant.
+        # Two 12s slices are still enough to catch a gross throttle-collapse.
+        local ivals; ivals="$(iperf3 -c "$peer_ip" -b 60M -t 24 -i 12 -O 1 2>/dev/null \
+          | awk '/sec/ && /bits\/sec/ && !/sender|receiver/{for(i=1;i<=NF;i++)if($i ~ /bits\/sec/){v=$(i-1); if($i=="Gbits/sec")v=v*1000; print v}}')"
+        r_start="$(printf '%s\n' "$ivals" | head -1)"; r_end="$(printf '%s\n' "$ivals" | tail -1)"
+        rate="${r_end:--}"
+        if [[ "$r_start" =~ ^[0-9.]+$ && "$r_end" =~ ^[0-9.]+$ ]]; then
+          awk "BEGIN{exit !($r_start>20 && $r_end < $r_start*0.5)}" && throttled=1
+        fi
       fi
+      # loss + latency from a 20s ping (also catches a blackhole the throttle causes)
+      local pout; pout="$(ping -c 40 -i 0.5 -W 2 "$peer_ip" 2>/dev/null)"
+      loss="$(printf '%s' "$pout" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
+      pingms="$(printf '%s' "$pout" | sed -nE 's#.*= [0-9.]+/([0-9.]+)/.*#\1#p' | head -1)"
+      # high sustained loss is itself a throttle/blackhole signature
+      awk "BEGIN{exit !(${loss:-0} >= 25)}" && throttled=1
     else
-      loss="100"; pingms="-"; rate="0"
+      loss="100"; pingms="-"; rate="0"; throttled=1
     fi
     : "${loss:=100}" "${pingms:=-}" "${rate:=-}"
-    printf '%-20s %8s %10s %8s\n' "$name" "$loss" "$pingms" "$rate" | tee -a "$RESULTFILE"
-    # score: prefer lowest loss, then highest rate
-    awk "BEGIN{exit !($loss < $best_loss - 0.5 || ($loss <= $best_loss + 0.5 && \"${rate}\" != \"-\" && ${rate:-0} > $best_rate))}" && {
-      best_name="$name"; best_loss="$loss"; best_rate="${rate:-0}"; cp "$CONF" "${CONF}.best"
+    local tag=""; [[ "$throttled" == 1 ]] && tag="THROTTLED"
+    printf '%-18s %6s %8s %8s  %s\n' "$name" "$loss" "$pingms" "$rate" "$tag" | tee -a "$RESULTFILE"
+    # Scoring: a throttled variant is disqualified outright. Otherwise rank on sustained
+    # throughput, penalise loss hard, and give UDP a bonus — it does not risk the volumetric
+    # TCP throttle and has lower, honest latency (the TCP path can report a bogus sub-RTT ping).
+    local score
+    if [[ "$throttled" == 1 ]]; then
+      score=-100000
+    else
+      score="$(awk -v r="$rate" -v l="$loss" -v t="$transport" 'BEGIN{
+        rr=(r ~ /^[0-9.]+$/)?r:0; ll=(l ~ /^[0-9.]+$/)?l:100;
+        printf "%.2f", rr - ll*5 + (t=="udp"?40:0)}')"
+    fi
+    awk "BEGIN{exit !($score > $best_score)}" && {
+      best_score="$score"; best_name="$name"; best_loss="$loss"; best_rate="$rate"; best_over="$over"
     }
   done
 
@@ -1233,11 +1262,15 @@ PY
   hdr "Auto-test result"
   cat "$RESULTFILE"
   echo
-  if [[ -n "$best_name" && -f "${CONF}.best" ]]; then
+  if [[ -n "$best_name" ]]; then
     msg "Best variant: ${BOLD}${best_name}${N} (loss ${best_loss}%, ~${best_rate} Mbit/s)"
     if ask_yn "Apply '${best_name}' to BOTH servers now" "Y"; then
-      cp "${CONF}.best" "$CONF"
-      $RSCP "${CONF}.best" "$fuser@$fhost:${RCONF}" >/dev/null 2>&1
+      # Apply the winning OVERRIDES onto EACH end's own pre-test base — never copy one end's
+      # whole config to the other, which would clobber the role/listen/peer/IPs and blackhole
+      # the tunnel. This is the same per-end merge the sweep used.
+      autotest_merge "${CONF}.autotest.bak" "$best_over" "$CONF"
+      $RSSH "$(autotest_merge_remote_cmd "${RCONF}.autotest.bak" "$best_over" "$RCONF")" >/dev/null 2>&1
+      chmod 600 "$CONF"; $RSSH "chmod 600 $RCONF" >/dev/null 2>&1
       $RSSH 'systemctl restart aestun' >/dev/null 2>&1; systemctl restart aestun >/dev/null 2>&1
       msg "Applied. The tunnel is now running: ${best_name}."
       echo "Enabled: $(jq -c '{transport,obfs,desync:.desync.enabled,split:.split.enabled,junk:.junk.enabled,hop:.hop.enabled,tcp_rotate:.tcp_rotate.enabled}' "$CONF")"
@@ -1254,6 +1287,44 @@ PY
   shred -u "$pwf" 2>/dev/null || rm -f "$pwf"
   rm -f "${CONF}.try" "${CONF}.best" "$RESULTFILE"
   pause
+}
+
+# autotest_merge BASE OVERRIDES OUT — merge the variant overrides onto BASE (an end's own
+# config, so role/listen/peer are preserved), resetting the method blocks first. Used at apply.
+autotest_merge() {
+  python3 - "$1" "$2" > "$3" <<'PY'
+import json,sys
+c=json.load(open(sys.argv[1])); o=json.loads(sys.argv[2])
+def m(a,b):
+    for k,v in b.items():
+        a[k]=m(a[k],v) if isinstance(v,dict) and isinstance(a.get(k),dict) else v
+    return a
+for blk in ("desync","junk","hop","split","tcp_rotate"):
+    c.setdefault(blk,{})["enabled"]=False
+c["transport"]="udp"; c["obfs"]="quic"
+m(c,o); json.dump(c,sys.stdout)
+PY
+}
+
+# autotest_merge_remote_cmd BASE OVERRIDES OUT — echoes a self-contained remote command that
+# performs the same per-end merge on the foreign server (base64-packed so quoting is safe).
+autotest_merge_remote_cmd() {
+  local py; py=$(cat <<'PY'
+import json,sys,base64
+base,ovr,out=sys.argv[1],base64.b64decode(sys.argv[2]).decode(),sys.argv[3]
+c=json.load(open(base)); o=json.loads(ovr)
+def m(a,b):
+    for k,v in b.items():
+        a[k]=m(a[k],v) if isinstance(v,dict) and isinstance(a.get(k),dict) else v
+    return a
+for blk in ("desync","junk","hop","split","tcp_rotate"):
+    c.setdefault(blk,{})["enabled"]=False
+c["transport"]="udp"; c["obfs"]="quic"
+m(c,o); json.dump(c,open(out,"w"))
+PY
+)
+  local ovr_b64; ovr_b64="$(printf '%s' "$2" | base64 -w0)"
+  printf "python3 -c %q %q %q %q" "$py" "$1" "$ovr_b64" "$3"
 }
 
 status_line() {

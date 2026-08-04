@@ -679,6 +679,12 @@ sudo ufw allow 51820/udp                   # if using ufw
   `rekey_interval: 0`.
 * **Throughput lower than expected** → confirm BBR is active (`sysctl -n
   net.ipv4.tcp_congestion_control`), and lower `mtu` if the path fragments.
+* **High latency / slow, especially on port 443** → try moving the carrier to a **high,
+  less-watched port** (e.g. `2087`). On the reference link, moving the pair off `:443` cut the
+  tunnel RTT **from ~82 ms to ~18 ms** and escaped a throttle in one step: the DPI monitors and
+  reroutes `:443` through an inspection path (~64 ms of added latency) but does not watch high
+  ports (measured — the encrypted in-tunnel probe confirmed it; see §17 finding 4). Do not park
+  the carrier on 443 just because it "looks like HTTPS." Port hopping (§15.3) automates this.
 * **Tunnel dead after a restart, both ends "active", nothing received** → check whether the
   carrier's exact source-port/destination-port pair has been blocked. This happened on the
   reference deployment: with both servers on `443`, plain random UDP from source port 443 to
@@ -978,13 +984,25 @@ and sampled `pidstat`/`mpstat` on both servers.
    localhost; UDP on the same link had **zero** loss. **UDP is the right transport here.** The
    project's own DPI observer detected and classified it correctly — a nice validation of §9.
 
+4. **📉 Port 443 is on a DPI inspection detour — moving off it cut latency 4.5×.** When a burst
+   of load got the `:443` carrier throttled, changing the port pair (to `:2087`) not only
+   escaped the block but dropped the tunnel RTT **from ~82 ms to ~18 ms**. The in-tunnel
+   *encrypted* probe (§7) — which only the real peer can answer — confirmed the same ~21 ms, so
+   it is a genuine path difference, not a measurement artifact. The reading is unambiguous:
+   **the DPI actively monitors/reroutes port 443 through an inspection path (~64 ms of added
+   latency), and does not watch `:2087`.** The lesson is concrete — **do not run the carrier on
+   443 just because it "looks like HTTPS"**: a less-watched high port can be both faster and
+   less blocked. And it is the clearest argument for **port hopping (§15.3)**: keep moving so no
+   single port stays under the DPI's lens long enough to be inspected, throttled, or blocked.
+
 ### 🏁 Final production config (applied to both ends)
 
 ```
 transport = udp · obfs = quic · cipher = chacha20-poly1305
+listen/peer on a HIGH, unwatched port (e.g. 2087) — NOT 443 (443 rides a DPI detour, +64ms)
 desync{repeats:6, autottl} + split{frag_pos:24} + junk{count:8}   ← enabled
-hop = off   (CPU headroom; enable vs a 5-tuple block)
-Cost of the enabled trio vs baseline: foreign +3–4 % CPU · throughput/latency within noise.
+hop = off   (CPU headroom; enable it if your chosen port later gets blocked)
+Result on the live link: 0% loss · RTT ~18 ms (was ~82 ms on 443) · foreign +3–4 % CPU.
 ```
 
 > The raw per-run logs (`pidstat`/`mpstat` for both ends, `tcpdump` captures, and the full report)
