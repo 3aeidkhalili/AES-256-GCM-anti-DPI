@@ -99,15 +99,25 @@ func newObfuscator(psk []byte, sendDir, recvDir string, shape bool) (*obfuscator
 	return o, nil
 }
 
-// mask derives the header-protection mask exactly as RFC 9001 does: encrypt a sample of
+// hpScratch is the working space for one header-protection operation: 16 bytes in,
+// 16 bytes out. It has to be supplied by the caller rather than declared locally, because
+// cipher.Block is an interface and the compiler therefore cannot prove that Encrypt does
+// not retain the slices it is handed — so local arrays escape to the heap and cost two
+// allocations on every single packet, in both directions. Callers keep one of these in
+// their sealer or opener, where it is allocated once per goroutine for the process's life.
+type hpScratch struct {
+	in  [16]byte
+	out [16]byte
+}
+
+// obfsMask derives the header-protection mask exactly as RFC 9001 does: encrypt a sample of
 // the ciphertext under the HP key and use the resulting block as a one-time pad over the
 // header's variable bits.
-func obfsMask(blk cipher.Block, sample []byte) [5]byte {
-	var in, out [16]byte
-	copy(in[:], sample)
-	blk.Encrypt(out[:], in[:])
+func obfsMask(blk cipher.Block, sample []byte, sc *hpScratch) [5]byte {
+	copy(sc.in[:], sample)
+	blk.Encrypt(sc.out[:], sc.in[:])
 	var m [5]byte
-	copy(m[:], out[:5])
+	copy(m[:], sc.out[:5])
 	return m
 }
 
@@ -142,9 +152,12 @@ func (o *obfuscator) adoptPeerCID(b []byte) bool {
 	return true
 }
 
-// nextHeader builds the 13-byte header for an outgoing packet and returns it together with
-// the AEAD nonce it encodes. Protection is applied later, once the ciphertext exists.
-func (o *obfuscator) nextHeader() (hdr []byte, nonce []byte, pn uint32) {
+// nextHeader writes the 13-byte header for an outgoing packet into hdr and the AEAD nonce
+// it encodes into nonce, returning the packet number. Caller-provided arrays rather than
+// freshly made slices: this runs once per outbound packet, and two 12-13 byte allocations
+// per packet was a steady stream of garbage for no reason. Protection is applied later,
+// once the ciphertext exists.
+func (o *obfuscator) nextHeader(hdr *[obfsHeaderLen]byte, nonce *[12]byte) (pn uint32) {
 	pn = o.pn.Add(1)
 
 	// The nonce is connection ID + packet number, so a wrapped packet number would start
@@ -177,7 +190,6 @@ func (o *obfuscator) nextHeader() (hdr []byte, nonce []byte, pn uint32) {
 
 	cid := o.cid.Load()
 
-	hdr = make([]byte, obfsHeaderLen)
 	hdr[0] = flags
 	copy(hdr[1:1+obfsCIDLen], cid[:])
 	binary.BigEndian.PutUint32(hdr[1+obfsCIDLen:], pn)
@@ -185,18 +197,17 @@ func (o *obfuscator) nextHeader() (hdr []byte, nonce []byte, pn uint32) {
 	// The nonce is the header's own connection ID and packet number. Unique per packet
 	// because the packet number strictly increases, and unique across restarts because
 	// the connection ID is freshly random per process.
-	nonce = make([]byte, 12)
-	copy(nonce, cid[:])
+	copy(nonce[:], cid[:])
 	binary.BigEndian.PutUint32(nonce[obfsCIDLen:], pn)
-	return hdr, nonce, pn
+	return pn
 }
 
 // protect applies header protection in place over a finished datagram (header+ciphertext).
-func (o *obfuscator) protect(pkt []byte) {
+func (o *obfuscator) protect(pkt []byte, sc *hpScratch) {
 	if len(pkt) < obfsHeaderLen+obfsSampleLen {
 		return
 	}
-	m := obfsMask(o.sendHP, pkt[obfsHeaderLen:obfsHeaderLen+obfsSampleLen])
+	m := obfsMask(o.sendHP, pkt[obfsHeaderLen:obfsHeaderLen+obfsSampleLen], sc)
 	// Only the bits QUIC itself protects: the low 5 bits of the first byte (reserved,
 	// key phase, packet number length) and the packet number bytes. The form and fixed
 	// bits stay clear so the packet still parses as a QUIC short header.
@@ -206,20 +217,20 @@ func (o *obfuscator) protect(pkt []byte) {
 	}
 }
 
-// unprotect reverses protect and returns the recovered nonce.
-func (o *obfuscator) unprotect(pkt []byte) (nonce []byte, ok bool) {
+// unprotectInto reverses protect, writing the recovered nonce into the caller's array so
+// the receive path does not allocate a 12-byte slice per packet.
+func (o *obfuscator) unprotectInto(pkt []byte, nonce *[12]byte, sc *hpScratch) bool {
 	if len(pkt) < obfsHeaderLen+obfsSampleLen {
-		return nil, false
+		return false
 	}
-	m := obfsMask(o.recvHP, pkt[obfsHeaderLen:obfsHeaderLen+obfsSampleLen])
+	m := obfsMask(o.recvHP, pkt[obfsHeaderLen:obfsHeaderLen+obfsSampleLen], sc)
 	// The connection ID is not protected, so it can be read directly; only the packet
 	// number needs unmasking to rebuild the nonce.
-	nonce = make([]byte, 12)
-	copy(nonce, pkt[1:1+obfsCIDLen])
+	copy(nonce[:], pkt[1:1+obfsCIDLen])
 	for i := 0; i < 4; i++ {
 		nonce[obfsCIDLen+i] = pkt[obfsHeaderLen-4+i] ^ m[1+i]
 	}
-	return nonce, true
+	return true
 }
 
 // padTo reports how many bytes of padding bring a datagram of size n up to the next bucket.

@@ -258,6 +258,38 @@ func quicIsLongHeader(pkt []byte) bool {
 	return len(pkt) > 0 && pkt[0]&0x80 != 0
 }
 
+// quicLongVersion returns the version field of a long-header packet.
+func quicLongVersion(pkt []byte) (uint32, bool) {
+	if len(pkt) < 5 || pkt[0]&0x80 == 0 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(pkt[1:5]), true
+}
+
+// quicKnownVersion reports whether a version number is one a real QUIC endpoint would send.
+//
+// This exists purely for classifying *unsolicited* traffic. The form bit alone is not enough
+// there: one byte in two of uniformly random junk has the high bit set, so a plain UDP
+// scanner would otherwise be filed as a QUIC prober and the event class would mean nothing.
+// The version field is four more bytes that random noise will essentially never get right.
+// Packet handling deliberately does not use this — the receive path still keys on the form
+// bit alone, exactly as before, so the wire behaviour is unchanged.
+func quicKnownVersion(v uint32) bool {
+	switch {
+	case v == 0: // Version Negotiation
+		return true
+	case v == 1: // RFC 9000
+		return true
+	case v == 0x6b3343cf: // RFC 9369 (QUIC v2)
+		return true
+	case v>>8 == 0xff0000: // the IETF draft series, still seen in the wild
+		return true
+	case v&0x0f0f0f0f == 0x0a0a0a0a: // GREASE, which real clients do send
+		return true
+	}
+	return false
+}
+
 // quicParseLongCIDs pulls the connection IDs out of a long-header packet. They sit in the
 // clear — header protection covers only the first byte's low bits and the packet number.
 func quicParseLongCIDs(pkt []byte) (dcid, scid []byte, ok bool) {
@@ -279,6 +311,236 @@ func quicParseLongCIDs(pkt []byte) (dcid, scid []byte, ok bool) {
 		return nil, nil, false
 	}
 	return dcid, pkt[p : p+sl], true
+}
+
+// --- reading someone else's Initial ---------------------------------------
+//
+// Initial packets are encrypted with keys derived from a connection ID that travels in the
+// clear, which means anyone can read them — that is the property this project relies on to
+// make its own cover traffic legible to a DPI box. The same property works in reverse: when
+// a stranger sends *us* an Initial, we can read theirs, and the server name inside says a
+// great deal about what they are. A censor's active prober typically replays a plausible
+// ClientHello for a real host; a research scanner sends something generic or malformed.
+//
+// This runs on unauthenticated input from anyone who can reach the port, so it is written
+// defensively: every field is bounds-checked, the work is capped by an input size limit,
+// and a recover() backstops the whole thing. A panic here would take down the tunnel.
+
+// readVarint reads an RFC 9000 variable-length integer.
+func readVarint(b []byte) (v uint64, n int, ok bool) {
+	if len(b) == 0 {
+		return 0, 0, false
+	}
+	length := 1 << (b[0] >> 6)
+	if len(b) < length {
+		return 0, 0, false
+	}
+	v = uint64(b[0] & 0x3f)
+	for i := 1; i < length; i++ {
+		v = v<<8 | uint64(b[i])
+	}
+	return v, length, true
+}
+
+// quicPeekInitialSNI decrypts a QUIC v1 client Initial and returns the server name from the
+// ClientHello inside it, or "" if the packet is not one, cannot be read, or carries no SNI.
+func quicPeekInitialSNI(pkt []byte) (sni string) {
+	defer func() {
+		if recover() != nil {
+			sni = ""
+		}
+	}()
+	// Long header, version 1, packet type Initial (bits 5-4 == 00). Anything else is not
+	// something we know how to read.
+	if len(pkt) < 7 || len(pkt) > 4096 || pkt[0]&0x80 == 0 {
+		return ""
+	}
+	if binary.BigEndian.Uint32(pkt[1:5]) != 1 || (pkt[0]>>4)&0x03 != 0 {
+		return ""
+	}
+	p := 5
+	dl := int(pkt[p])
+	p++
+	if dl > 20 || p+dl >= len(pkt) {
+		return ""
+	}
+	dcid := pkt[p : p+dl]
+	p += dl
+	sl := int(pkt[p])
+	p++
+	if sl > 20 || p+sl > len(pkt) {
+		return ""
+	}
+	p += sl
+	tokLen, n, ok := readVarint(pkt[p:])
+	if !ok {
+		return ""
+	}
+	p += n
+	if uint64(p)+tokLen > uint64(len(pkt)) {
+		return ""
+	}
+	p += int(tokLen)
+	length, n, ok := readVarint(pkt[p:])
+	if !ok {
+		return ""
+	}
+	p += n
+	pnOffset := p
+	if length < 20 || uint64(pnOffset)+length > uint64(len(pkt)) || pnOffset+20 > len(pkt) {
+		return ""
+	}
+
+	// Initial keys come from the destination connection ID in the client's first packet,
+	// which is exactly the value sitting in this header.
+	keys, err := initialKeys(dcid, true)
+	if err != nil {
+		return ""
+	}
+	var in, out [16]byte
+	copy(in[:], pkt[pnOffset+4:pnOffset+20])
+	keys.hp.Encrypt(out[:], in[:])
+
+	first := pkt[0] ^ (out[0] & 0x0f)
+	pnLen := int(first&0x03) + 1
+	if pnOffset+pnLen > len(pkt) {
+		return ""
+	}
+	// The AEAD's associated data is the header as it reads *unprotected*, so rebuild it
+	// in a scratch copy rather than mutating the receive buffer.
+	hdr := make([]byte, pnOffset+pnLen)
+	copy(hdr, pkt[:pnOffset+pnLen])
+	hdr[0] = first
+	var pn uint32
+	for i := 0; i < pnLen; i++ {
+		hdr[pnOffset+i] = pkt[pnOffset+i] ^ out[1+i]
+		pn = pn<<8 | uint32(hdr[pnOffset+i])
+	}
+	nonce := make([]byte, len(keys.iv))
+	copy(nonce, keys.iv)
+	for i := 0; i < 4; i++ {
+		nonce[len(nonce)-4+i] ^= byte(pn >> (8 * (3 - i)))
+	}
+	ct := pkt[pnOffset+pnLen : pnOffset+int(length)]
+	plain, err := keys.aead.Open(nil, nonce, ct, hdr)
+	if err != nil {
+		return ""
+	}
+	return sanitiseName(sniFromFrames(plain))
+}
+
+// sniFromFrames walks the frames of a decrypted Initial payload looking for the CRYPTO
+// frame at offset zero, which is where a ClientHello starts.
+func sniFromFrames(p []byte) string {
+	for i := 0; i < len(p); {
+		switch p[i] {
+		case 0x00, 0x01: // PADDING, PING
+			i++
+		case 0x06: // CRYPTO
+			i++
+			off, n, ok := readVarint(p[i:])
+			if !ok {
+				return ""
+			}
+			i += n
+			l, n2, ok := readVarint(p[i:])
+			if !ok {
+				return ""
+			}
+			i += n2
+			if uint64(i)+l > uint64(len(p)) {
+				return ""
+			}
+			data := p[i : i+int(l)]
+			i += int(l)
+			if off == 0 {
+				if s := sniFromClientHello(data); s != "" {
+					return s
+				}
+			}
+		default:
+			// Any other frame type in a first Initial means this is not the shape we
+			// know how to read. Stop rather than guess at offsets.
+			return ""
+		}
+	}
+	return ""
+}
+
+func sniFromClientHello(b []byte) string {
+	if len(b) < 4 || b[0] != 0x01 {
+		return ""
+	}
+	hl := int(b[1])<<16 | int(b[2])<<8 | int(b[3])
+	if 4+hl > len(b) {
+		hl = len(b) - 4
+	}
+	h := b[4 : 4+hl]
+	p := 2 + 32 // legacy_version + random
+	if len(h) < p+1 {
+		return ""
+	}
+	sidLen := int(h[p])
+	p++
+	if p+sidLen+2 > len(h) {
+		return ""
+	}
+	p += sidLen
+	csLen := int(h[p])<<8 | int(h[p+1])
+	p += 2
+	if p+csLen+1 > len(h) {
+		return ""
+	}
+	p += csLen
+	cmLen := int(h[p])
+	p++
+	if p+cmLen+2 > len(h) {
+		return ""
+	}
+	p += cmLen
+	extLen := int(h[p])<<8 | int(h[p+1])
+	p += 2
+	if p+extLen > len(h) {
+		extLen = len(h) - p
+	}
+	ext := h[p : p+extLen]
+	for q := 0; q+4 <= len(ext); {
+		typ := int(ext[q])<<8 | int(ext[q+1])
+		l := int(ext[q+2])<<8 | int(ext[q+3])
+		q += 4
+		if q+l > len(ext) {
+			return ""
+		}
+		if typ == 0x0000 { // server_name
+			d := ext[q : q+l]
+			// list length (2) + name type (1) + name length (2) + name
+			if len(d) >= 5 && d[2] == 0x00 {
+				nl := int(d[3])<<8 | int(d[4])
+				if 5+nl <= len(d) {
+					return string(d[5 : 5+nl])
+				}
+			}
+		}
+		q += l
+	}
+	return ""
+}
+
+// sanitiseName keeps an attacker-supplied string safe to put in a log line: printable
+// ASCII only, and short.
+func sanitiseName(s string) string {
+	if len(s) > 96 {
+		s = s[:96]
+	}
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x21 && s[i] <= 0x7e {
+			out = append(out, s[i])
+		} else {
+			out = append(out, '.')
+		}
+	}
+	return string(out)
 }
 
 // sendClientInitial emits the opening Initial for a freshly opened carrier flow and returns

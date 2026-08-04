@@ -1,6 +1,7 @@
 {
   "role": "a",
   "key": "PASTE_SAME_BASE64_KEY_ON_BOTH_SERVERS",
+  "cipher": "aes-gcm",
   "listen": "0.0.0.0:51820",
   "peer": "PUBLIC_IP_OF_SERVER_B:51820",
   "transport": "udp",
@@ -10,13 +11,20 @@
   "tun_name": "tun0",
   "local_ip": "10.8.0.1/24",
   "peer_ip": "10.8.0.2",
-  "mtu": 1300,
+  "mtu": 1420,
   "txqueuelen": 1000,
-  "rcvbuf": 8388608,
-  "sndbuf": 8388608,
+  "rcvbuf": 16777216,
+  "sndbuf": 16777216,
+  "offload": true,
+  "rate_mbps": 0,
   "pad_max": 64,
   "rekey_interval": 3600,
   "keepalive": 25,
   "manage_ip": true,
-  "stats_path": "/run/aestun/stats.json"
+  "stats_path": "/run/aestun/stats.json",
+  "dpi_log": {
+    "enabled": true,
+    "path": "/var/log/aestun/dpi.jsonl",
+    "probe": true
+  }
 }

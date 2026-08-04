@@ -125,7 +125,8 @@ func TestEpochSkewTolerance(t *testing.T) {
 	a, b := pair(3600, 0)
 	// Push the receiver one epoch ahead; it must still open via the adjacent epoch.
 	pkt := a.seal([]byte("across epoch"))
-	b.rememberEpoch(b.epochNow() + 1)
+	skewed := b.epochNow() + 1
+	b.rememberEpoch(skewed, b.aead(false, skewed))
 	if _, ok := b.open(pkt); !ok {
 		t.Fatal("must still open with a one-epoch skew")
 	}

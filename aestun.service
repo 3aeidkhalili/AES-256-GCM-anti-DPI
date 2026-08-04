@@ -13,6 +13,9 @@ LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 RuntimeDirectory=aestun
+# Gives the DPI observer a place to write that outlives ProtectSystem=full, created with
+# the right ownership before the daemon starts.
+LogsDirectory=aestun
 # Light hardening
 ProtectSystem=full
 ProtectHome=true

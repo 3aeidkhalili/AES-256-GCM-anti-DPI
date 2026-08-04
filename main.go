@@ -1,12 +1,11 @@
 //go:build linux
 
 // aestun — entry point and Linux-specific part (TUN creation, interface config, main loop).
-// The protocol and crypto core lives in tunnel.go (OS-independent and testable), and the
-// QUIC-shaped wire obfuscation in obfs.go.
+// The protocol and crypto core lives in tunnel.go (OS-independent and testable), the
+// QUIC-shaped wire obfuscation in obfs.go, and the DPI/probe observability in dpilog.go.
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -17,18 +16,22 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // ---------------------------------------------------------------------------
-// TUN (Linux) — no external dependency
+// TUN (Linux) — no external dependency. The device is opened and attached in
+// offload.go, which has to control the exact order of attach vs. poll registration.
 // ---------------------------------------------------------------------------
 
 type ifReq struct {
@@ -38,11 +41,10 @@ type ifReq struct {
 }
 
 const (
-	iffTun     = 0x0001
-	iffNoPI    = 0x1000
-	tunSetIff  = 0x400454ca
-	devNetTun  = "/dev/net/tun"
-	maxPktSize = 65535
+	iffTun    = 0x0001
+	iffNoPI   = 0x1000
+	tunSetIff = 0x400454ca
+	devNetTun = "/dev/net/tun"
 )
 
 // Read-loop resilience: a transient read error must not tear the tunnel down.
@@ -53,23 +55,6 @@ const (
 	maxReadErrors  = 32
 	readErrBackoff = 50 * time.Millisecond
 )
-
-func openTUN(name string) (*os.File, string, error) {
-	f, err := os.OpenFile(devNetTun, os.O_RDWR, 0)
-	if err != nil {
-		return nil, "", fmt.Errorf("open %s: %w (are you running as root?)", devNetTun, err)
-	}
-	var req ifReq
-	copy(req.Name[:], name)
-	req.Flags = iffTun | iffNoPI
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), tunSetIff, uintptr(unsafe.Pointer(&req)))
-	if errno != 0 {
-		f.Close()
-		return nil, "", fmt.Errorf("TUNSETIFF: %v", errno)
-	}
-	got := string(bytes.TrimRight(req.Name[:], "\x00"))
-	return f, got, nil
-}
 
 // ---------------------------------------------------------------------------
 // Interface configuration via the ip command
@@ -110,9 +95,10 @@ func configureIface(cfg *Config, ifname string) {
 type carrier interface {
 	// Send delivers one sealed datagram to the peer.
 	Send(pkt []byte) error
-	// Recv returns the next sealed datagram from the peer, blocking until one
-	// arrives. Peer-address learning (UDP roaming) happens inside.
-	Recv() ([]byte, error)
+	// Recv returns the next sealed datagram from the peer, blocking until one arrives,
+	// along with the source address and the IP TTL of the datagram that carried it.
+	// src is the zero value and ttl is 0 for transports that cannot supply them.
+	Recv() (pkt []byte, src netip.AddrPort, ttl uint8, err error)
 	Close() error
 }
 
@@ -122,32 +108,149 @@ type udpCarrier struct {
 	conn *net.UDPConn
 	t    *Tunnel
 	buf  []byte
-	// Source of the datagram most recently returned by Recv. Read by the caller only
-	// after that datagram authenticates, so a forged packet can never move the peer.
-	lastSrc *net.UDPAddr
+	oob  []byte
+	gso  bool
+	// Shapes bulk traffic only; keepalives and probes go out through Send untouched.
+	pacer *pacer
+
+	// When the kernel coalesces several datagrams into one recvmsg, the surplus waits
+	// here and Recv hands it out a segment at a time. Keeping the split inside the
+	// carrier means the receive loop above is identical whether GRO is on or off.
+	pend    []byte
+	pendSeg int
+	pendSrc netip.AddrPort
+	pendTTL uint8
 }
 
 func (u *udpCarrier) Send(pkt []byte) error {
-	peer := u.t.getPeer()
-	if peer == nil {
+	peer, ok := u.t.getPeer()
+	if !ok {
 		return nil // peer address not known yet; nothing to do but drop
 	}
-	_, err := u.conn.WriteToUDP(pkt, peer)
+	// The AddrPort form, so the send path does not build a *net.UDPAddr per datagram.
+	_, err := u.conn.WriteToUDPAddrPort(pkt, peer)
 	return err
 }
 
-func (u *udpCarrier) Recv() ([]byte, error) {
-	n, src, err := u.conn.ReadFromUDP(u.buf)
-	if err != nil {
-		return nil, err
+func (u *udpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
+	// Anything the kernel coalesced on the previous call is handed out first, one
+	// datagram at a time, before the socket is touched again.
+	if len(u.pend) > 0 {
+		n := u.pendSeg
+		if n > len(u.pend) {
+			n = len(u.pend) // the trailing segment may be shorter
+		}
+		pkt := u.pend[:n]
+		u.pend = u.pend[n:]
+		return pkt, u.pendSrc, u.pendTTL, nil
 	}
-	// Roaming is applied by the caller only after the packet authenticates, so a
-	// forged packet cannot redirect the tunnel. Stash the source for that step.
-	u.lastSrc = src
-	return u.buf[:n], nil
+	// ReadMsgUDPAddrPort rather than ReadFromUDP, for two reasons. It is the same recvmsg
+	// syscall underneath but also returns the ancillary data carrying the datagram's IP
+	// TTL — the one byte that lets the observer tell a packet the peer actually sent from
+	// one a middlebox forged with the peer's address on it. And the AddrPort form returns
+	// the source by value, where the *net.UDPAddr forms allocate a fresh address, with a
+	// heap-allocated IP slice inside it, for every datagram received.
+	n, oobn, _, src, err := u.conn.ReadMsgUDPAddrPort(u.buf, u.oob)
+	if err != nil {
+		return nil, netip.AddrPort{}, 0, err
+	}
+	oob := u.oob[:oobn]
+	addr, ttl := normAddr(src), parseTTL(oob)
+	// A segment size smaller than what arrived means the kernel merged several datagrams.
+	if seg := parseGROSegment(oob); seg > 0 && seg < n {
+		u.pend, u.pendSeg, u.pendSrc, u.pendTTL = u.buf[seg:n], seg, addr, ttl
+		return u.buf[:seg], addr, ttl, nil
+	}
+	return u.buf[:n], addr, ttl, nil
+}
+
+// sendBatch delivers a run of equally sized datagrams in one syscall, letting the kernel
+// split them apart again below IP. Falls back to a plain send for a batch of one, which is
+// what a quiet link produces.
+func (u *udpCarrier) sendBatch(b *txBatch) error {
+	if b.count == 0 {
+		return nil
+	}
+	peer, ok := u.t.getPeer()
+	if !ok {
+		b.reset()
+		return nil
+	}
+	var err error
+	if b.count == 1 || !u.gso {
+		// Not a run: send each datagram on its own. Without GSO the batch never holds
+		// more than one, so this is also the whole fallback path.
+		for off := 0; off < b.n; off += b.segSize {
+			end := off + b.segSize
+			if end > b.n {
+				end = b.n
+			}
+			if _, e := u.conn.WriteToUDPAddrPort(b.buf[off:end], peer); e != nil && err == nil {
+				err = e
+			}
+		}
+	} else {
+		oob := gsoControl(b.oob, uint16(b.segSize))
+		_, _, err = u.conn.WriteMsgUDPAddrPort(b.buf[:b.n], oob, peer)
+	}
+	b.reset()
+	return err
+}
+
+// normAddr puts an address into one canonical form.
+//
+// A wildcard listen address makes Go open a dual-stack IPv6 socket, and such a socket
+// reports IPv4 senders in the v4-mapped form (::ffff:1.2.3.4). A peer parsed from the
+// config is a plain IPv4 address. The two are *not* equal as netip values, so without
+// this every genuine peer packet would compare as coming from a stranger: the tunnel
+// would still work, because roaming overwrites the peer after the first authenticated
+// packet, but it would log a spurious roam on every start and mis-file the packets
+// before it. Normalising once, here, keeps every consumer downstream comparing like
+// with like — and keeps ::ffff: prefixes out of the log.
+func normAddr(a netip.AddrPort) netip.AddrPort {
+	if !a.IsValid() {
+		return a
+	}
+	return netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
 }
 
 func (u *udpCarrier) Close() error { return u.conn.Close() }
+
+// parseTTL digs the hop count out of the recvmsg control messages. Returns 0 when the
+// kernel did not supply one, which the callers treat as "unknown" rather than an anomaly.
+func parseTTL(oob []byte) uint8 {
+	if len(oob) == 0 {
+		return 0
+	}
+	msgs, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		return 0
+	}
+	for _, m := range msgs {
+		switch {
+		case m.Header.Level == unix.IPPROTO_IP && m.Header.Type == unix.IP_TTL && len(m.Data) >= 1:
+			return m.Data[0]
+		case m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_HOPLIMIT && len(m.Data) >= 4:
+			return uint8(binary.LittleEndian.Uint32(m.Data[:4]))
+		}
+	}
+	return 0
+}
+
+// enableTTLInfo asks the kernel to attach the hop count to every datagram it delivers.
+// Both address families are requested and both failures are ignored: on a v4-only socket
+// the v6 option simply does not apply, and on a kernel that refuses either one the observer
+// degrades to "TTL unknown" rather than failing to start.
+func enableTTLInfo(conn *net.UDPConn) {
+	rc, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	rc.Control(func(fd uintptr) {
+		unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVTTL, 1)
+		unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVHOPLIMIT, 1)
+	})
+}
 
 // --- TCP -------------------------------------------------------------------
 
@@ -228,7 +331,7 @@ func (c *tcpCarrier) Send(pkt []byte) error {
 	return err
 }
 
-func (c *tcpCarrier) Recv() ([]byte, error) {
+func (c *tcpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
 	for {
 		conn := c.current()
 		if conn == nil {
@@ -236,7 +339,7 @@ func (c *tcpCarrier) Recv() ([]byte, error) {
 			continue
 		}
 		if _, err := io.ReadFull(conn, c.hdr[:]); err != nil {
-			return nil, err
+			return nil, netip.AddrPort{}, 0, err
 		}
 		n := int(binary.BigEndian.Uint16(c.hdr[:]))
 		if n == 0 {
@@ -246,9 +349,9 @@ func (c *tcpCarrier) Recv() ([]byte, error) {
 			c.buf = make([]byte, n)
 		}
 		if _, err := io.ReadFull(conn, c.buf[:n]); err != nil {
-			return nil, err
+			return nil, netip.AddrPort{}, 0, err
 		}
-		return c.buf[:n], nil
+		return c.buf[:n], netip.AddrPort{}, 0, nil
 	}
 }
 
@@ -276,9 +379,10 @@ func jitter(d time.Duration) time.Duration {
 
 func keepaliveLoop(c carrier, t *Tunnel, seconds int) {
 	base := time.Duration(seconds) * time.Second
+	s := newSealer()
 	for {
 		time.Sleep(jitter(base))
-		if err := c.Send(t.seal(nil)); err != nil {
+		if err := c.Send(t.sealInto(s, nil)); err != nil {
 			log.Printf("keepalive send failed: %v", err)
 		}
 	}
@@ -292,13 +396,87 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[aestun] ")
 
-	if len(os.Args) > 1 && os.Args[1] == "keygen" {
-		k := make([]byte, 32)
-		if _, err := rand.Read(k); err != nil {
-			log.Fatalf("rand: %v", err)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "keygen":
+			k := make([]byte, 32)
+			if _, err := rand.Read(k); err != nil {
+				log.Fatalf("rand: %v", err)
+			}
+			fmt.Println(base64.StdEncoding.EncodeToString(k))
+			return
+		case "cipherinfo":
+			// Used by the installer to pick a suite without the operator having to know
+			// what AES-NI is. Prints the recommendation on its own line so a shell can
+			// read it with a single command substitution.
+			fmt.Printf("aes_hardware=%v\n", hasAESAccel())
+			fmt.Printf("cpu=%s\n", cpuModel())
+			fmt.Println(recommendedCipher())
+			return
+		case "probe":
+			// Send the carrier port the kind of traffic a censor's active prober or a
+			// scanner would, so the DPI observer on the far end can be checked against
+			// real packets rather than trusted. It is a diagnostic for your own tunnel;
+			// point it anywhere else and all you are doing is sending stray UDP.
+			fs := flag.NewFlagSet("probe", flag.ExitOnError)
+			target := fs.String("target", "", "carrier address to probe, host:port")
+			sni := fs.String("sni", "www.google.com", "server name to put in the QUIC ClientHello")
+			mode := fs.String("mode", "quic", "quic (a QUIC Initial) or junk (random datagrams)")
+			count := fs.Int("count", 1, "how many datagrams to send")
+			size := fs.Int("size", 64, "datagram size for junk mode")
+			fs.Parse(os.Args[2:])
+			if *target == "" {
+				log.Fatalf("probe: -target is required")
+			}
+			conn, err := net.Dial("udp", *target)
+			if err != nil {
+				log.Fatalf("probe: %v", err)
+			}
+			defer conn.Close()
+			for i := 0; i < *count; i++ {
+				var pkt []byte
+				switch *mode {
+				case "quic":
+					dcid := make([]byte, 8)
+					scid := make([]byte, 8)
+					rand.Read(dcid)
+					rand.Read(scid)
+					pkt, err = buildInitial(dcid, dcid, scid, buildClientHello(*sni), true)
+					if err != nil || pkt == nil {
+						log.Fatalf("probe: building the Initial failed: %v", err)
+					}
+				case "junk":
+					pkt = make([]byte, *size)
+					rand.Read(pkt)
+				default:
+					log.Fatalf("probe: -mode must be quic or junk")
+				}
+				if _, err := conn.Write(pkt); err != nil {
+					log.Fatalf("probe: %v", err)
+				}
+			}
+			fmt.Printf("sent %d %s datagram(s) to %s\n", *count, *mode, *target)
+			return
+		case "dpi-report":
+			fs := flag.NewFlagSet("dpi-report", flag.ExitOnError)
+			path := fs.String("log", "", "DPI log path (default: read it from the config)")
+			cfgp := fs.String("config", "/etc/aestun/config.json", "config file, used to locate the log")
+			hours := fs.Int("hours", 24, "how far back to summarise")
+			fs.Parse(os.Args[2:])
+			p := *path
+			if p == "" {
+				var c Config
+				if raw, err := os.ReadFile(*cfgp); err == nil {
+					json.Unmarshal(raw, &c)
+				}
+				c.DPILog.applyDefaults()
+				p = c.DPILog.Path
+			}
+			if err := dpiReport(p, time.Duration(*hours)*time.Hour); err != nil {
+				log.Fatalf("%v", err)
+			}
+			return
 		}
-		fmt.Println(base64.StdEncoding.EncodeToString(k))
-		return
 	}
 
 	cfgPath := flag.String("config", "/etc/aestun/config.json", "path to the JSON config file")
@@ -323,13 +501,18 @@ func main() {
 	if cfg.Obfs != "none" && cfg.Obfs != "quic" {
 		log.Fatalf("obfs must be \"none\" or \"quic\"")
 	}
+	if cfg.Cipher != cipherAESGCM && cfg.Cipher != cipherChaCha {
+		log.Fatalf("cipher must be %q or %q (and must match on both servers)", cipherAESGCM, cipherChaCha)
+	}
 	psk, err := base64.StdEncoding.DecodeString(strings.TrimSpace(cfg.Key))
 	if err != nil || len(psk) != 32 {
 		log.Fatalf("key must be base64 of exactly 32 bytes (get one from `aestun keygen`)")
 	}
 
+	tuneRuntime(&cfg)
+
 	// TUN
-	tun, ifname, err := openTUN(cfg.TunName)
+	tun, ifname, err := openTUNNonblock(cfg.TunName)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -343,19 +526,51 @@ func main() {
 	t := newTunnel(&cfg, psk)
 	t.ifname = ifname
 	go t.writeStats(cfg.StatsPath)
+	t.dpi.run(t)
 
-	rekeyDesc := "static"
-	if cfg.RekeyInterval > 0 {
-		rekeyDesc = fmt.Sprintf("every %ds", cfg.RekeyInterval)
+	log.Printf("%s", t.describe(&cfg))
+	if cfg.Cipher == cipherAESGCM && !hasAESAccel() {
+		log.Printf("warning: this CPU has no AES-NI, so AES-256-GCM runs in software and will "+
+			"dominate CPU use at any real packet rate. Set \"cipher\": %q on BOTH servers.", cipherChaCha)
 	}
-	log.Printf("role=%s transport=%s obfs=%s listen=%s peer=%s mtu=%d pad_max=%d keepalive=%d rekey=%s",
-		cfg.Role, cfg.Transport, cfg.Obfs, cfg.Listen, cfg.Peer, cfg.MTU, *cfg.PadMax, *cfg.Keepalive, rekeyDesc)
 
 	if cfg.Transport == "tcp" {
 		runTCP(&cfg, t, tun)
 	} else {
 		runUDP(&cfg, t, tun)
 	}
+}
+
+// tuneRuntime trims the Go runtime down to what a packet forwarder actually needs. With the
+// packet path allocating nothing, the collector has almost no work to do, and the default
+// settings mostly cost wakeups: a higher GC target keeps it from running on the little
+// garbage that remains, and an explicit memory limit is what actually bounds RSS.
+func tuneRuntime(cfg *Config) {
+	if p := derefOr(cfg.GCPercent, 400); p > 0 {
+		debug.SetGCPercent(p)
+	}
+	if cfg.MemLimit > 0 {
+		debug.SetMemoryLimit(cfg.MemLimit)
+	}
+	if cfg.MaxProcs > 0 {
+		runtime.GOMAXPROCS(cfg.MaxProcs)
+	}
+	startPprof(cfg.PprofAddr)
+}
+
+func cpuModel() string {
+	b, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return runtime.GOARCH
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "model name") {
+			if i := strings.Index(line, ":"); i >= 0 {
+				return strings.TrimSpace(line[i+1:])
+			}
+		}
+	}
+	return runtime.GOARCH
 }
 
 // ---------------------------------------------------------------------------
@@ -381,16 +596,38 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 	if err := conn.SetWriteBuffer(cfg.SndBuf); err != nil {
 		log.Printf("warning: SetWriteBuffer(%d) failed: %v", cfg.SndBuf, err)
 	}
+	if t.dpi.enabled() {
+		enableTTLInfo(conn)
+	}
 
 	if cfg.Peer != "" {
 		paddr, err := net.ResolveUDPAddr("udp", cfg.Peer)
 		if err != nil {
 			log.Fatalf("invalid peer: %v", err)
 		}
-		t.setPeer(paddr)
+		ap, ok := netip.AddrFromSlice(paddr.IP)
+		if !ok {
+			log.Fatalf("invalid peer address: %s", cfg.Peer)
+		}
+		// Unmap so a v4 peer compares equal to the v4-mapped form the socket reports.
+		t.setPeer(netip.AddrPortFrom(ap.Unmap(), uint16(paddr.Port)))
 	}
 
-	c := &udpCarrier{conn: conn, t: t, buf: make([]byte, maxPktSize)}
+	c := &udpCarrier{
+		conn: conn,
+		t:    t,
+		buf:  make([]byte, maxPktSize),
+		oob:  make([]byte, 256),
+	}
+	if *cfg.Offload {
+		c.gso = enableGSO(conn)
+		gro := enableGRO(conn)
+		log.Printf("kernel offload: udp_gso=%v udp_gro=%v", c.gso, gro)
+	}
+	if cfg.RateMbps > 0 {
+		c.pacer = newPacer(cfg.RateMbps)
+		log.Printf("carrier shaped to %.0f Mbit/s", cfg.RateMbps)
+	}
 	log.Printf("tunnel up - traffic ready to flow.")
 
 	// Role a opens the flow, so it plays the client half of the synthetic handshake; role b
@@ -406,12 +643,20 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 	if *cfg.Keepalive > 0 {
 		go keepaliveLoop(c, t, *cfg.Keepalive)
 	}
+
+	var probe *probeAgent
+	if t.dpi.enabled() && t.dpi.cfg.Probe != nil && *t.dpi.cfg.Probe {
+		probe = newProbeAgent(t, c, time.Duration(t.dpi.cfg.ProbeSec)*time.Second)
+		go probe.run()
+	}
+
 	go pumpTUNToCarrier(c, t, tun)
 
+	op := newOpener()
 	errs := 0
 	var lastInitialReply time.Time
 	for {
-		pkt, err := c.Recv()
+		pkt, src, ttl, err := c.Recv()
 		if err != nil {
 			errs++
 			if errs >= maxReadErrors {
@@ -422,9 +667,33 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 			continue
 		}
 		errs = 0
+
+		fromPeer := t.samePeer(src)
+
 		// Handshake cover only ever appears with obfs on; without it the first byte is
 		// random nonce material and this test would discard half of all real traffic.
 		if t.obfs != nil && quicIsLongHeader(pkt) {
+			v, _ := quicLongVersion(pkt)
+			realQUIC := quicKnownVersion(v)
+			switch {
+			case !fromPeer && src.IsValid():
+				// Nobody but the peer has any reason to send this port a QUIC handshake.
+				// Whoever did is checking what this port really is, so record who, and
+				// what host they claimed to be reaching for. Random junk that merely
+				// happens to have the form bit set is filed as scanning instead, so the
+				// probe class keeps its meaning.
+				class, sni := evScanUnauth, ""
+				if realQUIC {
+					class, sni = evProbeQUIC, quicPeekInitialSNI(pkt)
+				}
+				t.dpi.observeStranger(class, src, pkt, ttl, sni)
+			case fromPeer && !realQUIC:
+				// Wearing the peer's address, but carrying a version the peer would never
+				// send — this side only ever emits version 1. Forged traffic that happened
+				// to land on the form bit used to be discarded here without a word, which
+				// hid roughly half of any injection attempt from the log.
+				t.dpi.observeStranger(evInjectSpoof, src, pkt, ttl, "")
+			}
 			// Continue the conversation under the connection ID the peer named, so the
 			// 1-RTT packets belong to the handshake instead of looking unrelated to it.
 			if _, scid, ok := quicParseLongCIDs(pkt); ok {
@@ -441,17 +710,41 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 			}
 			continue
 		}
-		plain, ok := t.open(pkt)
+
+		plain, seq, ok := t.openSeq(op, pkt)
 		if !ok {
-			continue // invalid/forged/replayed packet — dropped silently
+			// Everything that failed to authenticate is interesting to somebody. Tell
+			// apart the three cases that mean different things: a replay (someone sent
+			// our own captured traffic back), a forgery wearing the peer's address, and
+			// ordinary background noise from a stranger.
+			if src.IsValid() {
+				switch {
+				case seq != 0:
+					// It decrypted, so it was genuinely ours — and it was rejected only
+					// by the replay window. From anyone at all, that is a recording being
+					// played back at us.
+					t.dpi.observeStranger(evProbeReplay, src, pkt, ttl, "")
+				case fromPeer:
+					t.dpi.observeStranger(evInjectSpoof, src, pkt, ttl, "")
+				default:
+					t.dpi.observeStranger(evScanUnauth, src, pkt, ttl, "")
+				}
+			}
+			continue
 		}
+
 		// Only now, after the packet has authenticated, is the source trusted enough
 		// to move the tunnel to it.
-		if c.lastSrc != nil {
-			t.maybeRoam(c.lastSrc)
+		if src.IsValid() {
+			t.maybeRoam(src)
 		}
+		t.dpi.observePeerPacket(seq, ttl)
+
 		if len(plain) == 0 {
 			continue // keepalive packet — not written to TUN
+		}
+		if probe != nil && probe.handle(plain) {
+			continue // in-tunnel measurement frame, not traffic
 		}
 		if _, err := tun.Write(plain); err != nil {
 			log.Printf("writing to TUN: %v", err)
@@ -507,10 +800,18 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 	if *cfg.Keepalive > 0 {
 		go keepaliveLoop(c, t, *cfg.Keepalive)
 	}
+
+	var probe *probeAgent
+	if t.dpi.enabled() && t.dpi.cfg.Probe != nil && *t.dpi.cfg.Probe {
+		probe = newProbeAgent(t, c, time.Duration(t.dpi.cfg.ProbeSec)*time.Second)
+		go probe.run()
+	}
+
 	go pumpTUNToCarrier(c, t, tun)
 
+	op := newOpener()
 	for {
-		pkt, err := c.Recv()
+		pkt, _, _, err := c.Recv()
 		if err != nil {
 			// A stream error means the connection is gone; drop it and let the dialer
 			// or the accept loop install a fresh one. Framing cannot resynchronise
@@ -522,11 +823,15 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 		if t.obfs != nil && quicIsLongHeader(pkt) {
 			continue
 		}
-		plain, ok := t.open(pkt)
+		plain, seq, ok := t.openSeq(op, pkt)
 		if !ok {
 			continue
 		}
+		t.dpi.observePeerPacket(seq, 0)
 		if len(plain) == 0 {
+			continue
+		}
+		if probe != nil && probe.handle(plain) {
 			continue
 		}
 		if _, err := tun.Write(plain); err != nil {
@@ -536,11 +841,53 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 }
 
 // pumpTUNToCarrier moves outbound IP packets from the TUN device onto the carrier.
+//
+// One blocking read, then a non-blocking drain of whatever else the device already has
+// queued, then one send for the whole run. When the link is busy the drain fills a batch
+// and the syscall cost is divided across it; when the link is quiet the first drain
+// attempt returns nothing and the packet goes out immediately, so batching never adds
+// latency to a lone packet.
 func pumpTUNToCarrier(c carrier, t *Tunnel, tun *os.File) {
 	buf := make([]byte, maxPktSize)
+	s := newSealer()
 	errs := 0
+
+	bc, canBatch := c.(*udpCarrier)
+	if !canBatch {
+		// TCP carrier: the stream has its own framing and no segmentation to offload.
+		for {
+			n, err := tun.Read(buf)
+			if err != nil {
+				errs++
+				if errs >= maxReadErrors {
+					log.Fatalf("TUN read failing persistently: %v", err)
+				}
+				log.Printf("TUN read error (%d/%d): %v", errs, maxReadErrors, err)
+				time.Sleep(readErrBackoff)
+				continue
+			}
+			errs = 0
+			if n == 0 {
+				continue
+			}
+			if err := c.Send(t.sealInto(s, buf[:n])); err != nil {
+				log.Printf("carrier send failed: %v", err)
+			}
+		}
+	}
+
+	tr := newTunReader(tun)
+	batch := newTxBatch(bc.gso)
+	pace := bc.pacer
+	flush := func() {
+		// Shape before the syscall, on the byte count that actually goes on the wire.
+		pace.wait(batch.n)
+		if err := bc.sendBatch(batch); err != nil {
+			log.Printf("carrier send failed: %v", err)
+		}
+	}
 	for {
-		n, err := tun.Read(buf)
+		n, err := tr.read(buf)
 		if err != nil {
 			errs++
 			if errs >= maxReadErrors {
@@ -554,8 +901,29 @@ func pumpTUNToCarrier(c carrier, t *Tunnel, tun *os.File) {
 		if n == 0 {
 			continue
 		}
-		if err := c.Send(t.seal(buf[:n])); err != nil {
-			log.Printf("carrier send failed: %v", err)
+		pkt := t.sealInto(s, buf[:n])
+		if !batch.wants(pkt) {
+			flush()
 		}
+		full := batch.add(pkt)
+		if full {
+			flush()
+			continue
+		}
+		// Drain whatever else is already waiting, but never wait for it.
+		for {
+			m, err := tr.tryRead(buf)
+			if err != nil || m == 0 {
+				break
+			}
+			pkt = t.sealInto(s, buf[:m])
+			if !batch.wants(pkt) {
+				flush()
+			}
+			if batch.add(pkt) {
+				break
+			}
+		}
+		flush()
 	}
 }

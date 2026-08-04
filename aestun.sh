@@ -20,6 +20,7 @@ CONF_DIR="/etc/aestun"
 CONF="${CONF_DIR}/config.json"
 SERVICE="/etc/systemd/system/aestun.service"
 STATS="/run/aestun/stats.json"
+DPI_LOG="/var/log/aestun/dpi.jsonl"
 SYSCTL_FILE="/etc/sysctl.d/99-aestun.conf"
 BBR_MODCONF="/etc/modules-load.d/aestun-bbr.conf"
 ZAPRET_DIR="/opt/zapret"
@@ -193,6 +194,9 @@ LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 RuntimeDirectory=aestun
+# Gives the DPI observer a place to write that survives ProtectSystem=full, created with
+# the right ownership before the daemon starts.
+LogsDirectory=aestun
 ProtectSystem=full
 ProtectHome=true
 
@@ -210,6 +214,7 @@ write_config() {
 {
   "role": "${CFG_ROLE}",
   "key": "${CFG_KEY}",
+  "cipher": "${CFG_CIPHER:-aes-gcm}",
   "listen": "0.0.0.0:${CFG_LISTEN_PORT}",
   "peer": "${CFG_PEER}",
   "transport": "${CFG_TRANSPORT:-udp}",
@@ -226,7 +231,12 @@ write_config() {
   "rekey_interval": ${CFG_REKEY},
   "keepalive": ${CFG_KA},
   "manage_ip": true,
-  "stats_path": "${STATS}"
+  "stats_path": "${STATS}",
+  "dpi_log": {
+    "enabled": ${CFG_DPI:-true},
+    "path": "${DPI_LOG}",
+    "probe": ${CFG_DPI_PROBE:-true}
+  }
 }
 EOF
   chmod 600 "$CONF"
@@ -354,6 +364,34 @@ interactive_setup() {
     CFG_KEY="$(ask_req "Paste the base64 key")" || return 1
   fi
 
+  # --- cipher suite ---
+  # This matters far more than it looks. Go only has a fast AES-GCM when the CPU exposes
+  # AES-NI *and* PCLMULQDQ; without them it falls back to a constant-time software
+  # implementation, and on a virtualised CPU that hides those flags the difference measured
+  # on this project's own foreign endpoint was 41 MB/s versus 234 MB/s. Both ends must agree,
+  # and a link is only as fast as its slower side, so if EITHER server lacks the instructions,
+  # both should be set to chacha20-poly1305.
+  local rec_cipher hw cpuname
+  rec_cipher="$("$BIN_DST" cipherinfo 2>/dev/null | tail -1)"
+  hw="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^aes_hardware=//p')"
+  cpuname="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^cpu=//p')"
+  [[ -n "$rec_cipher" ]] || rec_cipher="aes-gcm"
+  printf '\n%sCipher suite%s — must be IDENTICAL on both servers.\n' "$BOLD" "$N"
+  printf '  this CPU: %s%s%s\n' "$W" "${cpuname:-unknown}" "$N"
+  if [[ "$hw" == "true" ]]; then
+    printf '  AES hardware acceleration: %syes%s\n' "$G" "$N"
+  else
+    printf '  AES hardware acceleration: %sno%s — AES-GCM would run in software here and\n' "$R" "$N"
+    printf '     will dominate CPU use at any real packet rate.\n'
+  fi
+  printf '  %saes-gcm%s            : fastest where AES-NI exists\n' "$C" "$N"
+  printf '  %schacha20-poly1305%s  : fast everywhere, no special instructions needed\n' "$C" "$N"
+  printf '  %sThe wire format is byte-identical either way, so the choice is invisible to DPI.%s\n' "$D" "$N"
+  printf '  %sIf the OTHER server lacks AES-NI, choose chacha20-poly1305 on BOTH.%s\n' "$D" "$N"
+  CFG_CIPHER="$(ask "Cipher (aes-gcm/chacha20-poly1305)" "$rec_cipher")"
+  [[ "$CFG_CIPHER" == "aes-gcm" || "$CFG_CIPHER" == "chacha20-poly1305" ]] || {
+    warn "Unknown cipher '$CFG_CIPHER' — using $rec_cipher."; CFG_CIPHER="$rec_cipher"; }
+
   # --- carrier transport ---
   # UDP is the default for a reason: the carrier multiplexes every inner connection.
   # Over TCP, one lost carrier segment head-of-line-blocks *all* of them at once
@@ -406,6 +444,16 @@ interactive_setup() {
   # Kernel clamps this to net.core.rmem_max/wmem_max, so the network optimization
   # below has to raise those or the request is silently cut to the ~200 KB default.
   CFG_BUF="$(ask_int "Socket buffer per direction in bytes" "8388608")"
+
+  # --- DPI / probe observability ---
+  printf '\n%sDPI and probe logging%s — records what reaches the carrier port from outside the\n' "$BOLD" "$N"
+  printf 'tunnel-to-tunnel conversation (scans, active probes, replays, injected packets) and\n'
+  printf 'what the path does to the packets in flight (loss, blocking, throttling, latency).\n'
+  if ask_yn "Enable DPI/probe logging" "Y"; then CFG_DPI=true; else CFG_DPI=false; fi
+  CFG_DPI_PROBE=true
+  if [[ "$CFG_DPI" == true ]] && ! ask_yn "Send in-tunnel round-trip probes (needed for latency findings)" "Y"; then
+    CFG_DPI_PROBE=false
+  fi
 
   write_config
   write_service
@@ -511,6 +559,28 @@ monitor() {
     printf '  auth failures (auth_fail) : %s%s%s\n' "$Y" "$af" "$N"
     printf '  replay drops              : %s%s%s\n' "$Y" "$rd" "$N"
     printf '  key rotation              : %s\n' "$rk"
+
+    local dpi probes scans inj repl ttla loss rtt bh ciph
+    dpi="$(json_get "$STATS" dpi_enabled)"
+    if [[ "$dpi" == "true" ]]; then
+      probes="$(json_get "$STATS" dpi_probes)"; scans="$(json_get "$STATS" dpi_scans)"
+      inj="$(json_get "$STATS" dpi_injections)"; repl="$(json_get "$STATS" dpi_replays)"
+      ttla="$(json_get "$STATS" dpi_ttl_anomalies)"; loss="$(json_get "$STATS" loss_pct)"
+      rtt="$(json_get "$STATS" rtt_ms)"; bh="$(json_get "$STATS" dpi_blackholed_now)"
+      : "${probes:=0}" "${scans:=0}" "${inj:=0}" "${repl:=0}" "${ttla:=0}" "${loss:=-}" "${rtt:=-}"
+      # Anything non-zero in the first row is somebody paying attention to this port.
+      local pc="$G"; (( probes > 0 || repl > 0 || inj > 0 || ttla > 0 )) 2>/dev/null && pc="$R"
+      printf '%s\n' "${C}+-- DPI observer --------------------------------------+${N}"
+      printf '  active probes / replays   : %s%s%s / %s%s%s\n' "$pc" "$probes" "$N" "$pc" "$repl" "$N"
+      printf '  injections / TTL anomalies: %s%s%s / %s%s%s\n' "$pc" "$inj" "$N" "$pc" "$ttla" "$N"
+      printf '  background scanning       : %s\n' "$scans"
+      printf '  path loss / RTT           : %s%%  /  %s ms\n' "$loss" "$rtt"
+      if [[ "$bh" == "true" ]]; then
+        printf '  %scarrier looks BLOCKED — sending, nothing coming back%s\n' "$R" "$N"
+      fi
+    fi
+    ciph="$(json_get "$STATS" cipher)"
+    [[ -n "$ciph" ]] && printf '%s\n' "${D}  cipher: ${ciph}${N}"
     printf '%s\n' "${C}+-----------------------------------------------------+${N}"
     printf '%s\n' "${D}refresh every 2s — press q to quit${N}"
 
@@ -797,6 +867,120 @@ uninstall_all() {
 }
 
 # ----------------------------------------------------------------- main menu
+# =============================================================================
+#  DPI / probe log
+# =============================================================================
+dpi_enabled_in_cfg() {
+  [[ -f "$CONF" ]] || return 1
+  # A config written before this feature existed has no dpi_log block at all; the daemon
+  # defaults it on, so "absent" reads as enabled here too.
+  grep -q '"dpi_log"' "$CONF" || return 0
+  ! grep -q '"enabled"[[:space:]]*:[[:space:]]*false' "$CONF"
+}
+
+dpi_log_path() {
+  local p
+  p="$(sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONF" 2>/dev/null | tail -1)"
+  printf '%s' "${p:-$DPI_LOG}"
+}
+
+# dpi_set_enabled true|false — rewrite the dpi_log block in place.
+dpi_set_enabled() {
+  local want="$1" lp
+  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; return 1; }
+  lp="$(dpi_log_path)"
+  if grep -q '"dpi_log"' "$CONF"; then
+    python3 - "$CONF" "$want" <<'PY'
+import json,sys
+p,want=sys.argv[1],sys.argv[2]=="true"
+c=json.load(open(p))
+c.setdefault("dpi_log",{})["enabled"]=want
+json.dump(c,open(p,"w"),indent=2)
+PY
+  else
+    python3 - "$CONF" "$want" "$lp" <<'PY'
+import json,sys
+p,want,lp=sys.argv[1],sys.argv[2]=="true",sys.argv[3]
+c=json.load(open(p))
+c["dpi_log"]={"enabled":want,"path":lp,"probe":True}
+json.dump(c,open(p,"w"),indent=2)
+PY
+  fi
+  chmod 600 "$CONF"
+  msg "dpi_log.enabled = $want"
+  if ask_yn "Restart aestun now to apply" "Y"; then systemctl restart aestun && msg "restarted."; fi
+}
+
+dpi_menu() {
+  while true; do
+    clear
+    local state="off" sc="$R" lp sz
+    dpi_enabled_in_cfg && { state="on"; sc="$G"; }
+    lp="$(dpi_log_path)"
+    sz="-"; [[ -f "$lp" ]] && sz="$(du -h "$lp" 2>/dev/null | cut -f1)"
+    printf '%s\n' "${BOLD}${C}+-- DPI / probe log -----------------------------------+${N}"
+    printf '  state: %s%s%s    log: %s (%s)\n\n' "$sc" "$state" "$N" "$lp" "$sz"
+    printf '%s\n' "${D}  Records who talks to the carrier port from outside the tunnel-to-tunnel${N}"
+    printf '%s\n' "${D}  conversation, and what the path does to the packets in flight.${N}"
+    cat <<EOF
+
+  ${C}1${N}) Report — last 24 hours
+  ${C}2${N}) Report — last 7 days
+  ${C}3${N}) Live tail (high/warn findings)
+  ${C}4${N}) Raw log tail
+  ${C}5${N}) Self-test: send probe traffic at THIS server and see it logged
+  ${C}6${N}) Enable / disable
+  ${C}7${N}) Clear the log
+  ${C}0${N}) Back
+EOF
+    local c; c="$(ask 'Choose' '')" || return
+    case "$c" in
+      1) clear; "$BIN_DST" dpi-report -log "$lp" -hours 24 2>&1 | ${PAGER:-less} -R ;;
+      2) clear; "$BIN_DST" dpi-report -log "$lp" -hours 168 2>&1 | ${PAGER:-less} -R ;;
+      3) clear
+         printf '%s\n' "${D}streaming findings — Ctrl-C to stop${N}"
+         # journalctl carries the same lines because the daemon mirrors non-info events there.
+         journalctl -u aestun -f -o cat 2>/dev/null | grep --line-buffered '\[dpi\]' ;;
+      4) clear; tail -f "$lp" ;;
+      5) dpi_selftest ;;
+      6) if dpi_enabled_in_cfg; then dpi_set_enabled false; else dpi_set_enabled true; fi; pause ;;
+      7) if confirm "Delete $lp and its rotated copies?"; then
+           rm -f "$lp" "$lp".[0-9]; msg "cleared."
+         fi; pause ;;
+      0) return ;;
+      *) warn "invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+# dpi_selftest — send this server's own carrier port the traffic a prober would, then show
+# what the observer made of it. The point is that you can confirm the detector works on your
+# own box instead of waiting to find out during a real incident.
+dpi_selftest() {
+  clear
+  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
+  local port lp
+  port="$(json_get "$CONF" listen)"; port="${port##*:}"
+  lp="$(dpi_log_path)"
+  hdr "DPI observer self-test"
+  printf 'Sending probe traffic to 127.0.0.1:%s — the same port the tunnel listens on.\n' "$port"
+  printf '%sThis is local traffic only; nothing leaves the machine.%s\n\n' "$D" "$N"
+
+  printf '  1/2  QUIC Initial (what an active prober sends)...\n'
+  "$BIN_DST" probe -target "127.0.0.1:${port}" -mode quic -sni www.google.com -count 3 || true
+  printf '  2/2  random datagrams (what a port scanner sends)...\n'
+  "$BIN_DST" probe -target "127.0.0.1:${port}" -mode junk -count 25 -size 200 || true
+
+  local flush=65
+  printf '\nThe observer aggregates per source and flushes every %ss, so nothing appears\n' "$flush"
+  printf 'instantly — that is what keeps a scan from writing one line per packet.\n'
+  printf 'Waiting %ss' "$flush"
+  for _ in $(seq 1 $flush); do printf '.'; sleep 1; done
+  printf '\n\n'
+  "$BIN_DST" dpi-report -log "$lp" -hours 1
+  pause
+}
+
 status_line() {
   local st ins peer
   st="$(svc_active aestun)"
@@ -824,6 +1008,7 @@ main_menu() {
   ${C}7${N}) Edit config
   ${C}8${N}) Generate new key
   ${C}9${N}) Network optimization
+  ${C}d${N}) DPI / probe log            <- who is probing, what the path is doing
   ${C}z${N}) zapret module (DPI bypass)
   ${C}u${N}) Uninstall tunnel
   ${C}0${N}) Exit
@@ -839,6 +1024,7 @@ EOF
       7) edit_config ;;
       8) do_keygen ;;
       9) netopt_menu ;;
+      d|D) dpi_menu ;;
       z|Z) zapret_menu ;;
       u|U) uninstall_all ;;
       0) clear; exit 0 ;;
@@ -928,9 +1114,81 @@ do_build() {
     fi
   fi
 
-  ( cd "$LIB_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w" -o "$out" . ) \
+  local tags=()
+  if [[ "$mode" == "pprof" ]]; then
+    # Profiling pulls net/http in and roughly doubles the binary, so it is opt-in.
+    tags=(-tags pprof); out="${out}-pprof"
+  fi
+  ( cd "$LIB_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build "${tags[@]}" -trimpath -ldflags "-s -w" -o "$out" . ) \
     && msg "built: ${out}" \
     && printf '   copy to a server:  scp %s root@SERVER:/usr/local/bin/aestun\n' "$out"
+}
+
+# =============================================================================
+#  upgrade — move an existing install onto a new binary and new config fields
+#  without making the operator re-answer the whole wizard.
+# =============================================================================
+do_upgrade() {
+  need_root
+  [[ -f "$CONF" ]] || { err "Nothing to upgrade: $CONF does not exist. Run 'install' first."; exit 1; }
+  hdr "aestun upgrade"
+
+  local stamp bak
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  bak="/root/aestun-upgrade-${stamp}"
+  mkdir -p "$bak"
+  cp -a "$CONF" "$bak/config.json"
+  [[ -f "$BIN_DST" ]] && cp -a "$BIN_DST" "$bak/aestun.bin"
+  msg "Rolled-back copies saved in $bak"
+
+  ensure_binary || { err "no binary available"; return 1; }
+
+  # --- cipher ---
+  local cur rec hw cpuname
+  cur="$(json_get "$CONF" cipher)"; cur="${cur:-aes-gcm}"
+  rec="$("$BIN_DST" cipherinfo 2>/dev/null | tail -1)"; rec="${rec:-aes-gcm}"
+  hw="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^aes_hardware=//p')"
+  cpuname="$("$BIN_DST" cipherinfo 2>/dev/null | sed -n 's/^cpu=//p')"
+  printf '\n%sCipher%s  current: %s%s%s\n' "$BOLD" "$N" "$W" "$cur" "$N"
+  printf '  this CPU: %s  (AES hardware: %s)\n' "${cpuname:-unknown}" "${hw:-unknown}"
+  if [[ "$hw" != "true" ]]; then
+    printf '  %sThis CPU has no AES-NI. AES-GCM runs in software here and will dominate CPU use.%s\n' "$Y" "$N"
+  fi
+  printf '  %sBoth servers must use the same value, and the link is only as fast as its slower\n' "$D"
+  printf '  end — so if EITHER side lacks AES-NI, set chacha20-poly1305 on BOTH.%s\n' "$N"
+  local newc; newc="$(ask "Cipher (aes-gcm/chacha20-poly1305)" "$cur")"
+  [[ "$newc" == "aes-gcm" || "$newc" == "chacha20-poly1305" ]] || {
+    warn "Unknown cipher '$newc' — keeping $cur."; newc="$cur"; }
+
+  # --- dpi log ---
+  local dpion=true
+  ask_yn "Enable DPI/probe logging" "Y" || dpion=false
+
+  python3 - "$CONF" "$newc" "$dpion" "$DPI_LOG" <<'PY'
+import json,sys
+path,cipher,dpion,logpath=sys.argv[1],sys.argv[2],sys.argv[3]=="true",sys.argv[4]
+c=json.load(open(path))
+c["cipher"]=cipher
+d=c.setdefault("dpi_log",{})
+d["enabled"]=dpion
+d.setdefault("path",logpath)
+d.setdefault("probe",True)
+json.dump(c,open(path,"w"),indent=2)
+PY
+  chmod 600 "$CONF"
+  msg "Config updated (cipher=$newc, dpi_log.enabled=$dpion)."
+
+  if [[ "$newc" != "$cur" ]]; then
+    printf '\n%sThe cipher changed. The two ends will not talk until the OTHER server is set to\n' "$Y"
+    printf '%s as well — expect the tunnel to be down until you do that.%s\n' "$newc" "$N"
+    confirm "Restart aestun now anyway" || { warn "Not restarting. Run: systemctl restart aestun"; return 0; }
+  fi
+  systemctl restart aestun && msg "aestun restarted." || err "restart failed — see: journalctl -u aestun -n 50"
+  sleep 2
+  systemctl is-active --quiet aestun && msg "service is active." || {
+    err "service is not active. Roll back with:"
+    printf '   cp %s/config.json %s && cp %s/aestun.bin %s && systemctl restart aestun\n' "$bak" "$CONF" "$bak" "$BIN_DST"
+  }
 }
 
 # =============================================================================
@@ -961,7 +1219,9 @@ BANNER
 case "${1:-menu}" in
   zap-rule) shift; zap_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
   build)    shift; do_build "$@"; exit $? ;;
+  dpi-report) shift; "$BIN_DST" dpi-report -config "$CONF" "$@"; exit $? ;;
   install)  do_install; exit $? ;;
+  upgrade)  do_upgrade; exit $? ;;
   menu|"")  need_root; install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true; main_menu ;;
   -h|--help|help)
     cat <<'USAGE'
@@ -969,7 +1229,10 @@ aestun.sh — one file: installer + manager + monitor + zapret + build
 
   sudo ./aestun.sh              management menu (default)
   sudo ./aestun.sh install      interactive installer (run on each server)
-  ./aestun.sh build [arch]      cross-compile a static binary (dev machine)
+  sudo ./aestun.sh upgrade      move an existing install to a new binary/config
+  ./aestun.sh build [arch] [pprof|obfuscate]
+                                cross-compile a static binary (dev machine)
+  ./aestun.sh dpi-report        summarise the DPI/probe log
   ./aestun.sh zap-rule VERB     NFQUEUE helper {add|del|rearm}, invoked by systemd
 USAGE
     exit 0 ;;

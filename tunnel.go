@@ -6,24 +6,39 @@
 //     thing is high-entropy and indistinguishable from random data.
 //   - Sequence number (anti-replay) and padding live inside the encryption; invisible on the wire.
 //   - Separate keys per direction + optional time-based key rotation (no exchange needed).
+//
+// Performance design: the packet path allocates nothing. seal and open take a caller-owned
+// scratch struct (sealer/opener) that is reused for the life of the goroutine, the AEADs for
+// the current epoch are reached through lock-free atomics, and randomness is drawn from a
+// buffered CSPRNG instead of a syscall per packet. On a tunnel doing thousands of packets a
+// second those three things were costing more than the cipher.
 package main
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"log"
-	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// The largest datagram the tunnel will read or build. Defined here rather than in the
+// Linux-only file so the OS-independent core can size its own buffers.
+const maxPktSize = 65535
+
+// innerHeaderLen is the plaintext framing that precedes the inner IP packet:
+// 8 bytes of sequence number and 2 bytes of padding length.
+const innerHeaderLen = 10
+
+// aeadOverhead is the tag length. Both supported ciphers use 16, and both use a 12-byte
+// nonce, which is what makes the suite invisible on the wire.
+const aeadOverhead = 16
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -32,6 +47,7 @@ import (
 type Config struct {
 	Role          string `json:"role"`           // "a" or "b" (must differ on the two servers)
 	Key           string `json:"key"`            // shared key, base64 of 32 bytes (from the keygen subcommand)
+	Cipher        string `json:"cipher"`         // "aes-gcm" (default) or "chacha20-poly1305"; must match on both ends
 	Listen        string `json:"listen"`         // listen address, e.g. 0.0.0.0:51820
 	Peer          string `json:"peer"`           // peer address host:port (optional; learned from traffic if empty)
 	Transport     string `json:"transport"`      // carrier: "udp" (default) or "tcp"
@@ -50,6 +66,20 @@ type Config struct {
 	ManageIP      *bool  `json:"manage_ip"`      // whether the program runs the ip commands itself; default true
 	StatsPath     string `json:"stats_path"`     // stats file path for monitoring (empty = disabled)
 	Keepalive     *int   `json:"keepalive"`      // keepalive interval in seconds (explicit 0 = disabled; omitted = 25)
+
+	// --- performance ---
+	Offload  *bool   `json:"offload"`   // use kernel UDP segmentation/coalescing; default true
+	RateMbps float64 `json:"rate_mbps"` // shape the carrier to this rate; 0 = unlimited. See pacer.go —
+	//                                      set it from a measurement of your own path, below any policer.
+	GCPercent *int `json:"gc_percent"` // Go GC target; omitted = 100. The packet path allocates
+	//                                          nothing, so there is no garbage to amortise and a
+	//                                          higher target would only inflate RSS for no gain.
+	MemLimit  int64  `json:"mem_limit"`  // soft heap limit in bytes; 0 = 64 MiB
+	MaxProcs  int    `json:"max_procs"`  // GOMAXPROCS override; 0 = leave to the runtime
+	PprofAddr string `json:"pprof_addr"` // e.g. 127.0.0.1:6060 to expose net/http/pprof; empty = off
+
+	// --- observability ---
+	DPILog DPILogConfig `json:"dpi_log"`
 }
 
 func (c *Config) applyDefaults() {
@@ -58,6 +88,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Transport == "" {
 		c.Transport = "udp"
+	}
+	if c.Cipher == "" {
+		// Unset means an existing deployment written before the field existed, and those
+		// are all AES-GCM. Changing the default would silently break every such link.
+		c.Cipher = cipherAESGCM
 	}
 	if c.Obfs == "" {
 		c.Obfs = "none"
@@ -80,10 +115,15 @@ func (c *Config) applyDefaults() {
 		c.TxQueueLen = 1000
 	}
 	if c.RcvBuf == 0 {
-		c.RcvBuf = 8 << 20 // 8 MiB — absorbs traffic bursts so the kernel doesn't drop (RcvbufErrors)
+		// 16 MiB, matching the net.core.rmem_max the network tuning sets. At 8 MiB the
+		// receiver was still overflowing under a saturated link — the observer reported it
+		// as kernel.udp_errors/RcvbufErrors — and every one of those drops costs an inner
+		// TCP retransmission, which is far more expensive than the memory. The kernel
+		// clamps the request to rmem_max anyway, so asking for more is never harmful.
+		c.RcvBuf = 16 << 20
 	}
 	if c.SndBuf == 0 {
-		c.SndBuf = 8 << 20
+		c.SndBuf = 16 << 20
 	}
 	if c.PadMax == nil {
 		v := 64
@@ -100,6 +140,18 @@ func (c *Config) applyDefaults() {
 		v := 25
 		c.Keepalive = &v // omitted -> 25; an explicit 0 in config is preserved (keepalive disabled)
 	}
+	if c.Offload == nil {
+		v := true
+		c.Offload = &v
+	}
+	if c.GCPercent == nil {
+		v := 100
+		c.GCPercent = &v
+	}
+	if c.MemLimit == 0 {
+		c.MemLimit = 64 << 20
+	}
+	c.DPILog.applyDefaults()
 }
 
 // derefOr returns *p, or def when p is nil (for callers that skip applyDefaults, e.g. tests).
@@ -108,31 +160,6 @@ func derefOr(p *int, def int) int {
 		return def
 	}
 	return *p
-}
-
-// ---------------------------------------------------------------------------
-// HKDF (RFC 5869) over HMAC-SHA256 — short, dependency-free implementation
-// ---------------------------------------------------------------------------
-
-func hkdf(secret, salt, info []byte, n int) []byte {
-	if len(salt) == 0 {
-		salt = make([]byte, sha256.Size)
-	}
-	// Extract
-	m := hmac.New(sha256.New, salt)
-	m.Write(secret)
-	prk := m.Sum(nil)
-	// Expand
-	var out, t []byte
-	for i := 1; len(out) < n; i++ {
-		h := hmac.New(sha256.New, prk)
-		h.Write(t)
-		h.Write(info)
-		h.Write([]byte{byte(i)})
-		t = h.Sum(nil)
-		out = append(out, t...)
-	}
-	return out[:n]
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +236,7 @@ func (r *replayWindow) check(seq uint64) bool {
 
 type Tunnel struct {
 	psk     []byte
+	suite   string // cipher suite name; see cipher.go
 	sendDir string // "a->b" or "b->a"
 	recvDir string
 	rekey   uint64 // seconds; 0 = static
@@ -222,10 +250,11 @@ type Tunnel struct {
 
 	cacheMu sync.Mutex
 	cache   map[aeadKey]cipher.AEAD
-	// Lock-free fast path for the send AEAD, which every outgoing packet needs. The epoch
-	// changes once per rekey interval (an hour by default), so this hits on effectively
-	// every packet and the map+mutex path runs only at the boundary.
+	// Lock-free fast paths for the AEADs the packet loops need. The epoch changes once
+	// per rekey interval (an hour by default), so these hit on effectively every packet
+	// and the map+mutex path runs only at the boundary.
 	sendCache atomic.Pointer[aeadEntry]
+	recvCache atomic.Pointer[aeadEntry]
 
 	// nil when obfs is disabled, in which case the wire format stays the plain
 	// 12-byte-random-nonce one and remains compatible with peers that predate this layer.
@@ -234,12 +263,20 @@ type Tunnel struct {
 	sendSeq uint64
 	replay  *replayWindow
 
-	epMu      sync.Mutex
-	lastEpoch uint64
-	haveLast  bool
+	// Last epoch a packet successfully opened under. Atomics, not a mutex: this is read
+	// on every received packet and written once an hour.
+	lastEpoch atomic.Uint64
+	haveLast  atomic.Bool
 
-	peerMu sync.RWMutex
-	peer   *net.UDPAddr
+	// The peer address, held as a netip.AddrPort behind an atomic pointer. A value type
+	// rather than a *net.UDPAddr because the receive path compares against it on every
+	// single packet: net.UDPAddr carries a heap-allocated IP slice, and the socket call
+	// that produces one allocates it fresh per datagram. netip.AddrPort is comparable,
+	// allocation-free, and reduces the whole check to a load and an equality test.
+	peer atomic.Pointer[netip.AddrPort]
+
+	// DPI / probe observer; never nil (a disabled one is a no-op).
+	dpi *dpiLogger
 
 	// atomic counters for monitoring
 	txPackets  uint64
@@ -256,8 +293,13 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 	if cfg.Role == "b" {
 		sendDir, recvDir = "b->a", "a->b"
 	}
+	suite := cfg.Cipher
+	if suite == "" {
+		suite = cipherAESGCM
+	}
 	t := &Tunnel{
 		psk:     psk,
+		suite:   suite,
 		sendDir: sendDir,
 		recvDir: recvDir,
 		rekey:   cfg.RekeyInterval,
@@ -270,6 +312,7 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 		// collide with the peer's replay window (real time only moves forward).
 		sendSeq: uint64(time.Now().UnixMicro()),
 		replay:  newReplayWindow(4096),
+		dpi:     newDPILogger(&cfg.DPILog),
 	}
 	if cfg.Obfs == "quic" {
 		shape := true
@@ -281,6 +324,10 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 			log.Fatalf("obfs init: %v", err)
 		}
 		t.obfs = o
+	}
+	// Fail at startup rather than on the first packet if the suite name is wrong.
+	if _, err := newAEAD(t.suite, hkdf(psk, nil, []byte("probe"), 32)); err != nil {
+		log.Fatalf("cipher: %v", err)
 	}
 	return t
 }
@@ -300,7 +347,7 @@ type aeadKey struct {
 	epoch uint64
 }
 
-// aeadEntry is the lock-free send-cache payload: the AEAD for one epoch.
+// aeadEntry is the lock-free cache payload: the AEAD for one epoch.
 type aeadEntry struct {
 	epoch uint64
 	aead  cipher.AEAD
@@ -320,13 +367,9 @@ func (t *Tunnel) aead(send bool, epoch uint64) cipher.AEAD {
 	info := append([]byte("aestun-v1 "+dir+" "), make([]byte, 8)...)
 	binary.BigEndian.PutUint64(info[len(info)-8:], epoch)
 	kk := hkdf(t.psk, nil, info, 32)
-	blk, err := aes.NewCipher(kk)
+	a, err := newAEAD(t.suite, kk)
 	if err != nil {
-		log.Fatalf("aes: %v", err)
-	}
-	a, err := cipher.NewGCM(blk)
-	if err != nil {
-		log.Fatalf("gcm: %v", err)
+		log.Fatalf("cipher: %v", err)
 	}
 	if len(t.cache) > 64 { // avoid unbounded growth over long uptime
 		t.cache = make(map[aeadKey]cipher.AEAD)
@@ -346,26 +389,38 @@ func (t *Tunnel) sendAEAD(epoch uint64) cipher.AEAD {
 	return a
 }
 
-func (t *Tunnel) rememberEpoch(e uint64) {
-	t.epMu.Lock()
-	t.lastEpoch = e
-	t.haveLast = true
-	t.epMu.Unlock()
+// recvAEAD is the read half of the same idea. It deliberately does not populate the cache
+// on a miss: open() walks several candidate epochs and only one of them is the real one,
+// so the cache is updated from the success path instead of thrashed by the failures.
+func (t *Tunnel) recvAEAD(epoch uint64) cipher.AEAD {
+	if e := t.recvCache.Load(); e != nil && e.epoch == epoch {
+		return e.aead
+	}
+	return t.aead(false, epoch)
+}
+
+func (t *Tunnel) rememberEpoch(e uint64, a cipher.AEAD) {
+	t.lastEpoch.Store(e)
+	t.haveLast.Store(true)
+	// Store only across a rollover, so the steady state does not allocate an entry per packet.
+	if c := t.recvCache.Load(); c == nil || c.epoch != e {
+		t.recvCache.Store(&aeadEntry{epoch: e, aead: a})
+	}
 }
 
 // recvEpochs fills buf with the epochs to try when opening a packet, most-likely first, and
-// returns the count. It allocates nothing: the old version built a map and a slice on every
-// received packet, which at tunnel packet rates was a steady stream of garbage for the GC.
-// The candidate set is tiny (≤4) so deduping with a linear scan is cheaper than a map anyway.
+// returns the count. It allocates nothing and takes no locks: the old version built a map and
+// a slice on every received packet and took a mutex to read the last epoch, which at tunnel
+// packet rates was a steady stream of garbage and contention for the GC and scheduler.
+// The candidate set is tiny (<=4) so deduping with a linear scan is cheaper than a map anyway.
 func (t *Tunnel) recvEpochs(buf *[4]uint64) int {
 	if t.rekey == 0 {
 		buf[0] = 0
 		return 1
 	}
 	cur := t.epochNow()
-	t.epMu.Lock()
-	last, have := t.lastEpoch, t.haveLast
-	t.epMu.Unlock()
+	have := t.haveLast.Load()
+	last := t.lastEpoch.Load()
 
 	n := 0
 	// Inlined add-if-absent, deliberately not a closure: a closure over n/buf would escape
@@ -393,42 +448,88 @@ func (t *Tunnel) recvEpochs(buf *[4]uint64) int {
 	return n
 }
 
-// seal takes an IP packet and returns the encrypted datagram ready to send.
-func (t *Tunnel) seal(plain []byte) []byte {
+// ---------------------------------------------------------------------------
+// sealer / opener — per-goroutine scratch so the packet path allocates nothing
+// ---------------------------------------------------------------------------
+
+// A sealer holds the scratch buffers and the randomness source for one sending goroutine.
+// It is not safe for concurrent use; the TUN pump and the keepalive loop own one each.
+type sealer struct {
+	inner []byte
+	out   []byte
+	rng   *csprng
+	hdr   [obfsHeaderLen]byte
+	nonce [12]byte
+	hp    hpScratch
+}
+
+func newSealer() *sealer {
+	// Sized for the largest datagram the tunnel will ever build, so the make() calls in
+	// sealInto never fire in practice and the path is allocation-free from the first packet.
+	const room = maxPktSize + obfsHeaderLen + innerHeaderLen + aeadOverhead + 256
+	return &sealer{
+		inner: make([]byte, room),
+		out:   make([]byte, room),
+		rng:   newCSPRNG(),
+	}
+}
+
+// An opener holds the scratch buffer for one receiving goroutine. The slice returned by
+// openInto aliases that buffer and stays valid only until the next call on the same opener.
+type opener struct {
+	plain []byte
+	nonce [12]byte
+	hp    hpScratch
+}
+
+func newOpener() *opener {
+	return &opener{plain: make([]byte, maxPktSize+256)}
+}
+
+// sealInto takes an IP packet and returns the encrypted datagram ready to send. The result
+// aliases s.out and is only valid until the next call with the same sealer.
+func (t *Tunnel) sealInto(s *sealer, plain []byte) []byte {
 	epoch := t.epochNow()
 	aead := t.sendAEAD(epoch)
 
 	// With obfs on, the header doubles as the nonce (connection ID + packet number);
 	// with it off, the header *is* a random nonce and the format is byte-identical to
 	// what peers running the pre-obfs build expect.
-	var hdr, nonce []byte
+	var hdrLen int
 	if t.obfs != nil {
-		hdr, nonce, _ = t.obfs.nextHeader()
+		t.obfs.nextHeader(&s.hdr, &s.nonce)
+		hdrLen = obfsHeaderLen
 	} else {
-		nonce = make([]byte, 12)
-		if _, err := rand.Read(nonce); err != nil {
-			log.Fatalf("rand: %v", err)
-		}
-		hdr = nonce
+		s.rng.read(s.nonce[:])
+		copy(s.hdr[:12], s.nonce[:])
+		hdrLen = 12
 	}
 
-	pad := t.padFor(len(hdr), len(plain), nonce)
+	pad := t.padFor(hdrLen, len(plain), s.rng)
 
 	seq := atomic.AddUint64(&t.sendSeq, 1)
-	inner := make([]byte, 10+len(plain)+pad)
+	need := innerHeaderLen + len(plain) + pad
+	if cap(s.inner) < need {
+		s.inner = make([]byte, need)
+	}
+	inner := s.inner[:need]
 	binary.BigEndian.PutUint64(inner[0:8], seq)
 	binary.BigEndian.PutUint16(inner[8:10], uint16(pad))
-	copy(inner[10:], plain)
+	copy(inner[innerHeaderLen:], plain)
 	if pad > 0 {
-		rand.Read(inner[10+len(plain):])
+		s.rng.read(inner[innerHeaderLen+len(plain):])
 	}
 
-	out := make([]byte, len(hdr), len(hdr)+len(inner)+16)
-	copy(out, hdr)
-	out = aead.Seal(out, nonce, inner, nil)
+	if cap(s.out) < hdrLen+need+aeadOverhead {
+		s.out = make([]byte, hdrLen+need+aeadOverhead)
+	}
+	out := s.out[:hdrLen]
+	copy(out, s.hdr[:hdrLen])
+	// Seal appends into out's spare capacity, so no allocation happens here.
+	out = aead.Seal(out, s.nonce[:], inner, nil)
 	if t.obfs != nil {
 		// Applied last: the mask is derived from the finished ciphertext.
-		t.obfs.protect(out)
+		t.obfs.protect(out, &s.hp)
 	}
 
 	atomic.AddUint64(&t.txPackets, 1)
@@ -436,13 +537,21 @@ func (t *Tunnel) seal(plain []byte) []byte {
 	return out
 }
 
+// seal is the allocating convenience form, kept for tests and one-off callers. The packet
+// loops use sealInto.
+func (t *Tunnel) seal(plain []byte) []byte {
+	out := t.sealInto(newSealer(), plain)
+	cp := make([]byte, len(out))
+	copy(cp, out)
+	return cp
+}
+
 // padFor decides how much padding to add inside the encryption. Shaping mode targets the
-// size buckets so the datagram lands on one of a handful of lengths; otherwise it keeps the
-// original behaviour of a random amount up to pad_max.
-func (t *Tunnel) padFor(hdrLen, plainLen int, nonce []byte) int {
+// size buckets so the datagram lands on one of a handful of lengths; otherwise it adds a
+// random amount up to pad_max.
+func (t *Tunnel) padFor(hdrLen, plainLen int, rng *csprng) int {
 	if t.obfs != nil && t.obfs.shape {
-		// 10 bytes of inner header, 16 bytes of GCM tag.
-		base := hdrLen + 10 + plainLen + 16
+		base := hdrLen + innerHeaderLen + plainLen + aeadOverhead
 		if pad := obfsPadTo(base); pad > 0 && pad <= 65535 {
 			return pad
 		}
@@ -451,73 +560,120 @@ func (t *Tunnel) padFor(hdrLen, plainLen int, nonce []byte) int {
 	if t.padMax <= 0 {
 		return 0
 	}
-	return (int(nonce[0])<<8 | int(nonce[1])) % (t.padMax + 1) // reuse nonce entropy
+	// Drawn from the buffered CSPRNG. The previous version reused the first two nonce
+	// bytes, which is fine when the nonce is random but silently degenerates with obfs
+	// enabled: there those bytes are the connection ID, constant for the whole connection,
+	// so every packet got the *same* padding length and the shaping it was meant to
+	// provide disappeared.
+	return int(rng.uint16()) % (t.padMax + 1)
 }
 
-// open decrypts and authenticates a received datagram, returning the inner IP packet.
+// openInto decrypts and authenticates a received datagram, returning the inner IP packet.
+// The result aliases o.plain and is valid only until the next call with the same opener.
+func (t *Tunnel) openInto(o *opener, pkt []byte) ([]byte, bool) {
+	p, _, ok := t.openSeq(o, pkt)
+	return p, ok
+}
+
+// open is the allocating convenience form, kept for tests.
 func (t *Tunnel) open(pkt []byte) ([]byte, bool) {
+	p, ok := t.openInto(newOpener(), pkt)
+	if !ok {
+		return nil, false
+	}
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	return cp, true
+}
+
+// openSeq is the real implementation: decrypt, authenticate, replay-check, and hand back
+// the inner sequence number along with the packet. The sequence number costs nothing to
+// return — it was parsed anyway — and it is the only signal available that distinguishes
+// packets the network dropped from packets that were never sent, which is what the DPI
+// observer needs to measure loss and reordering on the authenticated stream.
+func (t *Tunnel) openSeq(o *opener, pkt []byte) (plain []byte, seq uint64, ok bool) {
 	var nonce, ct []byte
 	if t.obfs != nil {
-		if len(pkt) < obfsHeaderLen+16 {
-			return nil, false
+		if len(pkt) < obfsHeaderLen+aeadOverhead {
+			return nil, 0, false
 		}
-		var ok bool
-		if nonce, ok = t.obfs.unprotect(pkt); !ok {
-			return nil, false
+		if !t.obfs.unprotectInto(pkt, &o.nonce, &o.hp) {
+			return nil, 0, false
 		}
+		nonce = o.nonce[:]
 		ct = pkt[obfsHeaderLen:]
 	} else {
-		if len(pkt) < 12+16 {
-			return nil, false
+		if len(pkt) < 12+aeadOverhead {
+			return nil, 0, false
 		}
 		nonce = pkt[:12]
 		ct = pkt[12:]
 	}
+	if cap(o.plain) < len(ct) {
+		o.plain = make([]byte, len(ct))
+	}
 	var epochs [4]uint64
 	nEpochs := t.recvEpochs(&epochs)
 	for _, epoch := range epochs[:nEpochs] {
-		aead := t.aead(false, epoch)
-		inner, err := aead.Open(nil, nonce, ct, nil)
+		aead := t.recvAEAD(epoch)
+		inner, err := aead.Open(o.plain[:0], nonce, ct, nil)
 		if err != nil {
-			continue // wrong key/epoch or forged packet
+			continue
 		}
-		if len(inner) < 10 {
-			return nil, false
+		if len(inner) < innerHeaderLen {
+			return nil, 0, false
 		}
-		seq := binary.BigEndian.Uint64(inner[0:8])
+		s := binary.BigEndian.Uint64(inner[0:8])
 		pad := int(binary.BigEndian.Uint16(inner[8:10]))
-		if 10+pad > len(inner) {
-			return nil, false
+		if innerHeaderLen+pad > len(inner) {
+			return nil, 0, false
 		}
-		if !t.replay.check(seq) {
+		if !t.replay.check(s) {
 			atomic.AddUint64(&t.replayDrop, 1)
-			return nil, false // replayed packet
+			return nil, s, false
 		}
-		t.rememberEpoch(epoch)
+		t.rememberEpoch(epoch, aead)
 		atomic.AddUint64(&t.rxPackets, 1)
 		atomic.AddUint64(&t.rxBytes, uint64(len(pkt)))
 		atomic.StoreInt64(&t.lastRxUnix, time.Now().Unix())
-		return inner[10 : len(inner)-pad], true
+		return inner[innerHeaderLen : len(inner)-pad], s, true
 	}
 	atomic.AddUint64(&t.authFail, 1)
-	return nil, false
+	return nil, 0, false
 }
 
-func (t *Tunnel) setPeer(a *net.UDPAddr) {
-	t.peerMu.Lock()
-	t.peer = a
-	t.peerMu.Unlock()
+func (t *Tunnel) setPeer(a netip.AddrPort) {
+	t.peer.Store(&a)
 }
-func (t *Tunnel) getPeer() *net.UDPAddr {
-	t.peerMu.RLock()
-	defer t.peerMu.RUnlock()
-	return t.peer
-}
-func (t *Tunnel) maybeRoam(src *net.UDPAddr) {
-	cur := t.getPeer()
-	if cur == nil || !cur.IP.Equal(src.IP) || cur.Port != src.Port {
-		t.setPeer(src)
+
+// getPeer returns the current peer and whether one is known.
+func (t *Tunnel) getPeer() (netip.AddrPort, bool) {
+	p := t.peer.Load()
+	if p == nil {
+		return netip.AddrPort{}, false
 	}
+	return *p, true
+}
+
+// samePeer reports whether src is the address the tunnel is currently talking to. On the
+// receive path this runs for every datagram, so it is deliberately a pointer load and a
+// value comparison and nothing else.
+func (t *Tunnel) samePeer(src netip.AddrPort) bool {
+	p := t.peer.Load()
+	return p != nil && *p == src
+}
+
+func (t *Tunnel) maybeRoam(src netip.AddrPort) {
+	p := t.peer.Load()
+	if p != nil && *p == src {
+		return
+	}
+	old := ""
+	if p != nil {
+		old = p.String()
+	}
+	t.setPeer(src)
+	t.dpi.peerRoamed(old, src.String())
 }
 
 // writeStats writes the current stats to disk as JSON every 2 seconds (for the monitor menu).
@@ -530,11 +686,12 @@ func (t *Tunnel) writeStats(path string) {
 	for {
 		time.Sleep(2 * time.Second)
 		peer := ""
-		if p := t.getPeer(); p != nil {
+		if p, ok := t.getPeer(); ok {
 			peer = p.String()
 		}
 		s := map[string]any{
 			"role":           t.role,
+			"cipher":         t.suite,
 			"iface":          t.ifname,
 			"listen":         t.listen,
 			"peer":           peer,
@@ -549,6 +706,7 @@ func (t *Tunnel) writeStats(path string) {
 			"last_rx_unix":   atomic.LoadInt64(&t.lastRxUnix),
 			"now_unix":       time.Now().Unix(),
 		}
+		t.dpi.addStats(s)
 		b, err := json.MarshalIndent(s, "", "  ")
 		if err != nil {
 			continue
@@ -557,4 +715,19 @@ func (t *Tunnel) writeStats(path string) {
 			os.Rename(tmp, path)
 		}
 	}
+}
+
+// describe is the one-line startup banner.
+func (t *Tunnel) describe(cfg *Config) string {
+	rekeyDesc := "static"
+	if cfg.RekeyInterval > 0 {
+		rekeyDesc = fmt.Sprintf("every %ds", cfg.RekeyInterval)
+	}
+	rate := "unlimited"
+	if cfg.RateMbps > 0 {
+		rate = fmt.Sprintf("%.0f Mbit/s", cfg.RateMbps)
+	}
+	return fmt.Sprintf("role=%s transport=%s cipher=%s obfs=%s listen=%s peer=%s mtu=%d pad_max=%d keepalive=%d rekey=%s dpi_log=%v rate=%s",
+		cfg.Role, cfg.Transport, t.suite, cfg.Obfs, cfg.Listen, cfg.Peer, cfg.MTU,
+		derefOr(cfg.PadMax, 64), derefOr(cfg.Keepalive, 25), rekeyDesc, t.dpi.enabled(), rate)
 }
