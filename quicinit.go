@@ -34,6 +34,76 @@ var quicInitialSalt = []byte{
 	0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
 }
 
+// quicInitialSaltV2 is the QUIC v2 salt from RFC 9369 §3.3.1. v2 is a deliberately
+// "version-flexible" revision of v1: same packet structure, different version number,
+// different Initial salt, different key labels, and permuted long-header type codes.
+var quicInitialSaltV2 = []byte{
+	0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93,
+	0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
+}
+
+// --- QUIC versions the handshake cover can imitate -------------------------
+//
+// Which version the cover claims is not cosmetic. Some networks blacklist the *deployed*
+// QUIC versions outright: measurement on an Iranian carrier (AS25184) showed every
+// long-header packet carrying v1 or the ff0000xx draft series silently dropped, while v2
+// passed untouched — and worse, one dropped v1 Initial blackholed the whole 5-tuple, so
+// the short-header traffic that followed died with it and the tunnel never came up.
+//
+// So the version is a parameter, not a constant. `obfs: quic` keeps emitting v1, which is
+// what the overwhelming majority of real QUIC on the internet is; `obfs: quic2` emits v2,
+// which is real, RFC-specified, shipped by Chrome and Cloudflare, and — where v1 is
+// blacklisted — the difference between a working tunnel and a dead one.
+type quicVer struct {
+	version uint32
+	salt    []byte
+	// keyLabel/ivLabel/hpLabel are the HKDF-Expand-Label inputs. v2 renames all three
+	// (RFC 9369 §3.3.2) so that a v1 implementation cannot read v2 Initials by accident.
+	keyLabel, ivLabel, hpLabel string
+	// initialType is the two-bit long-header packet type for an Initial. v1 numbers
+	// Initial 0b00; v2 permutes the codes and numbers it 0b01 (RFC 9369 §3.2).
+	initialType byte
+}
+
+var (
+	quicV1 = quicVer{
+		version:     0x00000001,
+		salt:        quicInitialSalt,
+		keyLabel:    "quic key",
+		ivLabel:     "quic iv",
+		hpLabel:     "quic hp",
+		initialType: 0,
+	}
+	quicV2 = quicVer{
+		version:     0x6b3343cf,
+		salt:        quicInitialSaltV2,
+		keyLabel:    "quicv2 key",
+		ivLabel:     "quicv2 iv",
+		hpLabel:     "quicv2 hp",
+		initialType: 1,
+	}
+)
+
+// quicVerFor maps an obfs mode name onto the version its handshake cover imitates.
+func quicVerFor(obfs string) quicVer {
+	if obfs == obfsQUICv2 {
+		return quicV2
+	}
+	return quicV1
+}
+
+// quicVerByNumber returns the parameters for a version number we know how to speak, so a
+// reply can be built in whatever version the peer opened with.
+func quicVerByNumber(v uint32) (quicVer, bool) {
+	switch v {
+	case quicV1.version:
+		return quicV1, true
+	case quicV2.version:
+		return quicV2, true
+	}
+	return quicVer{}, false
+}
+
 func hkdfExtract(salt, ikm []byte) []byte {
 	m := hmac.New(sha256.New, salt)
 	m.Write(ikm)
@@ -69,16 +139,17 @@ type quicInitialKeys struct {
 }
 
 // initialKeys derives the client- or server-side Initial keys for a destination connection
-// ID, exactly as any QUIC v1 stack would.
-func initialKeys(dcid []byte, client bool) (*quicInitialKeys, error) {
-	initial := hkdfExtract(quicInitialSalt, dcid)
+// ID, exactly as any stack speaking that QUIC version would. The "client in"/"server in"
+// labels are the one part v2 leaves alone (RFC 9369 §3.3.2 renames only key/iv/hp).
+func initialKeys(ver quicVer, dcid []byte, client bool) (*quicInitialKeys, error) {
+	initial := hkdfExtract(ver.salt, dcid)
 	side := "server in"
 	if client {
 		side = "client in"
 	}
 	secret := hkdfExpandLabel(initial, side, 32)
 
-	blk, err := aes.NewCipher(hkdfExpandLabel(secret, "quic key", 16))
+	blk, err := aes.NewCipher(hkdfExpandLabel(secret, ver.keyLabel, 16))
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +157,11 @@ func initialKeys(dcid []byte, client bool) (*quicInitialKeys, error) {
 	if err != nil {
 		return nil, err
 	}
-	hpBlk, err := aes.NewCipher(hkdfExpandLabel(secret, "quic hp", 16))
+	hpBlk, err := aes.NewCipher(hkdfExpandLabel(secret, ver.hpLabel, 16))
 	if err != nil {
 		return nil, err
 	}
-	return &quicInitialKeys{aead: aead, iv: hkdfExpandLabel(secret, "quic iv", 12), hp: hpBlk}, nil
+	return &quicInitialKeys{aead: aead, iv: hkdfExpandLabel(secret, ver.ivLabel, 12), hp: hpBlk}, nil
 }
 
 // --- varint (RFC 9000 §16) ------------------------------------------------
@@ -192,8 +263,8 @@ func buildClientHello(sni string) []byte {
 // header is the client's source connection ID. Deriving from the header's DCID instead
 // produces a packet no QUIC stack — and no DPI — can decrypt, which defeats the entire
 // purpose of sending it.
-func buildInitial(keyCID, dcid, scid, crypto []byte, client bool) ([]byte, error) {
-	keys, err := initialKeys(keyCID, client)
+func buildInitial(ver quicVer, keyCID, dcid, scid, crypto []byte, client bool) ([]byte, error) {
+	keys, err := initialKeys(ver, keyCID, client)
 	if err != nil {
 		return nil, err
 	}
@@ -216,9 +287,10 @@ func buildInitial(keyCID, dcid, scid, crypto []byte, client bool) ([]byte, error
 	rand.Read(pnb[:])
 	pn = binary.BigEndian.Uint32(pnb[:]) & 0xffff // keep it small, like a real first packet
 
-	// Long header: 1 (form) 1 (fixed) 00 (Initial) 00 (reserved) 11 (pn len - 1)
-	hdr := []byte{0xc0 | (pnLen - 1)}
-	hdr = binary.BigEndian.AppendUint32(hdr, 1) // version 1
+	// Long header: 1 (form) 1 (fixed) TT (packet type) 00 (reserved) 11 (pn len - 1).
+	// The Initial type code is version-dependent: 0b00 in v1, 0b01 in v2.
+	hdr := []byte{0xc0 | (ver.initialType << 4) | (pnLen - 1)}
+	hdr = binary.BigEndian.AppendUint32(hdr, ver.version)
 	hdr = append(hdr, byte(len(dcid)))
 	hdr = append(hdr, dcid...)
 	hdr = append(hdr, byte(len(scid)))
@@ -350,12 +422,13 @@ func quicPeekInitialSNI(pkt []byte) (sni string) {
 			sni = ""
 		}
 	}()
-	// Long header, version 1, packet type Initial (bits 5-4 == 00). Anything else is not
-	// something we know how to read.
+	// Long header, a version whose Initial keys we can derive, and the Initial packet type
+	// for that version (0b00 in v1, 0b01 in v2). Anything else is not something we can read.
 	if len(pkt) < 7 || len(pkt) > 4096 || pkt[0]&0x80 == 0 {
 		return ""
 	}
-	if binary.BigEndian.Uint32(pkt[1:5]) != 1 || (pkt[0]>>4)&0x03 != 0 {
+	ver, ok := quicVerByNumber(binary.BigEndian.Uint32(pkt[1:5]))
+	if !ok || (pkt[0]>>4)&0x03 != ver.initialType {
 		return ""
 	}
 	p := 5
@@ -393,7 +466,7 @@ func quicPeekInitialSNI(pkt []byte) (sni string) {
 
 	// Initial keys come from the destination connection ID in the client's first packet,
 	// which is exactly the value sitting in this header.
-	keys, err := initialKeys(dcid, true)
+	keys, err := initialKeys(ver, dcid, true)
 	if err != nil {
 		return ""
 	}
@@ -546,7 +619,7 @@ func sanitiseName(s string) string {
 // sendClientInitial emits the opening Initial for a freshly opened carrier flow and returns
 // the source connection ID it advertised, which the peer echoes back as its destination.
 // Errors are not fatal: this is cover traffic and the tunnel works without it.
-func sendClientInitial(c carrier, sni string) ([]byte, error) {
+func sendClientInitial(c carrier, sni string, ver quicVer) ([]byte, error) {
 	dcid := make([]byte, 8)
 	scid := make([]byte, 8)
 	if _, err := rand.Read(dcid); err != nil {
@@ -556,7 +629,7 @@ func sendClientInitial(c carrier, sni string) ([]byte, error) {
 		return nil, err
 	}
 	// The client picks the DCID, so it is both the header value and the key input.
-	pkt, err := buildInitial(dcid, dcid, scid, buildClientHello(sni), true)
+	pkt, err := buildInitial(ver, dcid, dcid, scid, buildClientHello(sni), true)
 	if err != nil || pkt == nil {
 		return scid, err
 	}
@@ -572,13 +645,24 @@ func replyServerInitial(c carrier, clientPkt []byte) error {
 	if !ok || len(clientSCID) == 0 || len(clientDCID) == 0 {
 		return nil
 	}
+	// Answer in the version the client opened with, not in whatever this end is configured
+	// to emit. A server that replied to a v2 Initial in v1 would be incoherent to any
+	// stateful classifier — and on a network that drops v1, the reply would simply vanish.
+	v, ok := quicLongVersion(clientPkt)
+	if !ok {
+		return nil
+	}
+	ver, ok := quicVerByNumber(v)
+	if !ok {
+		return nil
+	}
 	scid := make([]byte, 8)
 	if _, err := rand.Read(scid); err != nil {
 		return err
 	}
 	// Header DCID is the client's source ID; the keys still come from the client's original
 	// destination ID, per RFC 9001 §5.2.
-	pkt, err := buildInitial(clientDCID, clientSCID, scid, nil, false)
+	pkt, err := buildInitial(ver, clientDCID, clientSCID, scid, nil, false)
 	if err != nil || pkt == nil {
 		return err
 	}

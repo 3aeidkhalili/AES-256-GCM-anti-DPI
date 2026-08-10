@@ -51,7 +51,7 @@ type Config struct {
 	Listen        string `json:"listen"`         // listen address, e.g. 0.0.0.0:51820
 	Peer          string `json:"peer"`           // peer address host:port (optional; learned from traffic if empty)
 	Transport     string `json:"transport"`      // carrier: "udp" (default) or "tcp"
-	Obfs          string `json:"obfs"`           // "none" (default) or "quic" — see obfs.go
+	Obfs          string `json:"obfs"`           // "none" (default), "quic", "quic2" or "dtls" — see obfs.go / dtlsobfs.go
 	Shape         *bool  `json:"shape"`          // quantise datagram sizes when obfs is on; default true
 	SNI           string `json:"sni"`            // server name in the synthetic QUIC handshake
 	TunName       string `json:"tun_name"`       // interface name, default tun0
@@ -59,8 +59,8 @@ type Config struct {
 	PeerIP        string `json:"peer_ip"`        // peer tunnel IP (informational / for connectivity test)
 	MTU           int    `json:"mtu"`            // interface MTU, default 1300
 	TxQueueLen    int    `json:"txqueuelen"`     // interface tx queue length, default 1000
-	RcvBuf        int    `json:"rcvbuf"`         // UDP socket receive buffer in bytes (0 = 8 MiB); needs net.core.rmem_max >= this
-	SndBuf        int    `json:"sndbuf"`         // UDP socket send buffer in bytes (0 = 8 MiB); needs net.core.wmem_max >= this
+	RcvBuf        int    `json:"rcvbuf"`         // UDP socket receive buffer in bytes (0 = 2 MiB); a queue, so bigger is not better — see applyDefaults
+	SndBuf        int    `json:"sndbuf"`         // UDP socket send buffer in bytes (0 = 2 MiB); oversizing this is bufferbloat
 	PadMax        *int   `json:"pad_max"`        // max random padding bytes per packet (explicit 0 = disabled; omitted = 64)
 	RekeyInterval uint64 `json:"rekey_interval"` // key rotation interval in seconds (0 = static key)
 	ManageIP      *bool  `json:"manage_ip"`      // whether the program runs the ip commands itself; default true
@@ -242,7 +242,7 @@ func (c *Config) applyDefaults() {
 		c.Cipher = cipherAESGCM
 	}
 	if c.Obfs == "" {
-		c.Obfs = "none"
+		c.Obfs = obfsNone
 	}
 	if c.SNI == "" {
 		// Something ordinary and high-volume, so the name itself draws no attention.
@@ -262,15 +262,25 @@ func (c *Config) applyDefaults() {
 		c.TxQueueLen = 1000
 	}
 	if c.RcvBuf == 0 {
-		// 16 MiB, matching the net.core.rmem_max the network tuning sets. At 8 MiB the
-		// receiver was still overflowing under a saturated link — the observer reported it
-		// as kernel.udp_errors/RcvbufErrors — and every one of those drops costs an inner
-		// TCP retransmission, which is far more expensive than the memory. The kernel
-		// clamps the request to rmem_max anyway, so asking for more is never harmful.
-		c.RcvBuf = 16 << 20
+		// 2 MiB. A socket buffer is a queue, and sizing it for peak throughput sizes it
+		// for latency too — which on a tunnel carrying interactive traffic is the wrong
+		// trade. Measured on the reference 650 Mbit/s link, saturated, ping across the
+		// tunnel:
+		//
+		//	16 MiB both ways : 669 Mbit/s, +109 ms of queueing delay, 55 ms jitter
+		//	 2 MiB both ways : 611 Mbit/s,  +22 ms,                    11 ms jitter
+		//
+		// So the old 16 MiB default bought 9% more peak throughput and paid five times
+		// the delay for it. Both directions matter: an oversized *receive* buffer is just
+		// as much of a backlog when the reader falls behind, and asymmetric sizing
+		// (2 MiB send, 16 MiB receive) measured in between at +70 ms.
+		//
+		// Raise it if this link only ever moves bulk data and nothing interactive; the
+		// kernel clamps the request to net.core.rmem_max either way.
+		c.RcvBuf = 2 << 20
 	}
 	if c.SndBuf == 0 {
-		c.SndBuf = 16 << 20
+		c.SndBuf = 2 << 20
 	}
 	if c.PadMax == nil {
 		v := 64
@@ -421,6 +431,10 @@ type Tunnel struct {
 	// and the TLS disguise lives entirely at the tcpCarrier's framing layer.
 	tlsShape bool
 
+	// Which QUIC version the synthetic handshake cover claims. Only meaningful when obfs is
+	// a QUIC mode; see quicinit.go for why this is configurable rather than fixed at v1.
+	coverVer quicVer
+
 	sendSeq uint64
 	replay  *replayWindow
 
@@ -476,8 +490,9 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 		dpi:     newDPILogger(&cfg.DPILog),
 		hopMode: cfg.Hop.on(),
 	}
-	if cfg.Obfs == "quic" {
-		if cfg.Transport == "tcp" {
+	if obfsIsQUIC(cfg.Obfs) || cfg.Obfs == obfsDTLS {
+		t.coverVer = quicVerFor(cfg.Obfs)
+		if cfg.Transport == "tcp" && cfg.Obfs != obfsDTLS {
 			// QUIC is a UDP protocol; over TCP the coherent disguise is TLS. The seal stays
 			// the plain format (obfs nil) and the tcpCarrier wraps each datagram in a TLS
 			// application-data record, opening with a synthetic TLS handshake (tls.go).
@@ -487,7 +502,11 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 			if cfg.Shape != nil {
 				shape = *cfg.Shape
 			}
-			o, err := newObfuscator(psk, sendDir, recvDir, shape)
+			wire := wireQUIC
+			if cfg.Obfs == obfsDTLS {
+				wire = wireDTLS
+			}
+			o, err := newObfuscator(psk, sendDir, recvDir, shape, wire)
 			if err != nil {
 				log.Fatalf("obfs init: %v", err)
 			}

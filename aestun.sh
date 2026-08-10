@@ -237,8 +237,8 @@ write_config() {
   "peer_ip": "${CFG_PEER_IP}",
   "mtu": ${CFG_MTU},
   "txqueuelen": ${CFG_TXQ},
-  "rcvbuf": ${CFG_BUF:-8388608},
-  "sndbuf": ${CFG_BUF:-8388608},
+  "rcvbuf": ${CFG_BUF:-2097152},
+  "sndbuf": ${CFG_BUF:-2097152},
   "pad_max": ${CFG_PAD},
   "rekey_interval": ${CFG_REKEY},
   "keepalive": ${CFG_KA},
@@ -253,7 +253,8 @@ write_config() {
   "desync": { "enabled": ${CFG_DESYNC:-false}, "repeats": ${CFG_DESYNC_REP:-4}, "autottl": true, "delta": -1, "badsum": ${CFG_DESYNC_BADSUM:-false} },
   "junk":   { "enabled": ${CFG_JUNK:-false}, "count": ${CFG_JUNK_COUNT:-8}, "min_ms": 5, "max_ms": 50 },
   "hop":    { "enabled": ${CFG_HOP:-false}, "ports": [${CFG_HOP_PORTS:-443, 8443, 2053, 2083, 2087, 2096}], "interval": ${CFG_HOP_INT:-30} },
-  "split":  { "enabled": ${CFG_SPLIT:-false}, "frag_pos": 24 }
+  "split":  { "enabled": ${CFG_SPLIT:-false}, "frag_pos": 24 },
+  "tcp_rotate": { "enabled": ${CFG_TCPROT:-false}, "interval_sec": ${CFG_TCPROT_INT:-15} }
 }
 EOF
   chmod 600 "$CONF"
@@ -426,13 +427,24 @@ interactive_setup() {
   # else on the wire looks like that. "quic" gives each datagram a QUIC short header and
   # opens the flow with a real Initial packet, so it reads as an ordinary QUIC connection.
   printf '\n%sWire obfuscation%s — must match on BOTH servers.\n' "$BOLD" "$N"
-  printf '  %snone%s: raw high-entropy datagrams (compatible with older builds)\n' "$C" "$N"
-  printf '  %squic%s: shapes the carrier as its natural TLS-family form — QUIC over UDP,\n' "$C" "$N"
-  printf '        TLS (records + synthetic handshake) over TCP\n'
-  CFG_OBFS="$(ask "Obfuscation (none/quic)" "quic")"
-  [[ "$CFG_OBFS" == "none" || "$CFG_OBFS" == "quic" ]] || {
-    warn "Unknown obfs '$CFG_OBFS' — using none."; CFG_OBFS="none"; }
-  if [[ "$CFG_OBFS" == "quic" ]]; then
+  printf '  %snone%s : raw high-entropy datagrams (compatible with older builds)\n' "$C" "$N"
+  printf '  %squic%s : shapes the carrier as its natural TLS-family form — QUIC over UDP,\n' "$C" "$N"
+  printf '         TLS (records + synthetic handshake) over TCP\n'
+  printf '  %squic2%s: same as quic, but the handshake cover claims QUIC v2 (RFC 9369).\n' "$C" "$N"
+  printf '         Iranian carriers were measured dropping every QUIC %sv1%s long-header\n' "$Y" "$N"
+  printf '         packet, which silently discards the quic cover; v2 passes. %sDefault.%s\n' "$G" "$N"
+  printf '  %sdtls%s : shapes the carrier as DTLS 1.2 records with a ClientHello cover —\n' "$C" "$N"
+  printf '         for links where QUIC itself is what draws attention (UDP only)\n'
+  CFG_OBFS="$(ask "Obfuscation (none/quic/quic2/dtls)" "quic2")"
+  case "$CFG_OBFS" in
+    none|quic|quic2|dtls) ;;
+    *) warn "Unknown obfs '$CFG_OBFS' — using none."; CFG_OBFS="none" ;;
+  esac
+  if [[ "$CFG_OBFS" == "dtls" && "$CFG_TRANSPORT" == "tcp" ]]; then
+    warn "dtls is a UDP record format; over TCP the coherent disguise is TLS — using quic2."
+    CFG_OBFS="quic2"
+  fi
+  if [[ "$CFG_OBFS" != "none" ]]; then
     CFG_SNI="$(ask "Server name to present in the handshake" "www.cloudflare.com")"
   fi
 
@@ -461,7 +473,15 @@ interactive_setup() {
   CFG_KA="$(ask_int "Keepalive interval seconds (0=off)" "25")"
   # Kernel clamps this to net.core.rmem_max/wmem_max, so the network optimization
   # below has to raise those or the request is silently cut to the ~200 KB default.
-  CFG_BUF="$(ask_int "Socket buffer per direction in bytes" "8388608")"
+  #
+  # 2 MiB, not 8. This buffer *is* a queue, and on a fast link an oversized one is pure
+  # bufferbloat: measured on the reference 650 Mbit/s link, 8 MiB held ~62 ms of backlog,
+  # so latency under load went 80 ms -> 142 ms and jitter to 35 ms. Dropping to 2 MiB cut
+  # that to ~19 ms of backlog (loaded latency ~99 ms, jitter ~10 ms) for about 4% of
+  # throughput. Raise it only if you are shifting bulk data and do not care about latency.
+  printf '\n%sSocket buffer%s — this is a queue: too small caps throughput, too large is\n' "$BOLD" "$N"
+  printf 'bufferbloat. 2 MiB is the measured sweet spot on a ~650 Mbit/s link.\n'
+  CFG_BUF="$(ask_int "Socket buffer per direction in bytes" "2097152")"
 
   # --- DPI / probe observability ---
   printf '\n%sDPI and probe logging%s — records what reaches the carrier port from outside the\n' "$BOLD" "$N"
@@ -1009,8 +1029,14 @@ dpi_selftest() {
   printf 'Sending probe traffic to 127.0.0.1:%s — the same port the tunnel listens on.\n' "$port"
   printf '%sThis is local traffic only; nothing leaves the machine.%s\n\n' "$D" "$N"
 
-  printf '  1/2  QUIC Initial (what an active prober sends)...\n'
-  "$BIN_DST" probe -target "127.0.0.1:${port}" -mode quic -sni www.google.com -count 3 || true
+  # Probe in the handshake format this tunnel actually speaks, so the self-test exercises
+  # the code path in use rather than one the config never reaches. obfs=none has no
+  # handshake cover of its own, so it falls back to a QUIC Initial — which is exactly what
+  # an unsolicited prober would send at it.
+  local pmode; pmode="$(json_get "$CONF" obfs 2>/dev/null)"
+  case "$pmode" in quic|quic2|dtls) ;; *) pmode="quic" ;; esac
+  printf '  1/2  %s handshake (what an active prober sends)...\n' "$pmode"
+  "$BIN_DST" probe -target "127.0.0.1:${port}" -mode "$pmode" -sni www.google.com -count 3 || true
   printf '  2/2  random datagrams (what a port scanner sends)...\n'
   "$BIN_DST" probe -target "127.0.0.1:${port}" -mode junk -count 25 -size 200 || true
 
@@ -1035,8 +1061,37 @@ c=json.load(open(sys.argv[1]))
 def st(k):
     v=c.get(k,{})
     return "on" if isinstance(v,dict) and v.get("enabled") else "off"
-print("desync=%s junk=%s hop=%s split=%s"%(st("desync"),st("junk"),st("hop"),st("split")))
+print("obfs=%s desync=%s junk=%s hop=%s split=%s"%(c.get("obfs","none"),st("desync"),st("junk"),st("hop"),st("split")))
 PY
+}
+
+# antidpi_set_obfs — change the wire disguise in place. Must be changed on BOTH servers:
+# the two formats are not negotiated, so a mismatch means every packet fails to open.
+antidpi_set_obfs() {
+  [[ -f "$CONF" ]] || { err "No config."; return 1; }
+  printf '\n%sWire disguise%s (must match on BOTH servers)\n' "$BOLD" "$N"
+  printf '  %snone%s  raw high-entropy datagrams\n' "$C" "$N"
+  printf '  %squic%s  QUIC v1 cover — note: Iranian carriers were measured dropping every\n' "$C" "$N"
+  printf '        v1 long-header packet, so the cover never arrives (tunnel still runs)\n'
+  printf '  %squic2%s QUIC v2 cover (RFC 9369) — passes where v1 is dropped\n' "$C" "$N"
+  printf '  %sdtls%s  DTLS 1.2 records + ClientHello cover (UDP only)\n' "$C" "$N"
+  local m; m="$(ask 'Mode (none/quic/quic2/dtls)' "$(json_get "$CONF" obfs)")" || return 1
+  case "$m" in
+    none|quic|quic2|dtls) ;;
+    *) warn "Unknown mode '$m' — unchanged."; return 1 ;;
+  esac
+  python3 - "$CONF" "$m" <<'PY'
+import json,sys
+p=sys.argv[1]
+c=json.load(open(p))
+c["obfs"]=sys.argv[2]
+if sys.argv[2]=="dtls" and c.get("transport")=="tcp":
+    print("dtls is UDP-only; leaving transport tcp would fail to start — switching to udp.")
+    c["transport"]="udp"
+json.dump(c,open(p,"w"),indent=2)
+PY
+  chmod 600 "$CONF"
+  msg "obfs set to '$m'. Set the SAME value on the other server, then restart both."
 }
 
 antidpi_set() { # antidpi_set MODULE true|false
@@ -1091,6 +1146,7 @@ antidpi_menu() {
   ${C}3${N}) toggle port hopping
   ${C}4${N}) toggle split
   ${C}5${N}) set port-hopping ports
+  ${C}6${N}) change wire disguise (none/quic/quic2/dtls)
   ${C}0${N}) back (restart to apply)
 EOF
     local c; c="$(ask 'Choose' '')" || return
@@ -1104,6 +1160,7 @@ EOF
          fi ;;
       4) if [[ "$state" == *split=on* ]]; then antidpi_set split false; else antidpi_set split true; fi ;;
       5) antidpi_set_hop_ports ;;
+      6) antidpi_set_obfs; pause ;;
       0) if confirm "Restart aestun now to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
          return ;;
       *) warn "invalid option"; sleep 1 ;;
@@ -1151,10 +1208,16 @@ autotest() {
   local peer_ip; peer_ip="$(json_get "$CONF" peer_ip)"; peer_ip="${peer_ip:-10.8.0.2}"
 
   # variant table: name|overrides(JSON merged onto BOTH ends)
+  # The wire-format variants come first and are worth the time even on a link that already
+  # works: a disguise whose handshake cover the network silently drops still carries traffic,
+  # so a passing tunnel is not evidence that its cover is intact. Measured on two Iranian
+  # carriers, quic (v1) is exactly that case — the tunnel runs, the cover does not arrive.
   local variants=(
     "baseline|{}"
-    "desync+split+junk|{\"transport\":\"udp\",\"obfs\":\"quic\",\"desync\":{\"enabled\":true,\"repeats\":6},\"split\":{\"enabled\":true},\"junk\":{\"enabled\":true}}"
-    "port-hop|{\"transport\":\"udp\",\"obfs\":\"quic\",\"hop\":{\"enabled\":true,\"ports\":[443,2053,2083,2087,2096],\"interval\":20}}"
+    "quic-v1|{\"transport\":\"udp\",\"obfs\":\"quic\"}"
+    "dtls|{\"transport\":\"udp\",\"obfs\":\"dtls\"}"
+    "desync+split+junk|{\"transport\":\"udp\",\"obfs\":\"quic2\",\"desync\":{\"enabled\":true,\"repeats\":6},\"split\":{\"enabled\":true},\"junk\":{\"enabled\":true}}"
+    "port-hop|{\"transport\":\"udp\",\"obfs\":\"quic2\",\"hop\":{\"enabled\":true,\"ports\":[443,2053,2083,2087,2096],\"interval\":20}}"
     "tcp+tls|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true}}"
     "tcp+tls+rotate|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true},\"tcp_rotate\":{\"enabled\":true,\"interval_sec\":15}}"
   )
@@ -1178,7 +1241,7 @@ def m(a,b):
 # reset the four method blocks to off first, so each variant is clean
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic"
+c["transport"]="udp"; c["obfs"]="quic2"
 m(c,o); json.dump(c,sys.stdout)
 PY
     cp "${CONF}.try" "$CONF"
@@ -1192,7 +1255,7 @@ def m(a,b):
     return a
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic"
+c["transport"]="udp"; c["obfs"]="quic2"
 m(c,o); json.dump(c,sys.stdout)
 PY
     $RSSH "cp ${RCONF}.try $RCONF" >/dev/null 2>&1
@@ -1301,7 +1364,7 @@ def m(a,b):
     return a
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic"
+c["transport"]="udp"; c["obfs"]="quic2"
 m(c,o); json.dump(c,sys.stdout)
 PY
 }
@@ -1319,7 +1382,7 @@ def m(a,b):
     return a
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic"
+c["transport"]="udp"; c["obfs"]="quic2"
 m(c,o); json.dump(c,open(out,"w"))
 PY
 )
@@ -1328,12 +1391,15 @@ PY
 }
 
 status_line() {
-  local st ins peer
+  local st ins peer tr ob
   st="$(svc_active aestun)"
   ins="not configured"; [[ -f "$CONF" ]] && ins="configured"
   local st_c="$R"; [[ "$st" == active ]] && st_c="$G"
   peer="$(json_get "$CONF" peer 2>/dev/null)"
-  printf '%s\n' "${D}status: ${st_c}${st}${N}${D} | ${ins} | peer: ${peer:-–} | arch: $(arch_tag)${N}"
+  # The wire format is the thing most likely to be wrong (it has to match on both ends and
+  # there are now four of them), so it belongs on the status line rather than three menus in.
+  tr="$(json_get "$CONF" transport 2>/dev/null)"; ob="$(json_get "$CONF" obfs 2>/dev/null)"
+  printf '%s\n' "${D}status: ${st_c}${st}${N}${D} | ${ins} | peer: ${peer:-–} | wire: ${tr:-udp}+${ob:-none} | arch: $(arch_tag)${N}"
 }
 
 main_menu() {
@@ -1522,15 +1588,56 @@ do_upgrade() {
   [[ "$newc" == "aes-gcm" || "$newc" == "chacha20-poly1305" ]] || {
     warn "Unknown cipher '$newc' — keeping $cur."; newc="$cur"; }
 
+  # --- wire disguise ---
+  # Existing installs are the ones most likely to be sitting on obfs=quic, which on Iranian
+  # carriers has its handshake cover dropped outright: the tunnel keeps working, so nothing
+  # looks wrong, while the disguise it was configured for is simply not happening.
+  local curo newo
+  curo="$(json_get "$CONF" obfs)"; curo="${curo:-none}"
+  printf '\n%sWire disguise%s  current: %s%s%s\n' "$BOLD" "$N" "$W" "$curo" "$N"
+  if [[ "$curo" == "quic" && "$(json_get "$CONF" transport)" != "tcp" ]]; then
+    printf '  %squic2 is recommended over quic on Iranian links:%s every QUIC v1 long-header\n' "$Y" "$N"
+    printf '  packet was measured dropped on AS25184 and AS34918, so the synthetic handshake\n'
+    printf '  never arrives and the flow reads as 1-RTT packets with no handshake in front.\n'
+    printf '  Same wire format for data, so throughput is unchanged. (README §10.2)\n'
+  fi
+  printf '  %snone%s / %squic%s / %squic2%s / %sdtls%s — must match on BOTH servers.\n' "$C" "$N" "$C" "$N" "$C" "$N" "$C" "$N"
+  local defo="$curo"; [[ "$curo" == "quic" && "$(json_get "$CONF" transport)" != "tcp" ]] && defo="quic2"
+  newo="$(ask "Obfuscation" "$defo")"
+  case "$newo" in none|quic|quic2|dtls) ;; *) warn "Unknown obfs '$newo' — keeping $curo."; newo="$curo" ;; esac
+
+  # --- socket buffers ---
+  # 8/16 MiB was the old default and is pure bufferbloat on a fast link; see the note in
+  # tunnel.go applyDefaults for the measurement behind 2 MiB.
+  local curbuf newbuf
+  curbuf="$(json_get "$CONF" rcvbuf)"; curbuf="${curbuf:-0}"
+  newbuf="$curbuf"
+  if [[ "$curbuf" =~ ^[0-9]+$ && "$curbuf" -gt 4194304 ]]; then
+    printf '\n%sSocket buffers%s  current: %s bytes per direction\n' "$BOLD" "$N" "$curbuf"
+    printf '  That buffer is a queue. Measured on a 650 Mbit/s link, 8 MiB held ~62 ms of\n'
+    printf '  backlog (latency under load 80 -> 142 ms, jitter 35 ms); 2 MiB cut it to ~19 ms\n'
+    printf '  (loaded latency ~99 ms, jitter ~10 ms) for about 4%% of throughput.\n'
+    ask_yn "Reduce to 2 MiB (better latency, slightly lower peak throughput)" "Y" && newbuf=2097152
+  fi
+
   # --- dpi log ---
   local dpion=true
   ask_yn "Enable DPI/probe logging" "Y" || dpion=false
 
-  python3 - "$CONF" "$newc" "$dpion" "$DPI_LOG" <<'PY'
+  python3 - "$CONF" "$newc" "$dpion" "$DPI_LOG" "$newo" "$newbuf" <<'PY'
 import json,sys
 path,cipher,dpion,logpath=sys.argv[1],sys.argv[2],sys.argv[3]=="true",sys.argv[4]
+obfs,buf=sys.argv[5],int(sys.argv[6])
 c=json.load(open(path))
 c["cipher"]=cipher
+c["obfs"]=obfs
+if buf:
+    c["rcvbuf"]=buf
+    c["sndbuf"]=buf
+# Older configs predate these blocks entirely; add them disabled so every knob the menus
+# offer is present in the file rather than silently defaulted inside the binary.
+c.setdefault("tcp_rotate",{"enabled":False,"interval_sec":15})
+c.setdefault("split",{"enabled":False,"frag_pos":24})
 d=c.setdefault("dpi_log",{})
 d["enabled"]=dpion
 d.setdefault("path",logpath)
@@ -1538,7 +1645,11 @@ d.setdefault("probe",True)
 json.dump(c,open(path,"w"),indent=2)
 PY
   chmod 600 "$CONF"
-  msg "Config updated (cipher=$newc, dpi_log.enabled=$dpion)."
+  msg "Config updated (cipher=$newc, obfs=$newo, buffers=${newbuf}, dpi_log.enabled=$dpion)."
+  if [[ "$newo" != "$curo" ]]; then
+    printf '\n%sThe wire disguise changed. Set obfs=%s on the OTHER server too — the formats are\n' "$Y" "$newo"
+    printf 'not negotiated, so a mismatch means every packet fails to authenticate.%s\n' "$N"
+  fi
 
   if [[ "$newc" != "$cur" ]]; then
     printf '\n%sThe cipher changed. The two ends will not talk until the OTHER server is set to\n' "$Y"

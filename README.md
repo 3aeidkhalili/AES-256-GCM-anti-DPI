@@ -21,6 +21,8 @@ runtime dependencies. The only third-party code is `golang.org/x/crypto/chacha20
 | 🔒 | AEAD encryption, per-direction keys, anti-replay, epoch rotation | on | §1 |
 | 🥷 | **QUIC** wire disguise over UDP (synthetic handshake, header protection, size buckets) | on with `obfs:quic` | §10 |
 | 🧣 | **TLS** wire disguise over TCP (synthetic ClientHello/ServerHello + application-data records) | on with `tcp`+`obfs:quic` | §10.1 |
+| 🛡️ | **QUIC v2** handshake cover — passes carriers that drop every QUIC v1 long header | on with `obfs:quic2` | §10.2 |
+| 📞 | **DTLS** wire disguise over UDP (1.2 records + plaintext ClientHello cover) | on with `obfs:dtls` | §10.3 |
 | 🎭 | **desync** — native in-process fake-QUIC injector (the zapret idea, no NFQUEUE) | **on** | §15.1 |
 | 🫧 | **junk** — flow-start cover traffic | **on** | §15.2 |
 | 🔀 | **hop** — keyed synchronised UDP port hopping | off | §15.3 |
@@ -30,9 +32,67 @@ runtime dependencies. The only third-party code is `golang.org/x/crypto/chacha20
 | 🧪 | **auto-test** — sweep every method/protocol on the live link and apply the best | menu `t` | §16 |
 | 🛰️ | **DPI observer** — probes, replays, injection, TTL anomalies, throttle/blackhole detection | on | §9 |
 
-> 🧭 **Recommended default (verified on a live link):** `transport: udp` + `obfs: quic` +
+> 🧭 **Recommended default (verified on a live link):** `transport: udp` + `obfs: quic2` +
 > **desync + split + junk**. See the field-test log in **§17** — measured on the reference
-> servers while they carried real user traffic.
+> servers while they carried real user traffic. Prefer `quic2` over `quic` on Iranian
+> carriers: both carry traffic identically, but v1's handshake cover is dropped outright
+> there, which silently removes the disguise §10 exists to provide (**§10.2**).
+
+> 🇮🇷 **فارسی:** یک راهنمای کامل فارسی در **[README.fa.md](README.fa.md)** هست.
+
+---
+
+## 🧭 0. Start here — the short version
+
+**What this is.** Two servers, one encrypted tunnel between them. You get a private network
+link (`10.8.0.1` ↔ `10.8.0.2`) that carries any IP traffic, and the bytes on the wire are
+built so that a censor's Deep Packet Inspection box cannot tell what they are.
+
+**The usual setup.** One server inside a censored network, one outside. Users connect to the
+inside server; their traffic rides the tunnel out.
+
+```
+   your users  ──▶  🇮🇷 server A  ══ encrypted tunnel ══▶  🌍 server B  ──▶  the internet
+                    (role "a")        looks like QUIC          (role "b")
+```
+
+**Install it — the whole thing, on each server:**
+
+```bash
+git clone https://github.com/YOURNAME/aestun && cd aestun
+sudo ./aestun.sh install     # answer the questions; run this on BOTH servers
+```
+
+Run `sudo ./aestun.sh` afterwards for the menu (status, live dashboard, logs, tuning).
+
+Three things **must be identical on both servers**, or nothing will work: the `key`, the
+`cipher`, and the `obfs` mode. Everything else is per-server.
+
+### Which options should I pick?
+
+If you do not want to read the rest of this document, use these answers.
+
+| Question | Answer | Why |
+|---|---|---|
+| `transport` | **`udp`** | ~3× faster than `tcp` here (650 vs 200 Mbit/s) and far better latency. Use `tcp` only if UDP is blocked outright. |
+| `obfs` | **`quic2`** | Makes the traffic look like a normal QUIC connection. `quic` looks the same but its opening handshake is **deleted by Iranian networks**, so the disguise quietly stops working (§10.2). |
+| `cipher` | **`chacha20-poly1305`** unless *both* CPUs have AES-NI | On a CPU without AES-NI, AES is slow and software-only. The wizard checks and tells you (§6). |
+| socket buffers | **2 MiB** (the default) | Bigger is *not* better — it is a queue, and an 8 MiB one adds ~60 ms of lag whenever the link is busy (§7.1). |
+| anti-DPI modules | start with all **off** | Turn them on only if the link is actually being interfered with. They cost speed and solve problems you may not have (§15). |
+
+**Not sure it is working?** `sudo ./aestun.sh` → *4) Connectivity test*. If that pings, the
+tunnel is up. If it does not, go to §13.
+
+### Words you will see
+
+| Term | In plain language |
+|---|---|
+| **DPI** | The censor's machine that reads passing traffic and decides what to block. |
+| **carrier** | The real UDP/TCP connection between your two servers, that everything else hides inside. |
+| **obfs / disguise** | Making the carrier *look* like some ordinary protocol so DPI ignores it. |
+| **cover / handshake cover** | Fake opening packets that make the flow look like a real QUIC or DTLS session starting. They carry no data. |
+| **role a / role b** | Which end is which. `a` opens the conversation (put it on the inside server), `b` answers. |
+| **bufferbloat** | Oversized queues. Speed looks fine, but ping goes bad the moment the link is busy. |
 
 ---
 
@@ -182,9 +242,9 @@ Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json
 | `listen` | `0.0.0.0:51820` | local UDP listen address |
 | `peer` | — | the other server `host:port` (learned from traffic if empty) |
 | `transport` | `udp` | carrier: `udp` or `tcp`. **Prefer udp** — see the note below |
-| `obfs` | `none` | `quic` shapes the carrier as its natural TLS-family form: **QUIC** over UDP (section 10), **TLS** over TCP (section 10.1) |
-| `sni` | `www.cloudflare.com` | server name in the synthetic handshake (`obfs: quic` only) |
-| `shape` | `true` | quantise datagram sizes onto buckets (`obfs: quic` only) |
+| `obfs` | `none` | `quic` shapes the carrier as its natural TLS-family form: **QUIC** over UDP (section 10), **TLS** over TCP (section 10.1). `quic2` is the same wire format with a **QUIC v2** handshake cover — use it where v1 is filtered (section 10.2). `dtls` shapes the carrier as **DTLS 1.2** records instead, UDP only (section 10.3) |
+| `sni` | `www.cloudflare.com` | server name in the synthetic handshake (any `obfs` other than `none`) |
+| `shape` | `true` | quantise datagram sizes onto buckets (not with `obfs: none`) |
 | `tun_name` | `tun0` | TUN interface name |
 | `local_ip` | `10.8.0.x/24` | this server's tunnel IP (CIDR) |
 | `peer_ip` | `10.8.0.y` | the other server's tunnel IP (used by the ping test) |
@@ -428,6 +488,42 @@ signature is non-zero loss at rates *well below* the knee — then the useful th
 FEC alone, not ARQ: parity recovers isolated drops without any head-of-line blocking. That is
 a reasonable addition to this design. Blanket KCP is not.
 
+### 7.1 Latency under load — the socket buffer is a queue
+
+Idle ping across the tunnel is set by distance and nothing in this project moves it: on the
+reference Iran↔Germany link it is ~79 ms whatever you configure. What *is* tunable, and what
+users actually experience as "bad ping", is the delay that appears **while the link is busy**.
+That delay is queueing, and the biggest queue is the carrier's own socket buffer.
+
+Measured on the reference link (650 Mbit/s, saturated with 4 TCP streams, pinging across the
+tunnel at the same time):
+
+| `rcvbuf` / `sndbuf` | throughput | idle ping | ping under load | jitter | added delay |
+|---|---|---|---|---|---|
+| 16 MiB | 669 Mbit/s | 79 ms | 189 ms | 55 ms | **+109 ms** |
+| 8 MiB | 660 Mbit/s | 80 ms | 142 ms | 35 ms | **+62 ms** |
+| **2 MiB** *(default)* | 633 Mbit/s | 80 ms | 97 ms | 9 ms | **+16 ms** |
+| 1 MiB | 614 Mbit/s | 80 ms | 91 ms | 6 ms | +11 ms |
+| 512 KiB | 595 Mbit/s | 80 ms | 88 ms | 7 ms | +8 ms |
+
+So the old 8–16 MiB default bought a few percent of peak throughput and paid four to seven
+times the delay for it. **2 MiB is the default** because it keeps ~95% of the throughput and
+turns a link that felt laggy under load into one that does not.
+
+Three things that sound like they should help here, and do not:
+
+* **Asymmetric sizing** (small send buffer, large receive buffer) measured at +70 ms — an
+  oversized *receive* buffer is just as much of a backlog when the reader falls behind.
+* **The tun interface's qdisc.** `fq`, `fq_codel`, `cake` and `pfifo_fast` all landed within
+  noise of each other. The queue that matters is not there.
+* **`rate_mbps` pacing.** Shaping to just under line rate made both latency and throughput
+  slightly worse. Pacing is for getting under a *policer* (§7), not for latency.
+
+**TCP carriers cannot be fixed this way.** With `transport: tcp` the added delay stayed at
++106…+134 ms no matter how the buffers were set, because the queues that matter are the
+kernel's TCP send queues at both ends and TCP-over-TCP retransmission on top of them. This is
+the same reason §5 says to prefer UDP: it is not only faster, it is dramatically smoother.
+
 ---
 
 ## 🐧 8. Network optimization (Ubuntu tuning)
@@ -605,6 +701,80 @@ would find the handshake goes nowhere.
 > ran the UDP/QUIC carrier with zero loss. The lesson is the one section 5 already gives: use
 > `tcp` only where UDP is blocked outright, and do not expect a bulk flow over it to survive a
 > volumetric policer just because it looks like HTTPS.
+
+### 10.2 QUIC v2 cover (`obfs: quic2`) — when v1 is filtered
+
+`obfs: quic2` is byte-for-byte the same wire format as `quic` for tunnel data. The only
+difference is the version the synthetic handshake in section 10 claims: **QUIC v2**
+(RFC 9369, `0x6b3343cf`) instead of v1. v2 is a real, deployed version — it changes the
+Initial salt, renames the key-derivation labels to `quicv2 …`, and permutes the long-header
+packet type codes, all of which this build implements, so the packet is a genuine v2 Initial
+rather than a v1 one with the version field overwritten.
+
+It exists because of a measurement. On two independent Iranian carriers — AS25184 (Afranet)
+and AS34918 (Pishgaman) — every long-header packet carrying **QUIC v1** was dropped, in both
+directions, while the same flow's short-header packets passed untouched:
+
+| cover sent (200 packets each) | delivered |
+|---|---|
+| QUIC v1 Initial (`0x00000001`) | **0 / 200** |
+| QUIC v2 Initial (`0x6b3343cf`) | 200 / 200 |
+| DTLS 1.2 ClientHello | 200 / 200 |
+| random 1200-byte datagrams | 200 / 200 |
+
+The draft series (`0xff0000xx`) is filtered too; version 0 and GREASE values are not. The
+rule is a version blocklist, and it is national rather than per-ISP.
+
+Two consequences worth being explicit about:
+
+* **A tunnel on `obfs: quic` still runs on such a link.** The Initial is cover — it carries no
+  tunnel data — so losing it costs no connectivity and nothing in the logs looks wrong. What is
+  lost is the entire point of section 10: the flow becomes 1-RTT packets with no handshake in
+  front of them, which is the exact anomaly the cover exists to remove. `quic2` is what makes
+  the disguise real again on these links.
+* **A dropped Initial can take the flow with it.** In controlled tests a single v1 Initial
+  blackholed the whole 5-tuple: short-header packets that followed on the same source and
+  destination port were dropped too, until the flow went idle long enough to age out. That is
+  a tunnel that comes up and then dies for no visible reason — check the cover before blaming
+  the carrier.
+
+Verify the cover actually arrives, rather than assuming it does, with the built-in prober
+(counters on the receiving end, e.g. `nft … counter` or `tcpdump`):
+
+```bash
+aestun probe -mode quic  -target PEER:PORT -count 200   # v1
+aestun probe -mode quic2 -target PEER:PORT -count 200   # v2
+aestun probe -mode dtls  -target PEER:PORT -count 200   # DTLS ClientHello
+```
+
+### 10.3 DTLS shaping (`obfs: dtls`) — a disguise that is not QUIC
+
+A version blocklist is cheap to extend. `obfs: dtls` is the answer to that: not a different
+QUIC, but a different protocol. Each datagram becomes a **DTLS 1.2 application-data record**,
+and the flow opens with a plaintext **ClientHello** that a censor's parser can read straight
+off the wire (unlike QUIC's, which it must decrypt first).
+
+```
+[1 type=0x17][2 version=0xfefd][2 epoch][6 sequence][2 length][ciphertext][16 tag]
+```
+
+The record header is 13 bytes — exactly the size the QUIC short-header format already uses —
+so the disguise costs nothing extra on the wire. As in real DTLS with an AEAD cipher
+(RFC 6347 §4.1.2.1, RFC 5288) the nonce is a salt derived from the pre-shared key followed by
+the record's own epoch and sequence number, so the header *is* nonce material rather than
+something prepended to it. The header stays in the clear, because that is what a real DTLS
+record looks like: there is no header protection to imitate, and masking it would be the one
+thing that stops the record parsing.
+
+Why DTLS specifically: it is what WebRTC uses for every browser call and what OpenVPN uses in
+its UDP mode, so it is close to unblockable wholesale — and the measurement above confirms it
+passes these links at the full offered rate. Both ends must be set to `dtls` (the formats are
+not negotiated), and it is **UDP only**; over TCP the coherent disguise is TLS, which is what
+`obfs: quic` already gives you (section 10.1).
+
+Same honest caveat as section 10. This raises the cost of classification; it is not proof of
+undetectability, and nothing here completes a real DTLS handshake — a prober that tries would
+find the handshake goes nowhere.
 
 ## 🧩 11. zapret module (optional DPI bypass)
 
@@ -939,6 +1109,58 @@ tcp+tls+rotate          20.1      —          —
 ---
 
 ## 📋 17. Field-test log (measured under real load)
+
+### 📊 17.0 Full matrix — every transport × every disguise × every module
+
+Measured on the reference link (🇮🇷 Pishgaman AS34918 ↔ 🌍 Leaseweb Germany, ~79 ms, both ends
+`chacha20-poly1305`), each variant reconfigured on both servers and restarted, then measured
+with `iperf3` (4 streams, each direction) and 60 pings across the tunnel. Buffers at 2 MiB.
+
+**Transports and disguises** — all eight combinations came up and carried traffic:
+
+| Variant | ⬇ down | ⬆ up | RTT | jitter | loss |
+|---|---|---|---|---|---|
+| `udp` + `dtls` | **661** Mbit/s | 704 | 79.7 ms | 1.8 ms | 0 % |
+| `udp` + `quic2` | **649** Mbit/s | 691 | 79.6 ms | 1.5 ms | 0 % |
+| `udp` + `quic` | 620 Mbit/s | 675 | 79.8 ms | 1.9 ms | 0 % |
+| `udp` + `none` | 358 Mbit/s | 488 | 79.8 ms | 1.8 ms | 0 % |
+| `tcp` + `quic` (TLS) | 205 Mbit/s | 259 | 83.3 ms | 6.0 ms | 0 % |
+| `tcp` + `none` | 197 Mbit/s | 227 | 76.0 ms | 2.3 ms | 0 % |
+| `tcp` + `quic2` (TLS) | 197 Mbit/s | 223 | 74.9 ms | 1.8 ms | 0 % |
+| `tcp` + `dtls` | rejected at startup — DTLS is a UDP record format; the error says to use `quic` over TCP |
+
+Two things worth noticing. **UDP is ~3× faster than TCP** here, which is why §5 tells you to
+prefer it. And **`obfs: none` is the slowest UDP option**, not the fastest — the disguise is
+not costing you speed, so there is no throughput argument for running without one.
+
+**Anti-DPI modules**, each on top of `udp` + `quic2`:
+
+| Module | ⬇ down | ⬆ up | RTT | notes |
+|---|---|---|---|---|
+| *(none)* | 649 | 691 | 79.6 ms | baseline |
+| `desync` | 621 | 704 | 79.7 ms | ~4 % cost |
+| `junk` | 638 | 657 | 79.9 ms | negligible cost |
+| `desync` + `split` | 632 | 688 | 79.5 ms | negligible over desync alone |
+| `desync` + `split` + `junk` | 638 | 684 | 80.0 ms | the recommended hardening set |
+| `hop` | 402 | 482 | 80.7 ms | **−38 %** — multi-socket forgoes kernel offload |
+| `tcp_rotate` (on `tcp`+`quic`) | 237 | 223 | 78.7 ms | works; jitter rises with each rotation |
+
+The hardening set costs about 2 % of throughput, so leaving it on is cheap. **`hop` is the one
+expensive module** — turn it on only against an actual 5-tuple block.
+
+**Handshake cover delivery**, 200 packets of each sent at the peer and counted on arrival:
+
+| Cover | Delivered |
+|---|---|
+| QUIC v1 Initial (`obfs: quic`) | **0 / 200** ❌ |
+| QUIC v2 Initial (`obfs: quic2`) | 200 / 200 ✅ |
+| DTLS ClientHello (`obfs: dtls`) | 200 / 200 ✅ |
+| random datagrams (control) | 200 / 200 ✅ |
+
+This is the measurement behind §10.2, and it is the single most important number in this
+document: **on `obfs: quic` the tunnel works and its disguise does not.**
+
+---
 
 The results below were captured on the **reference deployment** — 🇮🇷 Iran (role `a`, AES-NI) ↔
 🌍 foreign (role `b`, QEMU **no** AES-NI → both on `chacha20-poly1305`), a real ~80 ms censored

@@ -36,6 +36,33 @@ const (
 	obfsCIDLen    = 8
 )
 
+// The obfs modes. "quic" and "quic2" produce an identical wire format for tunnel data —
+// the same short-header shaping in this file — and differ only in which QUIC version the
+// synthetic handshake cover claims (quicinit.go). That distinction exists because some
+// networks blacklist long-header packets by version number. "dtls" is a different wire
+// format entirely (dtlsobfs.go), for links where QUIC itself is what draws attention.
+const (
+	obfsNone   = "none"
+	obfsQUIC   = "quic"
+	obfsQUICv2 = "quic2"
+	obfsDTLS   = "dtls"
+)
+
+// obfsIsQUIC reports whether a mode name selects QUIC-family shaping.
+func obfsIsQUIC(mode string) bool { return mode == obfsQUIC || mode == obfsQUICv2 }
+
+// obfsKnown reports whether a mode name is one this build implements.
+func obfsKnown(mode string) bool {
+	return mode == obfsNone || obfsIsQUIC(mode) || mode == obfsDTLS
+}
+
+// The two wire formats the obfuscator can produce. Both are 13-byte headers that double as
+// AEAD nonce material, so they are interchangeable at every call site in the packet loops.
+const (
+	wireQUIC = iota
+	wireDTLS
+)
+
 // Size buckets for the "balanced" shaping mode. Small datagrams are padded up to the next
 // bucket so the tiny-packet cluster (pure ACKs of the inner connections) stops forming its
 // own mode in the size histogram; large ones are left alone, which is where nearly all the
@@ -44,6 +71,14 @@ const (
 var obfsBuckets = []int{128, 256, 512, 768, 1024, 1280}
 
 type obfuscator struct {
+	// Which wire format this end produces: wireQUIC or wireDTLS. Chosen once at startup
+	// from the obfs mode and never changed — the two ends must agree, and nothing in the
+	// format is negotiated.
+	wire int
+
+	// Non-nil only in wireDTLS mode; carries the record epoch, sequence and nonce salts.
+	dtls *dtlsState
+
 	// Stable for the life of the connection, like a real QUIC connection ID. Held behind
 	// a pointer so it can be swapped if the packet number ever wraps (see nextHeader).
 	cid   atomic.Pointer[[obfsCIDLen]byte]
@@ -71,8 +106,15 @@ type obfuscator struct {
 // per round trip; at this tunnel's packet rates that lands in the low tens of packets.
 const spinPeriod = 24
 
-func newObfuscator(psk []byte, sendDir, recvDir string, shape bool) (*obfuscator, error) {
-	o := &obfuscator{shape: shape}
+func newObfuscator(psk []byte, sendDir, recvDir string, shape bool, wire int) (*obfuscator, error) {
+	o := &obfuscator{shape: shape, wire: wire}
+	if wire == wireDTLS {
+		d, err := newDTLSState(psk, sendDir, recvDir)
+		if err != nil {
+			return nil, err
+		}
+		o.dtls = d
+	}
 	if err := o.rotateCID(); err != nil {
 		return nil, err
 	}
@@ -158,6 +200,12 @@ func (o *obfuscator) adoptPeerCID(b []byte) bool {
 // per packet was a steady stream of garbage for no reason. Protection is applied later,
 // once the ciphertext exists.
 func (o *obfuscator) nextHeader(hdr *[obfsHeaderLen]byte, nonce *[12]byte) (pn uint32) {
+	if o.wire == wireDTLS {
+		// A DTLS record header is the same 13 bytes and also doubles as nonce material,
+		// so the whole packet loop is unchanged; only the bytes differ.
+		o.dtls.nextRecordHeader(hdr, nonce)
+		return 0
+	}
 	pn = o.pn.Add(1)
 
 	// The nonce is connection ID + packet number, so a wrapped packet number would start
@@ -204,6 +252,13 @@ func (o *obfuscator) nextHeader(hdr *[obfsHeaderLen]byte, nonce *[12]byte) (pn u
 
 // protect applies header protection in place over a finished datagram (header+ciphertext).
 func (o *obfuscator) protect(pkt []byte, sc *hpScratch) {
+	if o.wire == wireDTLS {
+		// Real DTLS has no header protection — the record header is plaintext, and
+		// masking it would be the one thing that makes the record fail to parse. All
+		// that is left to do is fill in the length field now the datagram is complete.
+		dtlsFinishRecord(pkt)
+		return
+	}
 	if len(pkt) < obfsHeaderLen+obfsSampleLen {
 		return
 	}
@@ -220,6 +275,9 @@ func (o *obfuscator) protect(pkt []byte, sc *hpScratch) {
 // unprotectInto reverses protect, writing the recovered nonce into the caller's array so
 // the receive path does not allocate a 12-byte slice per packet.
 func (o *obfuscator) unprotectInto(pkt []byte, nonce *[12]byte, sc *hpScratch) bool {
+	if o.wire == wireDTLS {
+		return o.dtls.recoverNonce(pkt, nonce)
+	}
 	if len(pkt) < obfsHeaderLen+obfsSampleLen {
 		return false
 	}
@@ -231,6 +289,15 @@ func (o *obfuscator) unprotectInto(pkt []byte, nonce *[12]byte, sc *hpScratch) b
 		nonce[obfsCIDLen+i] = pkt[obfsHeaderLen-4+i] ^ m[1+i]
 	}
 	return true
+}
+
+// isCover reports whether a datagram is synthetic handshake cover rather than tunnel
+// traffic. One byte in either format: the QUIC header form bit, or the DTLS content type.
+func (o *obfuscator) isCover(pkt []byte) bool {
+	if o.wire == wireDTLS {
+		return dtlsIsCover(pkt)
+	}
+	return quicIsLongHeader(pkt)
 }
 
 // padTo reports how many bytes of padding bring a datagram of size n up to the next bucket.

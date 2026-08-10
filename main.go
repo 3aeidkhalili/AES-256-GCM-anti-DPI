@@ -499,7 +499,7 @@ func main() {
 			fs := flag.NewFlagSet("probe", flag.ExitOnError)
 			target := fs.String("target", "", "carrier address to probe, host:port")
 			sni := fs.String("sni", "www.google.com", "server name to put in the QUIC ClientHello")
-			mode := fs.String("mode", "quic", "quic (a QUIC Initial) or junk (random datagrams)")
+			mode := fs.String("mode", "quic", "quic (QUIC v1 Initial), quic2 (QUIC v2 Initial), dtls (DTLS ClientHello) or junk (random datagrams)")
 			count := fs.Int("count", 1, "how many datagrams to send")
 			size := fs.Int("size", 64, "datagram size for junk mode")
 			fs.Parse(os.Args[2:])
@@ -514,20 +514,28 @@ func main() {
 			for i := 0; i < *count; i++ {
 				var pkt []byte
 				switch *mode {
-				case "quic":
+				case obfsQUIC, obfsQUICv2:
 					dcid := make([]byte, 8)
 					scid := make([]byte, 8)
 					rand.Read(dcid)
 					rand.Read(scid)
-					pkt, err = buildInitial(dcid, dcid, scid, buildClientHello(*sni), true)
+					pkt, err = buildInitial(quicVerFor(*mode), dcid, dcid, scid, buildClientHello(*sni), true)
 					if err != nil || pkt == nil {
 						log.Fatalf("probe: building the Initial failed: %v", err)
 					}
+				case obfsDTLS:
+					body := buildDTLSClientHello(*sni)
+					if body == nil {
+						log.Fatalf("probe: building the ClientHello failed")
+					}
+					var s [4]byte
+					rand.Read(s[:])
+					pkt = dtlsHandshakeRecord(1, 0, 0, uint64(binary.BigEndian.Uint32(s[:])), body)
 				case "junk":
 					pkt = make([]byte, *size)
 					rand.Read(pkt)
 				default:
-					log.Fatalf("probe: -mode must be quic or junk")
+					log.Fatalf("probe: -mode must be quic, quic2, dtls or junk")
 				}
 				if _, err := conn.Write(pkt); err != nil {
 					log.Fatalf("probe: %v", err)
@@ -576,8 +584,12 @@ func main() {
 	if cfg.Transport != "udp" && cfg.Transport != "tcp" {
 		log.Fatalf("transport must be \"udp\" or \"tcp\"")
 	}
-	if cfg.Obfs != "none" && cfg.Obfs != "quic" {
-		log.Fatalf("obfs must be \"none\" or \"quic\"")
+	if !obfsKnown(cfg.Obfs) {
+		log.Fatalf("obfs must be %q, %q, %q or %q (and must match on both servers)",
+			obfsNone, obfsQUIC, obfsQUICv2, obfsDTLS)
+	}
+	if cfg.Obfs == obfsDTLS && cfg.Transport == "tcp" {
+		log.Fatalf("obfs %q is a UDP record format; over TCP use obfs %q, which shapes as TLS", obfsDTLS, obfsQUIC)
 	}
 	if cfg.Cipher != cipherAESGCM && cfg.Cipher != cipherChaCha {
 		log.Fatalf("cipher must be %q or %q (and must match on both servers)", cipherAESGCM, cipherChaCha)
@@ -793,10 +805,19 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 	// Role a opens the flow, so it plays the client half of the synthetic handshake; role b
 	// answers whatever Initial arrives (see the receive loop below).
 	if t.obfs != nil && cfg.Role == "a" {
-		if _, err := sendClientInitial(c, cfg.SNI); err != nil {
-			log.Printf("warning: synthetic handshake failed: %v", err)
-		} else {
-			log.Printf("sent synthetic QUIC Initial (sni=%s)", cfg.SNI)
+		switch {
+		case t.obfs.wire == wireDTLS:
+			if err := sendDTLSClientHello(c, cfg.SNI); err != nil {
+				log.Printf("warning: synthetic handshake failed: %v", err)
+			} else {
+				log.Printf("sent synthetic DTLS ClientHello (sni=%s)", cfg.SNI)
+			}
+		default:
+			if _, err := sendClientInitial(c, cfg.SNI, t.coverVer); err != nil {
+				log.Printf("warning: synthetic handshake failed: %v", err)
+			} else {
+				log.Printf("sent synthetic QUIC Initial (version=0x%08x sni=%s)", t.coverVer.version, cfg.SNI)
+			}
 		}
 	}
 
@@ -836,7 +857,22 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 
 		// Handshake cover only ever appears with obfs on; without it the first byte is
 		// random nonce material and this test would discard half of all real traffic.
-		if t.obfs != nil && quicIsLongHeader(pkt) {
+		if t.obfs != nil && t.obfs.wire == wireDTLS && dtlsIsCover(pkt) {
+			// The DTLS disguise's cover flight. Same shape of exchange as the QUIC one:
+			// role b answers at most occasionally, so an unauthenticated packet cannot
+			// turn this port into an amplifier.
+			if !fromPeer && src.IsValid() {
+				t.dpi.observeStranger(evProbeQUIC, src, pkt, ttl, "")
+			}
+			if cfg.Role == "b" && time.Since(lastInitialReply) > 30*time.Second {
+				lastInitialReply = time.Now()
+				if err := replyDTLSHelloVerify(c); err != nil {
+					log.Printf("warning: handshake reply failed: %v", err)
+				}
+			}
+			continue
+		}
+		if t.obfs != nil && t.obfs.wire == wireQUIC && quicIsLongHeader(pkt) {
 			v, _ := quicLongVersion(pkt)
 			realQUIC := quicKnownVersion(v)
 			switch {

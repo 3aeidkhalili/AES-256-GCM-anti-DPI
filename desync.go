@@ -319,7 +319,9 @@ func (a *desyncAgent) sendBurst() {
 		scid := make([]byte, 8)
 		rand.Read(dcid)
 		rand.Read(scid)
-		payload, err := buildInitial(dcid, dcid, scid, buildClientHello(a.sni), true)
+		// The fakes have to claim the same QUIC version the real cover traffic does; a
+		// decoy in a version this flow never otherwise speaks is a signature of its own.
+		payload, err := buildInitial(a.t.coverVer, dcid, dcid, scid, buildClientHello(a.sni), true)
 		if err != nil || payload == nil {
 			continue
 		}

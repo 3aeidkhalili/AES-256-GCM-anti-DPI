@@ -416,17 +416,57 @@ func TestEnabledObserverPeerPathDoesNotAllocate(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPeekInitialSNI(t *testing.T) {
+	// Both cover versions have to round-trip: an Initial this build emits is exactly what
+	// the peer's DPI observer reads back, and v2 derives its keys from a different salt
+	// and different labels than v1, so a mix-up would silently produce an unreadable packet.
+	for _, tc := range []struct {
+		name string
+		ver  quicVer
+	}{{"v1", quicV1}, {"v2", quicV2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dcid := make([]byte, 8)
+			scid := make([]byte, 8)
+			rand.Read(dcid)
+			rand.Read(scid)
+			const want = "www.example.org"
+			pkt, err := buildInitial(tc.ver, dcid, dcid, scid, buildClientHello(want), true)
+			if err != nil || pkt == nil {
+				t.Fatalf("building the Initial failed: %v", err)
+			}
+			if v, ok := quicLongVersion(pkt); !ok || v != tc.ver.version {
+				t.Fatalf("expected version 0x%08x on the wire, got 0x%08x (ok=%v)", tc.ver.version, v, ok)
+			}
+			if got := (pkt[0] >> 4) & 0x03; got != tc.ver.initialType {
+				t.Fatalf("expected Initial type %d, got %d", tc.ver.initialType, got)
+			}
+			if got := quicPeekInitialSNI(pkt); got != want {
+				t.Fatalf("expected to read back SNI %q, got %q", want, got)
+			}
+		})
+	}
+}
+
+// A v2 Initial must not be readable as v1: the two derive Initial keys from different salts
+// and labels, so cross-reading would mean one of them is not really speaking its version.
+func TestInitialVersionsAreDistinct(t *testing.T) {
 	dcid := make([]byte, 8)
 	scid := make([]byte, 8)
 	rand.Read(dcid)
 	rand.Read(scid)
-	const want = "www.example.org"
-	pkt, err := buildInitial(dcid, dcid, scid, buildClientHello(want), true)
-	if err != nil || pkt == nil {
-		t.Fatalf("building the Initial failed: %v", err)
+	v1, err := buildInitial(quicV1, dcid, dcid, scid, buildClientHello("www.example.org"), true)
+	if err != nil || v1 == nil {
+		t.Fatalf("building the v1 Initial failed: %v", err)
 	}
-	if got := quicPeekInitialSNI(pkt); got != want {
-		t.Fatalf("expected to read back SNI %q, got %q", want, got)
+	v2, err := buildInitial(quicV2, dcid, dcid, scid, buildClientHello("www.example.org"), true)
+	if err != nil || v2 == nil {
+		t.Fatalf("building the v2 Initial failed: %v", err)
+	}
+	if bytes.Equal(v1, v2) {
+		t.Fatal("v1 and v2 Initials came out byte-identical")
+	}
+	// Same header shape, different version field and different Initial type code.
+	if v1[0]&0xf0 == v2[0]&0xf0 {
+		t.Fatalf("expected different long-header type nibbles, both are 0x%02x", v1[0]&0xf0)
 	}
 }
 
@@ -435,7 +475,7 @@ func TestPeekInitialSNI(t *testing.T) {
 func TestPeekInitialSNISurvivesGarbage(t *testing.T) {
 	dcid := make([]byte, 8)
 	rand.Read(dcid)
-	good, _ := buildInitial(dcid, dcid, dcid, buildClientHello("a.example"), true)
+	good, _ := buildInitial(quicV1, dcid, dcid, dcid, buildClientHello("a.example"), true)
 
 	cases := [][]byte{nil, {}, {0xc0}, {0x80, 0, 0, 0, 1}, bytes.Repeat([]byte{0xff}, 100)}
 	// Every truncation of a valid packet.
@@ -562,7 +602,7 @@ func TestKnownVersionFiltersRandomNoise(t *testing.T) {
 func TestKnownVersionAcceptsRealInitials(t *testing.T) {
 	dcid := make([]byte, 8)
 	rand.Read(dcid)
-	pkt, err := buildInitial(dcid, dcid, dcid, buildClientHello("x.example"), true)
+	pkt, err := buildInitial(quicV1, dcid, dcid, dcid, buildClientHello("x.example"), true)
 	if err != nil || pkt == nil {
 		t.Fatalf("building the Initial failed: %v", err)
 	}
