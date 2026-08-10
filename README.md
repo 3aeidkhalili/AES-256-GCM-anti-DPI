@@ -253,8 +253,8 @@ Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json
 | `pad_max` | `64` | max random padding bytes per packet (0 disables; anti-DPI) |
 | `rekey_interval` | `3600` | key-rotation seconds (0 = static key) |
 | `keepalive` | `25` | keepalive seconds (0 disables) |
-| `rcvbuf` | `16777216` | UDP socket receive buffer (bytes); absorbs bursts so the kernel doesn't drop |
-| `sndbuf` | `16777216` | UDP socket send buffer (bytes) |
+| `rcvbuf` | `2097152` | UDP socket receive buffer (bytes). **This is a queue — bigger is not better.** See section 7.1 |
+| `sndbuf` | `2097152` | UDP socket send buffer (bytes); an oversized one is pure bufferbloat (section 7.1) |
 | `manage_ip` | `true` | let the daemon run the `ip` commands |
 | `stats_path` | `/run/aestun/stats.json` | monitor stats file (empty disables) |
 | `offload` | `true` | kernel UDP segmentation/coalescing (section 7) |
@@ -270,12 +270,17 @@ Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json
 | `split` | *(off)* | IP-fragment the desync fakes — see section 15 |
 
 ### Packet loss / lag note
-The daemon sets the UDP socket buffers (`rcvbuf`/`sndbuf`, 8 MiB each) so traffic
-bursts are absorbed instead of dropped. Watch for drops with
-`grep Udp: /proc/net/snmp` — a rising **RcvbufErrors** means the buffer is too small
-*or* `net.core.rmem_max` is below `rcvbuf` (the kernel caps the buffer at `rmem_max`).
-Run the network optimization (below) so `rmem_max` is large enough — otherwise your
-8 MiB request is silently clamped to the ~200 KB default and packets drop under load.
+The daemon sets the UDP socket buffers (`rcvbuf`/`sndbuf`, **2 MiB** each) large enough to
+absorb bursts but small enough not to become a latency queue — section 7.1 has the
+measurement behind that number, and it is the single most effective tuning knob here.
+
+Watch for drops with `grep Udp: /proc/net/snmp` — a rising **RcvbufErrors** means the buffer
+is too small *or* `net.core.rmem_max` is below `rcvbuf` (the kernel caps the buffer at
+`rmem_max`). Run the network optimization (below) so `rmem_max` is large enough — otherwise
+the request is silently clamped to the ~200 KB default and packets drop under load.
+
+If you do see sustained `RcvbufErrors`, raise `rcvbuf` — but re-measure latency under load
+afterwards, because that is exactly the trade you are making.
 
 ### Transport note
 The carrier multiplexes **every** inner connection. Over TCP, one lost carrier segment
@@ -711,9 +716,9 @@ Initial salt, renames the key-derivation labels to `quicv2 …`, and permutes th
 packet type codes, all of which this build implements, so the packet is a genuine v2 Initial
 rather than a v1 one with the version field overwritten.
 
-It exists because of a measurement. On two independent Iranian carriers — AS25184 (Afranet)
-and AS34918 (Pishgaman) — every long-header packet carrying **QUIC v1** was dropped, in both
-directions, while the same flow's short-header packets passed untouched:
+It exists because of a measurement. On **two independent Iranian carriers**, every
+long-header packet carrying **QUIC v1** was dropped, in both directions, while the same
+flow's short-header packets passed untouched:
 
 | cover sent (200 packets each) | delivered |
 |---|---|
@@ -1112,7 +1117,7 @@ tcp+tls+rotate          20.1      —          —
 
 ### 📊 17.0 Full matrix — every transport × every disguise × every module
 
-Measured on the reference link (🇮🇷 Pishgaman AS34918 ↔ 🌍 Leaseweb Germany, ~79 ms, both ends
+Measured on the reference link (🇮🇷 Iran ↔ 🌍 Germany, ~79 ms, both ends
 `chacha20-poly1305`), each variant reconfigured on both servers and restarted, then measured
 with `iperf3` (4 streams, each direction) and 60 pings across the tunnel. Buffers at 2 MiB.
 
@@ -1147,6 +1152,35 @@ not costing you speed, so there is no throughput argument for running without on
 
 The hardening set costs about 2 % of throughput, so leaving it on is cheap. **`hop` is the one
 expensive module** — turn it on only against an actual 5-tuple block.
+
+**TCP carrier, verified separately.** Every TCP variant was re-run against the shipped
+build, with the crypto layer's `auth_fail` counter checked after each — it stayed at 0
+throughout, so nothing was quietly failing to authenticate:
+
+| Variant | ⬇ down | ⬆ up | RTT | loss | crypto |
+|---|---|---|---|---|---|
+| `tcp` + `none` | 230 Mbit/s | 211 | 83.2 ms | 0 % | `auth_fail=0` |
+| `tcp` + `quic` (TLS) | 202 Mbit/s | 259 | 78.7 ms | 0 % | `auth_fail=0` |
+| `tcp` + `quic2` (TLS) | 195 Mbit/s | 221 | 76.1 ms | 0 % | `auth_fail=0` |
+| `tcp` + `quic` + `tcp_rotate` | 181 Mbit/s | 194 | 79.4 ms | 0 % | `auth_fail=0` |
+
+The **TLS disguise was confirmed on the wire**, not just assumed. Capturing a fresh carrier
+connection from its SYN shows the dialing side opening with a real, parseable ClientHello:
+
+```
+16 03 01 00 9f                     ContentType 22 = handshake, record length 159
+01 00 00 9b  03 03                 ClientHello, legacy_version TLS 1.2
+13 01 13 02 13 03                  the three real TLS 1.3 cipher suites
+00 00 ... www.cloudflare.com       server_name extension, carrying the configured SNI
+```
+
+…after which every sealed datagram travels as a `17 03 03` application-data record. To a
+record-level DPI the flow is an ordinary HTTPS connection being established and then used.
+
+**`tcp_rotate` was verified to actually rotate**: with `interval_sec: 15`, five new
+connections opened in 80 seconds, each from a fresh source port, 12–16 s apart. Expect a
+single dropped packet around each rotation — the ping loss that appears during a rotation
+window is the in-flight datagrams on the connection being retired.
 
 **Handshake cover delivery**, 200 packets of each sent at the peer and counted on arrival:
 

@@ -1597,7 +1597,7 @@ do_upgrade() {
   printf '\n%sWire disguise%s  current: %s%s%s\n' "$BOLD" "$N" "$W" "$curo" "$N"
   if [[ "$curo" == "quic" && "$(json_get "$CONF" transport)" != "tcp" ]]; then
     printf '  %squic2 is recommended over quic on Iranian links:%s every QUIC v1 long-header\n' "$Y" "$N"
-    printf '  packet was measured dropped on AS25184 and AS34918, so the synthetic handshake\n'
+    printf '  packet was measured dropped on the carriers tested, so the synthetic handshake\n'
     printf '  never arrives and the flow reads as 1-RTT packets with no handshake in front.\n'
     printf '  Same wire format for data, so throughput is unchanged. (README §10.2)\n'
   fi
