@@ -34,9 +34,7 @@ const (
 	tlsRecHandshake      = 0x16
 	tlsRecChangeCipher   = 0x14
 	tlsRecAppData        = 0x17
-	tlsRecAlert          = 0x15
 	tlsRecordHeaderLen   = 5
-	tlsMaxRecordPayload  = 1 << 14      // 16384, the TLS record size limit
 	tlsRecordReadCeiling = 1<<14 + 2048 // a length past this on the wire means the stream desynced
 )
 

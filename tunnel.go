@@ -45,12 +45,13 @@ const aeadOverhead = 16
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	Role          string `json:"role"`           // "a" or "b" (must differ on the two servers)
-	Key           string `json:"key"`            // shared key, base64 of 32 bytes (from the keygen subcommand)
-	Cipher        string `json:"cipher"`         // "aes-gcm" (default) or "chacha20-poly1305"; must match on both ends
-	Listen        string `json:"listen"`         // listen address, e.g. 0.0.0.0:51820
-	Peer          string `json:"peer"`           // peer address host:port (optional; learned from traffic if empty)
-	Transport     string `json:"transport"`      // carrier: "udp" (default) or "tcp"
+	Role      string `json:"role"`      // "a" or "b" (must differ on the two servers)
+	Key       string `json:"key"`       // shared key, base64 of 32 bytes (from the keygen subcommand)
+	Cipher    string `json:"cipher"`    // "aes-gcm" (default) or "chacha20-poly1305"; must match on both ends
+	Listen    string `json:"listen"`    // listen address, e.g. 0.0.0.0:51820
+	Peer      string `json:"peer"`      // peer address host:port (optional; learned from traffic if empty)
+	Transport string `json:"transport"` // carrier: "udp" (default), "tcp", or "icmp" — see icmp.go
+
 	Obfs          string `json:"obfs"`           // "none" (default), "quic", "quic2" or "dtls" — see obfs.go / dtlsobfs.go
 	Shape         *bool  `json:"shape"`          // quantise datagram sizes when obfs is on; default true
 	SNI           string `json:"sni"`            // server name in the synthetic QUIC handshake
@@ -87,6 +88,58 @@ type Config struct {
 	Hop       HopConfig       `json:"hop"`        // keyed synchronised port hopping
 	Split     SplitConfig     `json:"split"`      // IP-fragment the disposable desync fakes
 	TCPRotate TCPRotateConfig `json:"tcp_rotate"` // rotate the TCP carrier connection to dodge volumetric throttling
+
+	// --- ICMP carrier (only consulted when transport is "icmp"; see icmp.go) ---
+	ICMP ICMPConfig `json:"icmp"`
+}
+
+// ICMPConfig tunes the ICMP carrier (icmp.go).
+//
+// Read the two groups differently. Readers, Batch and KernelFilter are local performance
+// choices: they change how this host talks to its own kernel and nothing on the wire, so the
+// two ends may differ and the defaults are already right for a busy link. ID, IDPool,
+// IDRotateSec and MimicPing change what the packets look like, so they are not negotiated
+// and must be set identically on BOTH servers or every packet fails to authenticate.
+type ICMPConfig struct {
+	ID          int `json:"id"`            // fixed echo identifier (1-65535); 0 = derive it from the key
+	IDPool      int `json:"id_pool"`       // identifiers to rotate through; default 1 (no rotation), max 8
+	IDRotateSec int `json:"id_rotate_sec"` // seconds per identifier epoch; default 60
+
+	Readers      int   `json:"readers"`          // receive goroutines; 0 = one per core, capped at 8
+	Batch        *int  `json:"batch"`            // messages per sendmmsg/recvmmsg; default 32, 1 = off
+	KernelFilter *bool `json:"kernel_filter"`    // attach the BPF filter to the raw socket; default true
+	Suppress     *bool `json:"suppress_replies"` // install the echo-reply drop rule; default true
+
+	// MimicPing prepends the 16-byte timeval that ping(8) puts at the start of its payload,
+	// so a dissector renders the flow as ordinary pings with a plausible round-trip time
+	// rather than as echo requests full of opaque bytes. It costs 16 bytes per packet and it
+	// changes the wire, so it is off by default and must match on both ends.
+	MimicPing *bool `json:"mimic_ping"`
+}
+
+func (c *ICMPConfig) applyDefaults() {
+	if c.IDPool == 0 {
+		c.IDPool = 1
+	}
+	if c.IDRotateSec == 0 {
+		c.IDRotateSec = 60
+	}
+	if c.Batch == nil {
+		v := 32
+		c.Batch = &v
+	}
+	if c.KernelFilter == nil {
+		v := true
+		c.KernelFilter = &v
+	}
+	if c.Suppress == nil {
+		v := true
+		c.Suppress = &v
+	}
+	if c.MimicPing == nil {
+		v := false
+		c.MimicPing = &v
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -314,10 +367,20 @@ func (c *Config) applyDefaults() {
 	c.Hop.applyDefaults()
 	c.Split.applyDefaults()
 	c.TCPRotate.applyDefaults()
+	c.ICMP.applyDefaults()
 }
 
-// derefOr returns *p, or def when p is nil (for callers that skip applyDefaults, e.g. tests).
+// derefOr returns *p, or def when p is nil (for callers reached before applyDefaults ran).
 func derefOr(p *int, def int) int {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
+// derefOr2 is derefOr for the *bool fields, which are pointers so that an explicit false in
+// the config survives a default of true.
+func derefOr2(p *bool, def bool) bool {
 	if p == nil {
 		return def
 	}
@@ -405,10 +468,11 @@ type Tunnel struct {
 	padMax  int
 
 	// display / monitoring info
-	role    string
-	ifname  string
-	listen  string
-	startAt time.Time
+	role      string
+	transport string // "udp", "tcp" or "icmp"; the observer picks its kernel counters from it
+	ifname    string
+	listen    string
+	startAt   time.Time
 
 	cacheMu sync.Mutex
 	cache   map[aeadKey]cipher.AEAD
@@ -483,6 +547,9 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 		listen:  cfg.Listen,
 		startAt: time.Now(),
 		cache:   make(map[aeadKey]cipher.AEAD),
+		// applyDefaults has already filled this in; read it here so the observer does not
+		// need a second reference to Config.
+		transport: cfg.Transport,
 		// seq starts from the current time so that after a restart it does not
 		// collide with the peer's replay window (real time only moves forward).
 		sendSeq: uint64(time.Now().UnixMicro()),
@@ -725,15 +792,6 @@ func (t *Tunnel) sealInto(s *sealer, plain []byte) []byte {
 	return out
 }
 
-// seal is the allocating convenience form, kept for tests and one-off callers. The packet
-// loops use sealInto.
-func (t *Tunnel) seal(plain []byte) []byte {
-	out := t.sealInto(newSealer(), plain)
-	cp := make([]byte, len(out))
-	copy(cp, out)
-	return cp
-}
-
 // padFor decides how much padding to add inside the encryption. Shaping mode targets the
 // size buckets so the datagram lands on one of a handful of lengths; otherwise it adds a
 // random amount up to pad_max.
@@ -756,25 +814,7 @@ func (t *Tunnel) padFor(hdrLen, plainLen int, rng *csprng) int {
 	return int(rng.uint16()) % (t.padMax + 1)
 }
 
-// openInto decrypts and authenticates a received datagram, returning the inner IP packet.
-// The result aliases o.plain and is valid only until the next call with the same opener.
-func (t *Tunnel) openInto(o *opener, pkt []byte) ([]byte, bool) {
-	p, _, ok := t.openSeq(o, pkt)
-	return p, ok
-}
-
-// open is the allocating convenience form, kept for tests.
-func (t *Tunnel) open(pkt []byte) ([]byte, bool) {
-	p, ok := t.openInto(newOpener(), pkt)
-	if !ok {
-		return nil, false
-	}
-	cp := make([]byte, len(p))
-	copy(cp, p)
-	return cp, true
-}
-
-// openSeq is the real implementation: decrypt, authenticate, replay-check, and hand back
+// openSeq decrypts, authenticates, replay-checks, and hands back
 // the inner sequence number along with the packet. The sequence number costs nothing to
 // return — it was parsed anyway — and it is the only signal available that distinguishes
 // packets the network dropped from packets that were never sent, which is what the DPI

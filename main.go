@@ -270,6 +270,7 @@ type tcpCarrier struct {
 	hdr  [2]byte // length prefix, plain framing
 	rhdr [5]byte // record header, TLS framing
 	buf  []byte
+	wbuf []byte // send scratch: header+payload assembled for a single Write
 }
 
 // errTLSDesync means the record framing read a length that cannot be right, so the stream is
@@ -335,28 +336,39 @@ func (c *tcpCarrier) Send(pkt []byte) error {
 	if len(pkt) > 65535 {
 		return fmt.Errorf("datagram too large for framing: %d", len(pkt))
 	}
-	var hdr []byte
-	if c.tlsShape {
-		// TLS application-data record header: type 0x17, version 0x0303, 2-byte length.
-		var h [tlsRecordHeaderLen]byte
-		h[0], h[1], h[2] = tlsRecAppData, 0x03, 0x03
-		binary.BigEndian.PutUint16(h[3:5], uint16(len(pkt)))
-		hdr = h[:]
-	} else {
-		var h [2]byte
-		binary.BigEndian.PutUint16(h[:], uint16(len(pkt)))
-		hdr = h[:]
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn != conn {
 		return nil // replaced under us; drop rather than write to a dead socket
 	}
-	if _, err := c.conn.Write(hdr); err != nil {
-		return err
+	// Header and payload go out in ONE write. Two writes on a TCP_NODELAY socket produce
+	// two segments per datagram, and the first is a lone 2- or 5-byte payload — which is
+	// both twice the packet rate on the wire and a signature no real TLS peer produces
+	// (a genuine implementation emits each record as one contiguous buffer). The scratch
+	// buffer is owned by the carrier and only touched under this mutex.
+	var hdrLen int
+	if c.tlsShape {
+		// TLS application-data record header: type 0x17, version 0x0303, 2-byte length.
+		hdrLen = tlsRecordHeaderLen
+		c.wbuf = grow(c.wbuf, hdrLen+len(pkt))
+		c.wbuf[0], c.wbuf[1], c.wbuf[2] = tlsRecAppData, 0x03, 0x03
+		binary.BigEndian.PutUint16(c.wbuf[3:5], uint16(len(pkt)))
+	} else {
+		hdrLen = 2
+		c.wbuf = grow(c.wbuf, hdrLen+len(pkt))
+		binary.BigEndian.PutUint16(c.wbuf[:2], uint16(len(pkt)))
 	}
-	_, err := c.conn.Write(pkt)
+	copy(c.wbuf[hdrLen:], pkt)
+	_, err := c.conn.Write(c.wbuf[:hdrLen+len(pkt)])
 	return err
+}
+
+// grow returns b resized to n, reallocating only when the capacity is short.
+func grow(b []byte, n int) []byte {
+	if cap(b) < n {
+		return make([]byte, n)
+	}
+	return b[:n]
 }
 
 func (c *tcpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
@@ -581,8 +593,20 @@ func main() {
 	if cfg.Role != "a" && cfg.Role != "b" {
 		log.Fatalf("role must be \"a\" or \"b\" (different on the two servers)")
 	}
-	if cfg.Transport != "udp" && cfg.Transport != "tcp" {
-		log.Fatalf("transport must be \"udp\" or \"tcp\"")
+	if cfg.Transport != "udp" && cfg.Transport != "tcp" && cfg.Transport != "icmp" {
+		log.Fatalf("transport must be \"udp\", \"tcp\" or \"icmp\"")
+	}
+	// The ICMP carrier is a ping payload, not a datagram protocol with a handshake to
+	// imitate. A QUIC or DTLS header inside an echo request is not cover — no real ping
+	// carries one — so it would be the one anomalous thing about an otherwise ordinary
+	// packet. Reject it rather than silently ignoring a configured obfs.
+	if cfg.Transport == "icmp" && cfg.Obfs != obfsNone {
+		log.Fatalf("transport \"icmp\" carries the tunnel in ping payloads and takes no obfs; "+
+			"set \"obfs\": %q on BOTH servers", obfsNone)
+	}
+	if cfg.Transport == "icmp" && cfg.Hop.on() {
+		log.Fatalf("transport \"icmp\" has no ports, so port hopping cannot apply; " +
+			"set \"hop\".\"enabled\" to false on BOTH servers")
 	}
 	if !obfsKnown(cfg.Obfs) {
 		log.Fatalf("obfs must be %q, %q, %q or %q (and must match on both servers)",
@@ -624,9 +648,12 @@ func main() {
 			"dominate CPU use at any real packet rate. Set \"cipher\": %q on BOTH servers.", cipherChaCha)
 	}
 
-	if cfg.Transport == "tcp" {
+	switch cfg.Transport {
+	case "tcp":
 		runTCP(&cfg, t, tun)
-	} else {
+	case "icmp":
+		runICMP(&cfg, t, tun)
+	default:
 		runUDP(&cfg, t, tun)
 	}
 }
@@ -689,6 +716,13 @@ func setPeerFromConfig(cfg *Config, t *Tunnel) {
 // data path — the whole thing runs in its own goroutine and disables itself on any problem.
 func startDesync(cfg *Config, t *Tunnel) {
 	if !cfg.Desync.on() {
+		return
+	}
+	// This injector builds a UDP datagram sharing the carrier's 5-tuple. The ICMP carrier
+	// has no such tuple, so it has an injector of its own (startICMPDesync in icmp.go) that
+	// runICMP calls instead — same config block, decoy pings rather than fake QUIC Initials.
+	// Reaching here on that transport would mean Initials addressed to UDP port 0.
+	if cfg.Transport == "icmp" {
 		return
 	}
 	go func() {
@@ -1039,41 +1073,62 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 	}
 }
 
-// pumpTUNToCarrier moves outbound IP packets from the TUN device onto the carrier.
+// pumpTUNToCarrier moves outbound IP packets from the TUN device onto the carrier, picking
+// the batching strategy the carrier can actually use: segmentation offload for UDP,
+// sendmmsg for the raw ICMP socket, and one write per packet for the TCP stream, which has
+// its own framing and nothing to offload.
+func pumpTUNToCarrier(c carrier, t *Tunnel, tun *os.File) {
+	switch bc := c.(type) {
+	case *udpCarrier:
+		pumpUDP(bc, t, tun)
+	case *icmpCarrier:
+		if bc.batch > 1 {
+			pumpICMPBatched(bc, t, tun)
+			return
+		}
+		pumpUnbatched(c, t, tun)
+	default:
+		pumpUnbatched(c, t, tun)
+	}
+}
+
+// pumpUnbatched is the plain one-packet-per-send path.
+func pumpUnbatched(c carrier, t *Tunnel, tun *os.File) {
+	buf := make([]byte, maxPktSize)
+	s := newSealer()
+	errs := 0
+	for {
+		n, err := tun.Read(buf)
+		if err != nil {
+			errs++
+			if errs >= maxReadErrors {
+				log.Fatalf("TUN read failing persistently: %v", err)
+			}
+			log.Printf("TUN read error (%d/%d): %v", errs, maxReadErrors, err)
+			time.Sleep(readErrBackoff)
+			continue
+		}
+		errs = 0
+		if n == 0 {
+			continue
+		}
+		if err := c.Send(t.sealInto(s, buf[:n])); err != nil {
+			log.Printf("carrier send failed: %v", err)
+		}
+	}
+}
+
+// pumpUDP is the segmentation-offload path.
 //
 // One blocking read, then a non-blocking drain of whatever else the device already has
 // queued, then one send for the whole run. When the link is busy the drain fills a batch
 // and the syscall cost is divided across it; when the link is quiet the first drain
 // attempt returns nothing and the packet goes out immediately, so batching never adds
 // latency to a lone packet.
-func pumpTUNToCarrier(c carrier, t *Tunnel, tun *os.File) {
+func pumpUDP(bc *udpCarrier, t *Tunnel, tun *os.File) {
 	buf := make([]byte, maxPktSize)
 	s := newSealer()
 	errs := 0
-
-	bc, canBatch := c.(*udpCarrier)
-	if !canBatch {
-		// TCP carrier: the stream has its own framing and no segmentation to offload.
-		for {
-			n, err := tun.Read(buf)
-			if err != nil {
-				errs++
-				if errs >= maxReadErrors {
-					log.Fatalf("TUN read failing persistently: %v", err)
-				}
-				log.Printf("TUN read error (%d/%d): %v", errs, maxReadErrors, err)
-				time.Sleep(readErrBackoff)
-				continue
-			}
-			errs = 0
-			if n == 0 {
-				continue
-			}
-			if err := c.Send(t.sealInto(s, buf[:n])); err != nil {
-				log.Printf("carrier send failed: %v", err)
-			}
-		}
-	}
 
 	tr := newTunReader(tun)
 	batch := newTxBatch(bc.gso)

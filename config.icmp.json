@@ -1,0 +1,54 @@
+{
+  "_comment": [
+    "Reference config for the ICMP carrier. Copy to BOTH servers, change only role,",
+    "peer, local_ip and peer_ip. The tunnel rides in ping payloads: there are no ports,",
+    "obfs must stay \"none\" (a QUIC header inside an echo request is not cover, it is the",
+    "one anomalous thing about an otherwise ordinary packet), and port hopping does not",
+    "apply. The service needs CAP_NET_RAW, and ICMP echo has to be allowed inbound in the",
+    "cloud firewall on both ends.",
+    "",
+    "Everything under \"icmp\" above the blank line is local to one host and may differ",
+    "between the two servers. Everything below it changes the packets on the wire and is",
+    "not negotiated: a mismatch means every packet fails to authenticate."
+  ],
+
+  "role": "a",
+  "key": "PASTE_SAME_BASE64_KEY_ON_BOTH_SERVERS",
+  "cipher": "aes-gcm",
+  "listen": "0.0.0.0:51820",
+  "peer": "PUBLIC_IPV4_OF_THE_OTHER_SERVER",
+  "transport": "icmp",
+  "obfs": "none",
+  "tun_name": "tun0",
+  "local_ip": "10.8.0.1/24",
+  "peer_ip": "10.8.0.2",
+  "mtu": 1300,
+  "txqueuelen": 1000,
+  "rcvbuf": 2097152,
+  "sndbuf": 2097152,
+  "rate_mbps": 0,
+  "pad_max": 64,
+  "rekey_interval": 3600,
+  "keepalive": 25,
+  "manage_ip": true,
+  "stats_path": "/run/aestun/stats.json",
+  "dpi_log": { "enabled": true, "path": "/var/log/aestun/dpi.jsonl", "probe": true },
+
+  "desync": { "enabled": false },
+  "junk":   { "enabled": false },
+  "hop":    { "enabled": false },
+  "split":  { "enabled": false },
+  "tcp_rotate": { "enabled": false },
+
+  "icmp": {
+    "readers": 0,
+    "batch": 32,
+    "kernel_filter": true,
+    "suppress_replies": true,
+
+    "id": 0,
+    "id_pool": 1,
+    "id_rotate_sec": 60,
+    "mimic_ping": false
+  }
+}

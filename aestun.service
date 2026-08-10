@@ -9,10 +9,12 @@ ExecStart=/usr/local/bin/aestun -config /etc/aestun/config.json
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-# CAP_NET_ADMIN: create the TUN device and run ip commands.
+# CAP_NET_ADMIN: create the TUN device, run ip commands, and set SO_RCVBUFFORCE on the
+#   ICMP carrier's socket (the un-clamped form of SO_RCVBUF).
 # CAP_NET_BIND_SERVICE: bind low ports (e.g. 443).
-# CAP_NET_RAW: only used by the optional native desync module (desync.go) to inject
-#   TTL-limited fake packets from a raw socket. Harmless to grant when desync is off.
+# CAP_NET_RAW: required by transport "icmp" (icmp.go opens a raw ICMP socket), and used by
+#   the optional native desync module (desync.go) to inject TTL-limited fakes. Harmless to
+#   grant when neither is in use.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 RuntimeDirectory=aestun

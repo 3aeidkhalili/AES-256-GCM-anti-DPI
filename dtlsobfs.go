@@ -2,11 +2,11 @@
 //
 // Why a second disguise exists at all. The QUIC disguise in obfs.go is the better one on a
 // link that lets QUIC through: it is what most encrypted UDP on the internet now looks like.
-// But measurement on two independent Iranian carriers found QUIC *v1* long-header packets
-// dropped outright in both directions — the same rule on both networks, so a national one
-// rather than an ISP quirk. A censor that already maintains a version blocklist for QUIC can
-// extend it; obfs=quic2 sidesteps today's list, but a disguise that is not QUIC at all is
-// the thing that survives the list growing.
+// But measurement on two independent Iranian carriers (AS25184 Afranet, AS34918 Pishgaman)
+// found QUIC *v1* long-header packets dropped outright in both directions — the same
+// national rule on both networks, not an ISP quirk. A censor that already maintains a
+// version blocklist for QUIC can extend it; obfs=quic2 sidesteps today's list, but a
+// disguise that is not QUIC at all is the thing that survives the list growing.
 //
 // DTLS is the natural second choice, and the same measurement backs it: DTLS-shaped
 // datagrams sustained the full offered rate on both carriers. It is also what a censor can

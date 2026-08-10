@@ -109,6 +109,39 @@ zapret_platform() {
 }
 
 # ----------------------------------------------------------------- read JSON safely
+# carrier_endpoint — split the configured peer into host and port, and say whether this
+# carrier has a port at all.  Prints:  HOST|PORT|TRANSPORT   (PORT empty for icmp)
+#
+# The separator is "|" rather than a tab on purpose: a tab is IFS whitespace, so `read`
+# collapses a run of them and the empty PORT field of an ICMP peer would silently shift
+# TRANSPORT into PORT.
+#
+# This exists because "${peer##*:}" is wrong on two of the three carriers. On the ICMP
+# carrier the peer is a bare address with no colon in it, so that expansion returns the whole
+# address — and every caller then went on to build "--dport 91.107.160.35", which iptables
+# rejects and nfqws silently mis-parses. An IPv6 peer in bracket form has the same problem in
+# reverse. Parse it once, here, and let the callers ask whether there is a port.
+carrier_endpoint() {
+  local peer transport host port
+  peer="$(json_get "$CONF" peer)"
+  transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
+  if [[ "$transport" == "icmp" ]]; then
+    # ICMP has no ports. Accept the host:port form anyway, because operators copy the peer
+    # line across from a UDP config, and just drop the port.
+    host="${peer%%:*}"; [[ "$peer" == \[*\]* ]] && host="${peer#\[}" && host="${host%%\]*}"
+    printf '%s||%s\n' "$host" "$transport"; return 0
+  fi
+  if [[ "$peer" == \[*\]:* ]]; then          # [2001:db8::1]:443
+    host="${peer#\[}"; host="${host%%\]*}"; port="${peer##*:}"
+  elif [[ "$peer" == *:* ]]; then            # 1.2.3.4:443
+    host="${peer%:*}"; port="${peer##*:}"
+  else                                       # no port given: fall back to the listen port
+    host="$peer"; port="$(json_get "$CONF" listen)"; port="${port##*:}"
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] || port=""
+  printf '%s|%s|%s\n' "$host" "$port" "$transport"
+}
+
 json_get() { # json_get FILE KEY
   local f="$1" k="$2"
   [[ -f "$f" ]] || { echo ""; return; }
@@ -159,7 +192,7 @@ ensure_deps() {
 }
 
 # check_build_deps — a source build needs either the vendored deps (offline) or network access
-# to fetch them. The prebuilt binaries need neither; this only matters when building from source.
+# to fetch them.
 check_build_deps() {
   if [[ ! -d "${LIB_DIR}/vendor" ]]; then
     warn "vendor/ is absent — the build will fetch golang.org/x/crypto and golang.org/x/sys from"
@@ -168,23 +201,85 @@ check_build_deps() {
   fi
 }
 
+# ensure_go — put a Go toolchain on PATH, installing one if the box has none.
+#
+# Building from source is the *preferred* path even though prebuilt binaries ship alongside
+# these sources, and the order matters. Nothing ties a checked-in binary to the source next to
+# it: the one previously in this tree predated the ICMP carrier, so an install that preferred
+# it put an older program on disk than the sources the operator was reading, with no warning.
+# Compiling first means "update both servers" means the same thing on both; the prebuilts are
+# the fallback for a box with no toolchain and no way to fetch one.
+GO_VERSION="1.26.5"
+ensure_go() {
+  command -v go >/dev/null 2>&1 && return 0
+  [[ -x /usr/local/go/bin/go ]] && { export PATH="/usr/local/go/bin:$PATH"; return 0; }
+  local tag; tag="$(arch_tag)"
+  local tarball="go${GO_VERSION}.linux-${tag}.tar.gz"
+  warn "Go is not installed; fetching ${tarball} to build aestun from source..."
+  local url ok=1
+  for url in "https://go.dev/dl/${tarball}" \
+             "https://dl.google.com/go/${tarball}" \
+             "https://mirrors.aliyun.com/golang/${tarball}"; do
+    if curl -fsSL --connect-timeout 15 -o "/tmp/${tarball}" "$url" \
+       && tar -tzf "/tmp/${tarball}" >/dev/null 2>&1; then ok=0; break; fi
+  done
+  if (( ok != 0 )); then
+    rm -f "/tmp/${tarball}"
+    err "Could not download a Go toolchain. Install one manually (apt install golang-go, or"
+    err "https://go.dev/dl/) and re-run, or build elsewhere with:  ./aestun.sh build ${tag}"
+    return 1
+  fi
+  rm -rf /usr/local/go && tar -C /usr/local -xzf "/tmp/${tarball}" && rm -f "/tmp/${tarball}"
+  export PATH="/usr/local/go/bin:$PATH"
+  command -v go >/dev/null 2>&1 || { err "Go install failed."; return 1; }
+  msg "Go $(go version | awk '{print $3}') installed in /usr/local/go."
+}
+
 # ---------------------------------------------------------------------- install bin
+#
+# Source build first, prebuilt binary second. Both are supported; the order is what keeps the
+# installed program honest. A prebuilt that is older than the sources beside it is the failure
+# mode worth designing against — it produces a box running code nobody is looking at — so the
+# fallback path says loudly when it is taken and checks the binary against SHA256SUMS.
 ensure_binary() {
   local tag; tag="$(arch_tag)"
   local pre="${LIB_DIR}/aestun-linux-${tag}"
+
+  if [[ -f "${LIB_DIR}/main.go" ]] && ensure_go; then
+    check_build_deps
+    msg "Building aestun from the sources in ${LIB_DIR} ..."
+    if ( cd "$LIB_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$tag" go build -trimpath -ldflags "-s -w" -o "${BIN_DST}.new" . ); then
+      # Replace by rename, so a running service is never left pointing at a half-written file.
+      install -m 0755 "${BIN_DST}.new" "$BIN_DST" && rm -f "${BIN_DST}.new"
+      msg "Built and installed from source: $BIN_DST (${tag})"
+      return 0
+    fi
+    rm -f "${BIN_DST}.new"
+    err "Build failed — falling back to the prebuilt binary if one is present."
+  fi
+
   if [[ -f "$pre" ]]; then
+    warn "Using the PREBUILT binary ${pre##*/} — it was not compiled from the sources in this"
+    warn "directory just now, so it matches them only if nobody has edited them since."
+    # SHA256SUMS records what the shipped binaries hashed to when they were built. A mismatch
+    # means the binary was replaced or the file is damaged; either way, say so.
+    if [[ -f "${LIB_DIR}/SHA256SUMS" ]]; then
+      if ( cd "$LIB_DIR" && grep -q "  aestun-linux-${tag}\$" SHA256SUMS \
+           && sha256sum -c --ignore-missing --status SHA256SUMS 2>/dev/null ); then
+        msg "  checksum verified against SHA256SUMS."
+      else
+        err "  checksum does NOT match SHA256SUMS — this binary is not the one that was shipped."
+        confirm "  Install it anyway" || return 1
+      fi
+    fi
     install -m 0755 "$pre" "$BIN_DST"
     msg "Installed prebuilt binary: $BIN_DST (${tag})"
+    printf '   %sTo be certain it matches the sources, rebuild:  ./aestun.sh build %s%s\n' "$D" "$tag" "$N"
     return 0
   fi
-  if command -v go >/dev/null 2>&1 && [[ -f "${LIB_DIR}/main.go" ]]; then
-    warn "No prebuilt binary found; building from source with Go..."
-    check_build_deps
-    ( cd "$LIB_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$tag" go build -trimpath -ldflags "-s -w" -o "$BIN_DST" . )
-    [[ -f "$BIN_DST" ]] && { msg "Built and installed."; return 0; }
-  fi
-  err "No suitable binary (aestun-linux-${tag}) found and Go is unavailable to build it."
-  err "On a machine with Go run:  ./aestun.sh build ${tag}   then place the output next to this script."
+
+  err "No Go toolchain could be obtained and no prebuilt aestun-linux-${tag} is present."
+  err "On a machine with Go run:  ./aestun.sh build ${tag}   then copy the output here."
   return 1
 }
 
@@ -202,7 +297,8 @@ ExecStart=${BIN_DST} -config ${CONF}
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-# CAP_NET_RAW is only used by the optional native desync module; harmless when it is off.
+# CAP_NET_RAW is required by transport "icmp" and by the optional native desync module;
+# harmless to grant when neither is in use. CAP_NET_ADMIN also enables SO_RCVBUFFORCE.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 RuntimeDirectory=aestun
@@ -254,7 +350,18 @@ write_config() {
   "junk":   { "enabled": ${CFG_JUNK:-false}, "count": ${CFG_JUNK_COUNT:-8}, "min_ms": 5, "max_ms": 50 },
   "hop":    { "enabled": ${CFG_HOP:-false}, "ports": [${CFG_HOP_PORTS:-443, 8443, 2053, 2083, 2087, 2096}], "interval": ${CFG_HOP_INT:-30} },
   "split":  { "enabled": ${CFG_SPLIT:-false}, "frag_pos": 24 },
-  "tcp_rotate": { "enabled": ${CFG_TCPROT:-false}, "interval_sec": ${CFG_TCPROT_INT:-15} }
+  "tcp_rotate": { "enabled": ${CFG_TCPROT:-false}, "interval_sec": ${CFG_TCPROT_INT:-15} },
+
+  "icmp": {
+    "readers": ${CFG_ICMP_READERS:-0},
+    "batch": ${CFG_ICMP_BATCH:-32},
+    "kernel_filter": true,
+    "suppress_replies": true,
+    "id": 0,
+    "id_pool": ${CFG_ICMP_POOL:-1},
+    "id_rotate_sec": ${CFG_ICMP_ROT:-60},
+    "mimic_ping": ${CFG_ICMP_MIMIC:-false}
+  }
 }
 EOF
   chmod 600 "$CONF"
@@ -267,6 +374,18 @@ open_firewall() { # open_firewall PORT
     ufw allow "${port}/udp" >/dev/null 2>&1 && msg "UFW rule added for ${port}/udp."
   fi
 }
+# open_firewall_icmp — the ICMP carrier has no port to open, only a message type. Many cloud
+# images ship a UFW policy that drops inbound ICMP echo, which makes the tunnel look blocked
+# by the ISP when it is being blocked by the host itself.
+open_firewall_icmp() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+    ufw allow proto icmp >/dev/null 2>&1 && msg "UFW rule added for ICMP." \
+      || warn "Could not add a UFW ICMP rule; allow ICMP echo manually or the carrier will not receive."
+  fi
+  printf '  %sAlso allow ICMP echo (type 8) inbound in the CLOUD firewall on both servers —\n' "$Y"
+  printf '  a provider security group that only opens TCP/UDP silently drops this carrier.%s\n' "$N"
+}
+
 close_firewall() { # close_firewall PORT
   local port="$1"
   command -v ufw >/dev/null 2>&1 && ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
@@ -353,6 +472,38 @@ show_network_opt() {
 # =============================================================================
 #  Interactive setup — prompts every value; used on BOTH the Iran and foreign server
 # =============================================================================
+# icmp_setup_questions — the ICMP carrier's own knobs, asked only when that carrier is chosen.
+#
+# Split deliberately into two halves. The performance knobs are local to this host and can
+# differ between the two servers; the wire knobs are not negotiated (there is no handshake to
+# negotiate in) and a mismatch means every packet fails to authenticate, so they are asked
+# with that said out loud and default to the interoperable choice.
+icmp_setup_questions() {
+  printf '\n%sICMP carrier settings%s\n' "$BOLD" "$N"
+  printf '  %sThe defaults are right for a busy link; the first two are local to this host.%s\n' "$D" "$N"
+  CFG_ICMP_READERS="$(ask_int "Receive goroutines (0 = one per core, capped at 8)" "0")"
+  CFG_ICMP_BATCH="$(ask_int "Messages per sendmmsg/recvmmsg (1 disables batching)" "32")"
+
+  printf '\n  %sThe next two change the packets on the wire, so they must be IDENTICAL on\n' "$Y"
+  printf '  both servers — there is no negotiation, and a mismatch is a dead tunnel.%s\n' "$N"
+  printf '  %sIdentifier rotation%s: port hopping'"'"'s idea applied to the one field an ICMP\n' "$C" "$N"
+  printf '    flow has to key on. A middlebox that learns to drop "the ping with identifier\n'
+  printf '    0x8D94" has to learn the whole set, and by then the schedule has moved.\n'
+  CFG_ICMP_POOL="$(ask_int "  identifiers to rotate through (1 = no rotation, max 8)" "1")"
+  if [[ "$CFG_ICMP_POOL" -gt 1 ]]; then
+    CFG_ICMP_ROT="$(ask_int "  seconds per identifier" "60")"
+  fi
+  printf '  %sPing mimicry%s: prepend the 16-byte timeval ping(8) puts at the start of its\n' "$C" "$N"
+  printf '    payload, so a dissector renders the flow as ordinary pings with a plausible\n'
+  printf '    round-trip time. Costs 16 bytes per packet.\n'
+  ask_yn "  enable ping mimicry" "N" && CFG_ICMP_MIMIC=true
+
+  printf '\n  %sThis host must allow ICMP echo in and out in the cloud firewall, and the\n' "$Y"
+  printf '  service needs CAP_NET_RAW (the unit already grants it).%s\n' "$N"
+  command -v iptables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1 || \
+    warn "  neither iptables nor nft is present: the kernel will answer the peer's data pings"
+}
+
 interactive_setup() {
   hdr "aestun tunnel setup"
   ensure_deps
@@ -415,17 +566,30 @@ interactive_setup() {
   # Over TCP, one lost carrier segment head-of-line-blocks *all* of them at once
   # (and inner TCP retransmits on top of outer TCP), which shows up as every user
   # stalling in lockstep. Only pick TCP if UDP is blocked on your path.
-  printf '\n%sCarrier transport%s — udp is strongly preferred.\n' "$BOLD" "$N"
-  printf '  %sudp%s: a lost packet affects only the connection it carried\n' "$C" "$N"
-  printf '  %stcp%s: survives UDP-blocking networks, but one loss stalls every connection\n' "$C" "$N"
-  CFG_TRANSPORT="$(ask "Transport (udp/tcp)" "udp")"
-  [[ "$CFG_TRANSPORT" == "udp" || "$CFG_TRANSPORT" == "tcp" ]] || {
-    warn "Unknown transport '$CFG_TRANSPORT' — using udp."; CFG_TRANSPORT="udp"; }
+  printf '\n%sCarrier transport%s — udp is the default; icmp is for paths that punish UDP.\n' "$BOLD" "$N"
+  printf '  %sudp%s : a lost packet affects only the connection it carried\n' "$C" "$N"
+  printf '  %stcp%s : survives UDP-blocking networks, but one loss stalls every connection\n' "$C" "$N"
+  printf '  %sicmp%s: the tunnel rides in ping payloads. On the reference Iran<->EU link UDP\n' "$C" "$N"
+  printf '        lost ~42%% of everything offered, in ~94 ms blackouts every ~345 ms, at any\n'
+  printf '        rate — and ICMP echo crossed the same path at the same moment at 30 Mbit/s\n'
+  printf '        with 0.4%% loss. Needs CAP_NET_RAW and takes no obfs and no port hopping.\n'
+  CFG_TRANSPORT="$(ask "Transport (udp/tcp/icmp)" "udp")"
+  case "$CFG_TRANSPORT" in
+    udp|tcp|icmp) ;;
+    *) warn "Unknown transport '$CFG_TRANSPORT' — using udp."; CFG_TRANSPORT="udp" ;;
+  esac
 
   # --- wire obfuscation ---
   # The payload is already indistinguishable from random, which is the problem: nothing
   # else on the wire looks like that. "quic" gives each datagram a QUIC short header and
   # opens the flow with a real Initial packet, so it reads as an ordinary QUIC connection.
+  if [[ "$CFG_TRANSPORT" == "icmp" ]]; then
+    # An echo request is not a datagram protocol with a handshake to imitate. A QUIC or DTLS
+    # header inside a ping is not cover — no real ping carries one — so it would be the single
+    # anomalous thing about an otherwise ordinary packet. The binary refuses the combination.
+    CFG_OBFS="none"
+    printf '\n%sWire obfuscation%s: not applicable to the ICMP carrier — the cover *is* the ping.\n' "$BOLD" "$N"
+  else
   printf '\n%sWire obfuscation%s — must match on BOTH servers.\n' "$BOLD" "$N"
   printf '  %snone%s : raw high-entropy datagrams (compatible with older builds)\n' "$C" "$N"
   printf '  %squic%s : shapes the carrier as its natural TLS-family form — QUIC over UDP,\n' "$C" "$N"
@@ -447,16 +611,27 @@ interactive_setup() {
   if [[ "$CFG_OBFS" != "none" ]]; then
     CFG_SNI="$(ask "Server name to present in the handshake" "www.cloudflare.com")"
   fi
+  fi
 
   # --- network endpoints ---
   printf '\n'
-  CFG_LISTEN_PORT="$(ask "${CFG_TRANSPORT^^} listen port on THIS server" "51820")"
-  is_port "$CFG_LISTEN_PORT" || { CFG_LISTEN_PORT=51820; warn "Invalid port, using 51820."; }
-  local phost pport
-  phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
-  pport="$(ask "${CFG_TRANSPORT^^} port of the OTHER server" "$CFG_LISTEN_PORT")"
-  is_port "$pport" || pport="$CFG_LISTEN_PORT"
-  CFG_PEER="${phost}:${pport}"
+  local phost
+  if [[ "$CFG_TRANSPORT" == "icmp" ]]; then
+    # ICMP has no ports. listen is still written (the config schema is shared) but nothing
+    # binds it, and the peer is an address on its own.
+    CFG_LISTEN_PORT=51820
+    phost="$(ask_req "Public IPv4 of the OTHER server")" || return 1
+    CFG_PEER="${phost}"
+    printf '  %sThe ICMP carrier is IPv4-only and needs the peer address on BOTH ends.%s\n' "$D" "$N"
+  else
+    CFG_LISTEN_PORT="$(ask "${CFG_TRANSPORT^^} listen port on THIS server" "51820")"
+    is_port "$CFG_LISTEN_PORT" || { CFG_LISTEN_PORT=51820; warn "Invalid port, using 51820."; }
+    local pport
+    phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
+    pport="$(ask "${CFG_TRANSPORT^^} port of the OTHER server" "$CFG_LISTEN_PORT")"
+    is_port "$pport" || pport="$CFG_LISTEN_PORT"
+    CFG_PEER="${phost}:${pport}"
+  fi
 
   # --- tunnel interface / local IPs ---
   printf '\n'
@@ -499,6 +674,10 @@ interactive_setup() {
   # from the management menu (option x) without re-running this wizard.
   CFG_DESYNC=false; CFG_DESYNC_BADSUM=false; CFG_JUNK=false; CFG_HOP=false; CFG_SPLIT=false
   CFG_HOP_PORTS="443, 8443, 2053, 2083, 2087, 2096"
+  CFG_ICMP_POOL=1; CFG_ICMP_ROT=60; CFG_ICMP_MIMIC=false; CFG_ICMP_READERS=0; CFG_ICMP_BATCH=32
+  if [[ "$CFG_TRANSPORT" == "icmp" ]]; then
+    icmp_setup_questions
+  else
   printf '\n%sAnti-DPI hardening%s — optional, all off by default (README §15).\n' "$BOLD" "$N"
   if ask_yn "Native desync (in-process fake QUIC injector, replaces the zapret module)" "N"; then
     CFG_DESYNC=true
@@ -512,15 +691,60 @@ interactive_setup() {
     CFG_HOP_PORTS="$(printf '%s' "$hp" | tr -d ' ' | sed 's/,/, /g')"
     printf '  %sRemember to open these ports in the cloud/OS firewall on BOTH servers.%s\n' "$Y" "$N"
   fi
+  fi
 
   write_config
   write_service
   systemctl daemon-reload
   systemctl enable --now aestun >/dev/null 2>&1 && msg "Service enabled and started."
-  open_firewall "$CFG_LISTEN_PORT"
-  if [[ "$CFG_HOP" == true ]]; then
-    local p
-    for p in ${CFG_HOP_PORTS//,/ }; do open_firewall "$p"; done
+  if [[ "$CFG_TRANSPORT" == "icmp" ]]; then
+    open_firewall_icmp
+  else
+    open_firewall "$CFG_LISTEN_PORT"
+    if [[ "$CFG_HOP" == true ]]; then
+      local p
+      for p in ${CFG_HOP_PORTS//,/ }; do open_firewall "$p"; done
+    fi
+  fi
+
+  # --- zapret (DPI desync on the carrier) ---
+  #
+  # On by default, and asked after the service is already up so a zapret failure can never
+  # stop the tunnel from being installed. It is ordering-only in systemd (Before=aestun,
+  # never Requires), and the NFQUEUE rule carries --queue-bypass, so even a wedged nfqws
+  # passes traffic through untouched rather than blackholing the carrier.
+  printf '\n'
+  if [[ "$CFG_TRANSPORT" == "icmp" ]]; then
+    printf '%szapret%s: skipped — nfqws desyncs TCP and UDP flows and has no ICMP mode, so\n' "$BOLD" "$N"
+    printf '  arming it here would install rules that never match while systemd reports it\n'
+    printf '  active. The equivalent for this carrier is built into the binary and is what\n'
+    printf '  the "desync" block now means on ICMP: a burst of ordinary 64-byte decoy pings\n'
+    printf '  carrying the tunnel'"'"'s own identifier, at a TTL that expires before the peer, so\n'
+    printf '  a classifier watching from the first packet sees an ordinary ping session.\n'
+    if ask_yn "Enable the native ICMP desync (decoy pings) on the carrier" "Y"; then
+      CFG_DESYNC=true
+      python3 - "$CONF" <<'PY'
+import json,sys
+p=sys.argv[1]; c=json.load(open(p))
+d=c.setdefault("desync",{}); d["enabled"]=True
+d.setdefault("repeats",4); d.setdefault("autottl",True); d.setdefault("delta",-1)
+d.setdefault("min_ttl",3); d.setdefault("max_ttl",20); d.setdefault("badsum",False)
+json.dump(c,open(p,"w"),indent=2)
+PY
+      chmod 600 "$CONF"
+      systemctl restart aestun >/dev/null 2>&1 && msg "native ICMP desync enabled."
+    fi
+  else
+    printf '%sDPI desync (zapret/nfqws) on the carrier port%s — recommended, on by default.\n' "$BOLD" "$N"
+    printf '  Builds nfqws from source and desyncs the first few packets of the carrier flow,\n'
+    printf '  which is the window a stateful DPI classifies it in. Needs git + a compiler.\n'
+    if ask_yn "Install and enable zapret on ${CFG_TRANSPORT}/${CFG_LISTEN_PORT}" "Y"; then
+      if zap_install quiet; then
+        zap_enable quiet || warn "zapret built but could not be armed; enable it later from menu 'z'."
+      else
+        warn "zapret could not be built on this server. The tunnel is unaffected; retry from menu 'z'."
+      fi
+    fi
   fi
 
   # --- network optimization ---
@@ -661,7 +885,13 @@ test_conn() {
   if ping -c 4 -W 2 "$peer_ip"; then
     printf '\n'; msg "Tunnel link is healthy."
   else
-    printf '\n'; err "No reply. Check: both services active, UDP port open, key/roles correct."
+    printf '\n'
+    if [[ "$(json_get "$CONF" transport)" == "icmp" ]]; then
+      err "No reply. Check: both services active, ICMP echo allowed in BOTH cloud firewalls,"
+      err "the same key/roles, and the same icmp.id_pool / icmp.mimic_ping on both servers."
+    else
+      err "No reply. Check: both services active, carrier port open, key/roles correct."
+    fi
   fi
   pause
 }
@@ -727,7 +957,12 @@ EOF
 # =============================================================================
 zap_installed() { [[ -x "$ZAP_BIN" ]]; }
 
+# zap_install [quiet] — build nfqws from source. With "quiet" it never pauses and returns a
+# status instead, so the installer can run it as one step of the wizard.
 zap_install() {
+  local quiet="${1:-}"
+  local _p=pause; [[ "$quiet" == quiet ]] && _p=:
+  zap_installed && { msg "zapret already built: ${ZAP_BIN}"; return 0; }
   hdr "Install zapret (builds nfqws from source)"
   # Upstream zapret ships NO prebuilt binaries in the git tree, so we build nfqws.
   ensure_deps
@@ -736,7 +971,7 @@ zap_install() {
   apt-get update -y >/dev/null 2>&1 || true
   if ! apt-get install -y git iptables build-essential zlib1g-dev \
         libnetfilter-queue-dev libnfnetlink-dev libmnl-dev libcap-dev >/dev/null 2>&1; then
-    err "Failed to install build dependencies (apt)."; pause; return
+    err "Failed to install build dependencies (apt)."; $_p; return 1
   fi
 
   if [[ -d "$ZAPRET_DIR/.git" ]]; then
@@ -744,29 +979,48 @@ zap_install() {
   else
     msg "Cloning zapret..."
     git clone --depth 1 https://github.com/bol-van/zapret "$ZAPRET_DIR" \
-      || { err "git clone failed (no route to GitHub from this server?)."; pause; return; }
+      || { err "git clone failed (no route to GitHub from this server?)."; $_p; return 1; }
   fi
 
   msg "Building nfqws..."
+  local rc=0
   if make -C "$ZAPRET_DIR/nfq" nfqws >/tmp/nfqws-build.log 2>&1 && zap_installed; then
     msg "zapret ready: ${ZAP_BIN}"
     "$ZAP_BIN" --version 2>/dev/null | head -1 || true
   else
     err "Build failed. Last lines of /tmp/nfqws-build.log:"; tail -8 /tmp/nfqws-build.log
+    rc=1
   fi
-  pause
+  $_p
+  return $rc
 }
 
+# zap_enable [quiet] — arm nfqws on the carrier. With "quiet" it never pauses, so the
+# installer can turn it on without interrupting the wizard.
 zap_enable() {
-  hdr "Enable zapret on the tunnel port"
-  zap_installed || { err "Install zapret first (option 1)."; pause; return; }
-  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
+  local quiet="${1:-}"
+  local _p=pause; [[ "$quiet" == quiet ]] && _p=:
+  hdr "Enable zapret on the tunnel carrier"
+  zap_installed || { err "Install zapret first (option 1)."; $_p; return 1; }
+  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; $_p; return 1; }
 
-  local peer host port qnum=200 transport desync
-  peer="$(json_get "$CONF" peer)"; port="${peer##*:}"; host="${peer%:*}"
-  [[ -z "$port" ]] && { err "Could not read peer port from config."; pause; return; }
-  [[ -z "$host" ]] && { err "Could not read peer host from config."; pause; return; }
-  transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
+  local host port qnum=200 transport desync
+  IFS='|' read -r host port transport < <(carrier_endpoint)
+  if [[ "$transport" == "icmp" ]]; then
+    # Stated plainly rather than half-applied. zapret's nfqws desyncs TCP and UDP flows via
+    # NFQUEUE; it has no ICMP mode, and the carrier here is echo-request payloads. Arming it
+    # would install rules that match nothing and report "active" while doing nothing at all,
+    # which is worse than not running it. The ICMP carrier's own anti-DPI work is in the
+    # binary instead: identifier rotation, ping mimicry and rate shaping (menu 'i').
+    err "The carrier transport is \"icmp\". zapret/nfqws desyncs TCP and UDP only — it has no"
+    err "ICMP mode, so enabling it here would arm rules that never match."
+    warn "Use the ICMP carrier's own anti-DPI settings instead: menu 'i' (id rotation, ping"
+    warn "mimicry) and \"rate_mbps\" in the config, which is what actually limits volumetric"
+    warn "exposure on a ping carrier."
+    $_p; return 1
+  fi
+  [[ -n "$port" ]] || { err "Could not read a carrier port from config."; $_p; return 1; }
+  [[ -n "$host" ]] || { err "Could not read the peer host from config."; $_p; return 1; }
 
   # Cover ALL protocols in one nfqws using two profiles (matched first-to-last):
   #   1) TCP on the carrier port -> multisplit (fragments the TLS-record stream; the peer
@@ -835,7 +1089,7 @@ EOF
     warn "Queue saw no packets. zapret is armed but did nothing; check that conntrack is installed."
   fi
   warn "If traffic breaks, disable this module. Tune the desync mode with zapret's blockcheck.sh."
-  pause
+  $_p
 }
 
 zap_disable() {
@@ -888,6 +1142,12 @@ zapret_menu() {
     local ins="no"; zap_installed && ins="yes"
     local act; act="$(svc_active aestun-zapret)"
     hdr "zapret — DPI bypass (installed: ${ins} | service: ${act})"
+    if [[ -f "$CONF" && "$(json_get "$CONF" transport)" == "icmp" ]]; then
+      # Said here as well as in zap_enable, because "active" on this menu with an ICMP
+      # carrier is exactly the misleading state this module can get into.
+      printf '  %sCarrier is ICMP: nfqws desyncs TCP and UDP only and cannot act on this\n' "$Y"
+      printf '  carrier. Its equivalent is the native decoy-ping injector — menu x.%s\n' "$N"
+    fi
     cat <<EOF
   ${C}1${N}) install / update zapret
   ${C}2${N}) enable on the tunnel port
@@ -921,6 +1181,14 @@ uninstall_all() {
   rm -f "$SERVICE" "$ZAP_SERVICE" "$ZAP_RULES" "$BIN_DST"
   systemctl daemon-reload
   ip link del "$iface" 2>/dev/null || true
+  # The ICMP carrier installs echo-reply DROP rules that outlive the process. The binary
+  # removes them on SIGTERM, but a rule left by an older build (or a hard kill) would stay
+  # for ever and silently break ordinary ping to the peer, so sweep them by their comment.
+  local r
+  while read -r r; do
+    [[ -n "$r" ]] && eval "iptables -w -D OUTPUT ${r#-A OUTPUT }" 2>/dev/null || true
+  done < <(iptables -S OUTPUT 2>/dev/null | grep -- '--comment "aestun icmp carrier"' | sed 's/--comment "aestun icmp carrier"/--comment "aestun icmp carrier"/')
+  nft delete table ip aestun 2>/dev/null || true
   [[ -n "$port" ]] && close_firewall "$port"
   confirm "Remove network optimization (sysctl tuning) too?" && remove_network_opt
   confirm "Delete config directory ${CONF_DIR}?" && rm -rf "$CONF_DIR"
@@ -1022,6 +1290,17 @@ EOF
 dpi_selftest() {
   clear
   [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
+  if [[ "$(json_get "$CONF" transport)" == "icmp" ]]; then
+    # The self-test sends UDP at the carrier's listen port. On the ICMP carrier nothing binds
+    # a port, so every probe would land on a closed port and the observer would record
+    # nothing — a green "no findings" that means only that the test missed.
+    err "The carrier is ICMP, which binds no port — this self-test sends UDP probes and would"
+    err "measure nothing at all."
+    warn "The observer is still live on this carrier: it classifies stray echo requests that"
+    warn "carry this tunnel's identifier but fail to authenticate, and reports the raw socket's"
+    warn "own drop counter. Use option 1 (report) to read what it has actually seen."
+    pause; return
+  fi
   local port lp
   port="$(json_get "$CONF" listen)"; port="${port##*:}"
   lp="$(dpi_log_path)"
@@ -1128,7 +1407,113 @@ PY
   msg "hop ports set. Open them in the cloud firewall on BOTH servers."
 }
 
+# icmp_menu — the ICMP carrier's settings, live. Same split as the wizard: the top group is
+# local to this host, the bottom group changes the wire and has to be mirrored on the peer.
+icmp_menu() {
+  [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
+  if [[ "$(json_get "$CONF" transport)" != "icmp" ]]; then
+    warn "The carrier transport is not 'icmp' — these settings are ignored until it is."
+    confirm "Show them anyway" || return
+  fi
+  while true; do
+    clear
+    local cur
+    cur="$(python3 - "$CONF" 2>/dev/null <<'PY'
+import json,sys
+c=json.load(open(sys.argv[1])).get("icmp",{})
+print("readers=%s batch=%s filter=%s suppress=%s id_pool=%s rotate=%ss mimic=%s" % (
+  c.get("readers",0), c.get("batch",32), c.get("kernel_filter",True),
+  c.get("suppress_replies",True), c.get("id_pool",1), c.get("id_rotate_sec",60),
+  c.get("mimic_ping",False)))
+PY
+)"
+    printf '%s\n' "${BOLD}${C}+-- ICMP carrier ------------------------------------+${N}"
+    printf '  current: %s%s%s\n\n' "$W" "${cur:-unreadable}" "$N"
+    printf '%s\n' "${D}  1-3 are local to this host and may differ between the two servers.${N}"
+    printf '%s\n' "${D}  4-6 change the wire and MUST be identical on BOTH servers.${N}"
+    cat <<EOF
+
+  ${C}1${N}) receive goroutines      (0 = one per core, capped at 8)
+  ${C}2${N}) messages per syscall    (sendmmsg/recvmmsg batch; 1 = off)
+  ${C}3${N}) toggle kernel packet filter (BPF on the raw socket)
+  ${C}4${N}) identifier pool size    (1 = no rotation, max 8)
+  ${C}5${N}) identifier rotation interval
+  ${C}6${N}) toggle ping mimicry     (16-byte timeval prefix)
+  ${C}7${N}) toggle echo-reply suppression (firewall rule)
+  ${C}0${N}) back (restart to apply)
+EOF
+    local c; c="$(ask 'Choose' '')" || return
+    case "$c" in
+      1) icmp_set readers "$(ask_int 'Receive goroutines' '0')" ;;
+      2) icmp_set batch "$(ask_int 'Messages per syscall' '32')" ;;
+      3) icmp_toggle kernel_filter ;;
+      4) icmp_set id_pool "$(ask_int 'Identifiers in the set (1-8)' '1')"
+         warn "Set the SAME id_pool on the other server, then restart both." ;;
+      5) icmp_set id_rotate_sec "$(ask_int 'Seconds per identifier' '60')"
+         warn "Set the SAME interval on the other server, then restart both." ;;
+      6) icmp_toggle mimic_ping
+         warn "Ping mimicry must match on BOTH servers, or every packet fails to authenticate." ;;
+      7) icmp_toggle suppress_replies ;;
+      0) if confirm "Restart aestun now to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
+         return ;;
+      *) warn "invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+icmp_set() { # icmp_set KEY INT
+  python3 - "$CONF" "$1" "$2" <<'PY'
+import json,sys
+p,k,v=sys.argv[1],sys.argv[2],int(sys.argv[3])
+c=json.load(open(p)); c.setdefault("icmp",{})[k]=v
+json.dump(c,open(p,"w"),indent=2)
+PY
+  chmod 600 "$CONF"
+}
+
+icmp_toggle() { # icmp_toggle KEY
+  python3 - "$CONF" "$1" <<'PY'
+import json,sys
+p,k=sys.argv[1],sys.argv[2]
+c=json.load(open(p)); d=c.setdefault("icmp",{})
+d[k]=not d.get(k, k in ("kernel_filter","suppress_replies"))
+json.dump(c,open(p,"w"),indent=2)
+print("%s is now %s"%(k,d[k]))
+PY
+  chmod 600 "$CONF"
+}
+
 antidpi_menu() {
+  if [[ -f "$CONF" && "$(json_get "$CONF" transport)" == "icmp" ]]; then
+    # On a ping carrier obfs is refused by the binary and port hopping has no ports to hop.
+    # desync and junk do apply — the binary dispatches "desync" to the ICMP injector (decoy
+    # pings) rather than the QUIC one — so offer exactly those two.
+    while true; do
+      clear
+      local st; st="$(antidpi_state)"
+      printf '%s\n' "${BOLD}${C}+-- Anti-DPI hardening (ICMP carrier) ---------------+${N}"
+      printf '  current: %s%s%s\n\n' "$W" "$st" "$N"
+      printf '%s\n' "${D}  desync = a burst of ordinary 64-byte decoy pings carrying this tunnel's${N}"
+      printf '%s\n' "${D}           identifier, at a TTL that expires before the peer${N}"
+      printf '%s\n' "${D}  junk   = flow-start cover traffic${N}"
+      printf '%s\n' "${D}  obfs and port hopping do not apply on this carrier; identifier rotation${N}"
+      printf '%s\n' "${D}  and ping mimicry live in menu 'i'.${N}"
+      cat <<EOF
+
+  ${C}1${N}) toggle desync (decoy pings)
+  ${C}2${N}) toggle junk
+  ${C}0${N}) back (restart to apply)
+EOF
+      local ic; ic="$(ask 'Choose' '')" || return
+      case "$ic" in
+        1) if [[ "$st" == *desync=on* ]]; then antidpi_set desync false; else antidpi_set desync true; fi ;;
+        2) if [[ "$st" == *junk=on* ]]; then antidpi_set junk false; else antidpi_set junk true; fi ;;
+        0) if confirm "Restart aestun now to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
+           return ;;
+        *) warn "invalid option"; sleep 1 ;;
+      esac
+    done
+  fi
   while true; do
     clear
     local state; state="$(antidpi_state)"
@@ -1220,6 +1605,14 @@ autotest() {
     "port-hop|{\"transport\":\"udp\",\"obfs\":\"quic2\",\"hop\":{\"enabled\":true,\"ports\":[443,2053,2083,2087,2096],\"interval\":20}}"
     "tcp+tls|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true}}"
     "tcp+tls+rotate|{\"transport\":\"tcp\",\"obfs\":\"quic\",\"junk\":{\"enabled\":true},\"tcp_rotate\":{\"enabled\":true,\"interval_sec\":15}}"
+    # The ICMP carrier has to be in the sweep, because on the link this was built for it is
+    # the method that wins outright: UDP lost ~42% at every offered rate in ~94 ms blackouts
+    # and TCP was throttled to a blackhole within seconds, while ICMP echo crossed the same
+    # path at the same moment at full rate. A sweep that cannot select it cannot find that.
+    # It takes no obfs and no port hopping; "desync" here means the native decoy-ping
+    # injector, which is the ICMP equivalent of a fake burst.
+    "icmp|{\"transport\":\"icmp\",\"obfs\":\"none\",\"hop\":{\"enabled\":false}}"
+    "icmp+desync|{\"transport\":\"icmp\",\"obfs\":\"none\",\"hop\":{\"enabled\":false},\"desync\":{\"enabled\":true,\"repeats\":4}}"
   )
 
   local best_name="" best_loss=100 best_rate="-" best_score=-1000000 best_over="{}"
@@ -1305,15 +1698,19 @@ PY
     local tag=""; [[ "$throttled" == 1 ]] && tag="THROTTLED"
     printf '%-18s %6s %8s %8s  %s\n' "$name" "$loss" "$pingms" "$rate" "$tag" | tee -a "$RESULTFILE"
     # Scoring: a throttled variant is disqualified outright. Otherwise rank on sustained
-    # throughput, penalise loss hard, and give UDP a bonus — it does not risk the volumetric
-    # TCP throttle and has lower, honest latency (the TCP path can report a bogus sub-RTT ping).
+    # throughput, penalise loss hard, and give the datagram carriers a bonus — neither risks
+    # the volumetric TCP throttle, and both report honest latency (the TCP path can report a
+    # bogus sub-RTT ping). ICMP gets the same bonus as UDP rather than none: it is a datagram
+    # carrier with the same properties, and on the link this was written for it is the only
+    # one that survives the path at all. Leaving it unbonused would have the sweep pick a UDP
+    # variant losing 42% over an ICMP one losing 0.4%.
     local score
     if [[ "$throttled" == 1 ]]; then
       score=-100000
     else
       score="$(awk -v r="$rate" -v l="$loss" -v t="$transport" 'BEGIN{
         rr=(r ~ /^[0-9.]+$/)?r:0; ll=(l ~ /^[0-9.]+$/)?l:100;
-        printf "%.2f", rr - ll*5 + (t=="udp"?40:0)}')"
+        printf "%.2f", rr - ll*5 + ((t=="udp"||t=="icmp")?40:0)}')"
     fi
     awk "BEGIN{exit !($score > $best_score)}" && {
       best_score="$score"; best_name="$name"; best_loss="$loss"; best_rate="$rate"; best_over="$over"
@@ -1422,6 +1819,7 @@ main_menu() {
   ${C}9${N}) Network optimization
   ${C}d${N}) DPI / probe log            <- who is probing, what the path is doing
   ${C}x${N}) Anti-DPI hardening         <- desync / junk / port-hop / split (native, §15)
+  ${C}i${N}) ICMP carrier settings      <- readers / batching / id rotation / ping mimicry
   ${C}t${N}) Auto-test methods          <- sweep every method/protocol, apply the best (§16)
   ${C}z${N}) zapret module (DPI bypass)
   ${C}u${N}) Uninstall tunnel
@@ -1440,6 +1838,7 @@ EOF
       9) netopt_menu ;;
       d|D) dpi_menu ;;
       x|X) antidpi_menu ;;
+      i|I) icmp_menu ;;
       t|T) autotest ;;
       z|Z) zapret_menu ;;
       u|U) uninstall_all ;;
@@ -1456,9 +1855,17 @@ EOF
 #  so it is identical on both ends. Was the standalone zapret-rules.sh.
 # =============================================================================
 zap_rule() {
-  local peer host port qnum=200
-  peer="$(json_get "$CONF" peer)"; host="${peer%:*}"; port="${peer##*:}"
-  [[ -n "$host" && -n "$port" ]] || { echo "zap-rule: cannot read peer from $CONF" >&2; return 1; }
+  local host port transport qnum=200
+  IFS='|' read -r host port transport < <(carrier_endpoint)
+  if [[ "$transport" == "icmp" ]]; then
+    # nfqws filters on TCP and UDP; there is no ICMP mode, and an NFQUEUE rule on -p icmp
+    # would round-trip the whole carrier through a userspace process that then does nothing
+    # with it. Succeed quietly so the unit's ExecStartPre/ExecStopPost do not fail the
+    # service — zap_enable is what refuses loudly.
+    echo "zap-rule: carrier is ICMP; nfqws has no ICMP desync, nothing to do" >&2
+    return 0
+  fi
+  [[ -n "$host" && -n "$port" ]] || { echo "zap-rule: cannot read peer host/port from $CONF" >&2; return 1; }
 
   # Cover BOTH transports on the carrier port. The tunnel uses one at a time, but queuing tcp
   # AND udp means the desync applies whatever the carrier is (and keeps working if you switch
@@ -1549,7 +1956,49 @@ do_build() {
   fi
   ( cd "$LIB_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build "${tags[@]}" -trimpath -ldflags "-s -w" -o "$out" . ) \
     && msg "built: ${out}" \
-    && printf '   copy to a server:  scp %s root@SERVER:/usr/local/bin/aestun\n' "$out"
+    && printf '   copy to a server:  scp %s root@SERVER:/usr/local/bin/aestun\n' "$out" \
+    && zap_refresh_sums "$out"
+}
+
+# zap_refresh_sums — keep SHA256SUMS in step with a binary that was just rebuilt.
+#
+# A checksum file that is not regenerated is worse than none: it certifies the previous
+# binary, so the fallback path in ensure_binary would report a mismatch on a perfectly good
+# build and an operator would learn to ignore it. Only the plain (untagged) builds are
+# recorded — a pprof or garble build is a one-off, not something to ship.
+zap_refresh_sums() {
+  local out="$1"
+  [[ "$out" =~ ^aestun-linux-(amd64|arm64)$ ]] || return 0
+  command -v go >/dev/null 2>&1 || return 0
+  ( cd "$LIB_DIR" || return 0
+    {
+      echo "# Prebuilt aestun binaries — built from the sources in this directory."
+      echo "#"
+      echo "# Go:      $(go version | awk '{print $3}')"
+      echo "# Built:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "# Flags:   CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\""
+      echo "#"
+      echo "# The build is reproducible: -trimpath and CGO_ENABLED=0 mean the same Go version"
+      echo "# over the same sources produces byte-identical output, so you can verify these"
+      echo "# rather than trust them:"
+      echo "#"
+      echo "#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags \"-s -w\" -o /tmp/v ."
+      echo "#   sha256sum /tmp/v aestun-linux-amd64      # the two hashes must match"
+      echo "#"
+      echo "# aestun.sh compiles from source whenever a Go toolchain is available or can be"
+      echo "# fetched; these are the fallback for a box that has neither."
+      echo ""
+      local f
+      # "aestun" is the host build of the same program — on an amd64 box it is byte-identical
+      # to aestun-linux-amd64, and it is the one to run straight out of the directory.
+      for f in aestun aestun-linux-amd64 aestun-linux-arm64; do
+        [[ -f "$f" ]] && sha256sum "$f"
+      done
+      echo ""
+      echo "# source fingerprint at build time:"
+      sha256sum ./*.go go.mod go.sum 2>/dev/null | sha256sum | sed 's/^/# sources: /'
+    } > SHA256SUMS
+  ) && msg "SHA256SUMS refreshed."
 }
 
 # =============================================================================
@@ -1592,12 +2041,19 @@ do_upgrade() {
   # Existing installs are the ones most likely to be sitting on obfs=quic, which on Iranian
   # carriers has its handshake cover dropped outright: the tunnel keeps working, so nothing
   # looks wrong, while the disguise it was configured for is simply not happening.
-  local curo newo
+  local curo newo curtr
   curo="$(json_get "$CONF" obfs)"; curo="${curo:-none}"
+  curtr="$(json_get "$CONF" transport)"; curtr="${curtr:-udp}"
+  if [[ "$curtr" == "icmp" ]]; then
+    # The binary refuses obfs on this carrier, so offering it here would only produce a
+    # config that fails to start.
+    newo="none"
+    printf '\n%sWire disguise%s: not applicable — the ICMP carrier'"'"'s cover is the ping itself.\n' "$BOLD" "$N"
+  else
   printf '\n%sWire disguise%s  current: %s%s%s\n' "$BOLD" "$N" "$W" "$curo" "$N"
   if [[ "$curo" == "quic" && "$(json_get "$CONF" transport)" != "tcp" ]]; then
     printf '  %squic2 is recommended over quic on Iranian links:%s every QUIC v1 long-header\n' "$Y" "$N"
-    printf '  packet was measured dropped on the carriers tested, so the synthetic handshake\n'
+    printf '  packet was measured dropped on AS25184 and AS34918, so the synthetic handshake\n'
     printf '  never arrives and the flow reads as 1-RTT packets with no handshake in front.\n'
     printf '  Same wire format for data, so throughput is unchanged. (README §10.2)\n'
   fi
@@ -1605,6 +2061,7 @@ do_upgrade() {
   local defo="$curo"; [[ "$curo" == "quic" && "$(json_get "$CONF" transport)" != "tcp" ]] && defo="quic2"
   newo="$(ask "Obfuscation" "$defo")"
   case "$newo" in none|quic|quic2|dtls) ;; *) warn "Unknown obfs '$newo' — keeping $curo."; newo="$curo" ;; esac
+  fi
 
   # --- socket buffers ---
   # 8/16 MiB was the old default and is pure bufferbloat on a fast link; see the note in
@@ -1638,6 +2095,13 @@ if buf:
 # offer is present in the file rather than silently defaulted inside the binary.
 c.setdefault("tcp_rotate",{"enabled":False,"interval_sec":15})
 c.setdefault("split",{"enabled":False,"frag_pos":24})
+# The ICMP carrier's block. Every value here is the binary's own default, so adding it to an
+# existing config changes nothing about how the tunnel behaves — it just makes the knobs
+# visible to the menus and to anyone reading the file.
+i=c.setdefault("icmp",{})
+for k,v in (("readers",0),("batch",32),("kernel_filter",True),("suppress_replies",True),
+            ("id",0),("id_pool",1),("id_rotate_sec",60),("mimic_ping",False)):
+    i.setdefault(k,v)
 d=c.setdefault("dpi_log",{})
 d["enabled"]=dpion
 d.setdefault("path",logpath)

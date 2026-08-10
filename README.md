@@ -162,15 +162,37 @@ periodically for very high-volume, long-lived links (GCM random-nonce safety bou
 | `junk.go` | flow-start cover traffic (section 15) |
 | `hop.go` | keyed synchronised port hopping (section 15) |
 | `split.go` | IP-fragmentation of the disposable desync fakes (section 15) |
+| `icmp.go` | the ICMP carrier: ping-payload transport, kernel packet filter, identifier rotation, ping mimicry, decoy-ping desync (section 17) |
+| `mmsg.go` | `sendmmsg`/`recvmmsg` plumbing — many datagrams per syscall, used by the ICMP carrier |
 | `hkdf.go` | HKDF-SHA256 key derivation (RFC 5869) |
 | `main.go` | Linux TUN device, UDP/TCP carriers, main loop (build-tagged `linux`) |
 | `pprof_on.go` / `pprof_off.go` | profiling endpoints, behind the `pprof` build tag |
-| `*_test.go` | unit tests, allocation assertions and benchmarks (`go test`) |
-| `vendor/` | the two vendored dependencies, so the build works offline |
 | `aestun.sh` | one script: installer, management TUI, live monitor, zapret, network tuning, build, and the systemd-invoked NFQUEUE helper (`zap-rule`) |
 | `aestun.service` | reference systemd unit |
-| `config.server-a.json` / `config.server-b.json` | example configs |
-| `aestun-linux-amd64` / `aestun-linux-arm64` | prebuilt binaries (if shipped) |
+| `config.server-a.json` / `config.server-b.json` / `config.icmp.json` | example configs |
+| `aestun` | the core build for this host — run it straight out of the directory |
+| `aestun-linux-amd64` / `aestun-linux-arm64` | the same program, cross-built for each architecture |
+| `SHA256SUMS` | their checksums, the Go version and flags they were built with, and a fingerprint of the sources at build time |
+
+**Source build first, prebuilt second.** `aestun.sh install` compiles what is actually in the
+directory — fetching a Go toolchain if the box has none — and only falls back to the prebuilt
+binary when no toolchain can be obtained. That order matters: nothing ties a checked-in binary
+to the source beside it, and the one previously in this tree predated the ICMP carrier, so an
+installer that preferred it put an older program on disk than the sources the operator was
+reading. The fallback path says out loud that it was taken and verifies the binary against
+`SHA256SUMS` first.
+
+The builds are reproducible (`CGO_ENABLED=0`, `-trimpath`), so you can check rather than trust:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /tmp/v .
+sha256sum /tmp/v aestun-linux-amd64     # the two hashes must match
+```
+
+`./aestun.sh build amd64` (or `arm64`) rebuilds a binary **and** regenerates `SHA256SUMS`, so
+the checksum file cannot certify a binary that no longer exists.
+
+The tree ships **no test files** — `go test` targets were removed to keep it small.
 
 ---
 
@@ -253,8 +275,8 @@ Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json
 | `pad_max` | `64` | max random padding bytes per packet (0 disables; anti-DPI) |
 | `rekey_interval` | `3600` | key-rotation seconds (0 = static key) |
 | `keepalive` | `25` | keepalive seconds (0 disables) |
-| `rcvbuf` | `2097152` | UDP socket receive buffer (bytes). **This is a queue — bigger is not better.** See section 7.1 |
-| `sndbuf` | `2097152` | UDP socket send buffer (bytes); an oversized one is pure bufferbloat (section 7.1) |
+| `rcvbuf` | `16777216` | UDP socket receive buffer (bytes); absorbs bursts so the kernel doesn't drop |
+| `sndbuf` | `16777216` | UDP socket send buffer (bytes) |
 | `manage_ip` | `true` | let the daemon run the `ip` commands |
 | `stats_path` | `/run/aestun/stats.json` | monitor stats file (empty disables) |
 | `offload` | `true` | kernel UDP segmentation/coalescing (section 7) |
@@ -270,17 +292,12 @@ Every value is prompted by `aestun.sh install`, or edit `/etc/aestun/config.json
 | `split` | *(off)* | IP-fragment the desync fakes — see section 15 |
 
 ### Packet loss / lag note
-The daemon sets the UDP socket buffers (`rcvbuf`/`sndbuf`, **2 MiB** each) large enough to
-absorb bursts but small enough not to become a latency queue — section 7.1 has the
-measurement behind that number, and it is the single most effective tuning knob here.
-
-Watch for drops with `grep Udp: /proc/net/snmp` — a rising **RcvbufErrors** means the buffer
-is too small *or* `net.core.rmem_max` is below `rcvbuf` (the kernel caps the buffer at
-`rmem_max`). Run the network optimization (below) so `rmem_max` is large enough — otherwise
-the request is silently clamped to the ~200 KB default and packets drop under load.
-
-If you do see sustained `RcvbufErrors`, raise `rcvbuf` — but re-measure latency under load
-afterwards, because that is exactly the trade you are making.
+The daemon sets the UDP socket buffers (`rcvbuf`/`sndbuf`, 8 MiB each) so traffic
+bursts are absorbed instead of dropped. Watch for drops with
+`grep Udp: /proc/net/snmp` — a rising **RcvbufErrors** means the buffer is too small
+*or* `net.core.rmem_max` is below `rcvbuf` (the kernel caps the buffer at `rmem_max`).
+Run the network optimization (below) so `rmem_max` is large enough — otherwise your
+8 MiB request is silently clamped to the ~200 KB default and packets drop under load.
 
 ### Transport note
 The carrier multiplexes **every** inner connection. Over TCP, one lost carrier segment
@@ -716,9 +733,9 @@ Initial salt, renames the key-derivation labels to `quicv2 …`, and permutes th
 packet type codes, all of which this build implements, so the packet is a genuine v2 Initial
 rather than a v1 one with the version field overwritten.
 
-It exists because of a measurement. On **two independent Iranian carriers**, every
-long-header packet carrying **QUIC v1** was dropped, in both directions, while the same
-flow's short-header packets passed untouched:
+It exists because of a measurement. On two independent Iranian carriers — AS25184 (Afranet)
+and AS34918 (Pishgaman) — every long-header packet carrying **QUIC v1** was dropped, in both
+directions, while the same flow's short-header packets passed untouched:
 
 | cover sent (200 packets each) | delivered |
 |---|---|
@@ -794,15 +811,29 @@ censoring ISP has a harder time recognizing or throttling them. From `aestun.sh`
 2. **enable** — adds `iptables` NFQUEUE rules and runs `nfqws` as a service (`aestun-zapret`).
 3. **status / disable / remove**.
 
-### 🌐 Protocol coverage (TCP + UDP + any protocol)
+**It is now installed and enabled by default** by `aestun.sh install` on a TCP or UDP carrier.
+It is ordering-only in systemd (`Before=aestun`, never `Requires=`) and the NFQUEUE rule carries
+`--queue-bypass`, so a zapret that fails to build, fails to start, or wedges can never stop the
+tunnel from coming up or blackhole the carrier — traffic passes through untouched.
 
-The NFQUEUE rule now queues **both `tcp` and `udp`** on the carrier port, and `nfqws` runs two
+### 🌐 Protocol coverage (TCP + UDP + any protocol) — and what it cannot cover
+
+The NFQUEUE rule queues **both `tcp` and `udp`** on the carrier port, and `nfqws` runs two
 profiles so it acts on whatever the carrier is — and keeps working if you switch transport:
 
 * **TCP on the carrier port → `multisplit`** (fragments the TLS-record stream; the peer
   reassembles it transparently, on-path DPI sees a split connection start);
 * **everything else (the UDP carrier, and any other protocol) → `fake` injection** with
   `--dpi-desync-any-protocol=1`, so it desyncs the carrier's opaque payload regardless of L7.
+
+> ⚠️ **`transport: icmp` is the one carrier zapret cannot cover.** `nfqws` desyncs TCP and UDP
+> flows through NFQUEUE and has no ICMP mode. Enabling it on an ICMP carrier installs rules that
+> match nothing while `systemctl` reports the unit **active** — a green light that means only
+> that the test missed. This was live on the reference deployment: the unit had been "active"
+> for over two hours having desynced **zero** packets, because its rules pointed at `tcp/udp
+> :9090` while the carrier was ping. The installer and both menus now refuse the combination and
+> say why. The equivalent for that carrier is the **native decoy-ping injector** (§17), reached
+> through the same `desync` config block.
 
 Tune it for your network with zapret's own `blockcheck.sh`. If traffic breaks, disable the
 module — the tunnel itself does not depend on it.
@@ -1113,11 +1144,149 @@ tcp+tls+rotate          20.1      —          —
 
 ---
 
-## 📋 17. Field-test log (measured under real load)
+---
+
+## 🛰️ 17. The ICMP carrier (`transport: icmp`)
+
+This carrier exists because of a measurement, not a theory. On the reference link — a European
+VPS to a Tehran VPS — the same path treats three protocols completely differently:
+
+| protocol | offered | delivered | loss | outages |
+|---|---|---|---|---|
+| TCP (any port) | — | 0.07–1.3 Mbit/s | — | 500+ retransmits / 15 s |
+| UDP (any port) | 0.5 Mbit/s | 0.30 Mbit/s | **40.8 %** | ~94 ms dead every ~345 ms |
+| UDP (any port) | 40 Mbit/s | 23.2 Mbit/s | **42.5 %** | ~94 ms dead every ~345 ms |
+| **ICMP echo** | 30 Mbit/s | **30.4 Mbit/s** | **0.4 %** | none |
+
+The UDP loss is flat across two orders of magnitude of offered rate, so it is **not congestion
+and not a policer** — shaping cannot help, because there is no threshold to stay under. It
+arrives as blackouts: the path swallows everything for ~94 ms, passes everything for ~250 ms,
+and repeats. Sampled across four flows on four different source/destination port pairs, those
+dead windows coincide with Jaccard 0.96–0.97 — the blackout is a property of the **path**, not
+of the flow. Port hopping, socket striping and 5-tuple rotation all move traffic from one
+blocked window into the same blocked window.
+
+ICMP echo crosses that path, at the same moment, at full rate. So the tunnel rides in ping
+payloads.
+
+### Two details that make it work rather than merely look like it should
+
+**Echo _requests_ (type 8) in both directions, never replies.** An unsolicited echo reply is
+dropped somewhere on this path — measured, 100 % of 37 500 — because a stateful middlebox has
+no request to match it to. A request is not a response to anything, so nothing has to remember
+it. Both ends send requests and neither expects an answer.
+
+**Which means the peer's kernel answers them.** Every data packet would draw an echo reply
+carrying a copy of the payload back the way it came: the reverse direction's bandwidth spent on
+nothing, and a volumetric signature no real ping has. The carrier installs one firewall rule to
+drop those replies before they leave, matched on the ICMP **identifier** (iptables `u32`, or
+`nft`), so only this tunnel's pings go unanswered and ordinary `ping` to the peer keeps working.
+The rule is removed on `SIGTERM`, so `systemctl stop aestun` restores plain ping.
+
+### Making a raw socket fast
+
+A raw socket is not a UDP socket: it sees every ICMP message the host receives, it has no
+GSO/GRO, and it costs one syscall per packet in each direction. A single unbatched reader at
+400 Mbit/s lost **22 829 packets to receive-buffer overflow while the path delivered 99.5 %** of
+them — every one of those drops was on the host, not the network. Three things close that gap:
+
+* **a classic BPF filter on the socket** (`kernel_filter`, on by default) so the kernel queues
+  only this tunnel's echo requests. This is not just saved wakeups: the receive buffer is a
+  fixed budget, and a ping flood aimed at the host would otherwise evict carrier data that had
+  already crossed the network;
+* **`sendmmsg` / `recvmmsg`** (`batch`, default 32) so a busy link pays one syscall per batch
+  instead of one per packet. `MSG_WAITFORONE` means a quiet link never waits for a batch to
+  fill, so batching adds no latency to a lone packet;
+* **several receive goroutines** (`readers`, default one per core capped at 8), because a reader
+  also has to decrypt and write to the TUN before it can come back around to the socket.
+
+Measured after those changes on the live link: **437 Mbit/s** one way, **366 Mbit/s** the other,
+**0 raw-socket drops** across ~700 000 packets in each direction, `auth_fail: 0`.
+
+`SO_RCVBUFFORCE` is tried before `SO_RCVBUF`, so `rcvbuf` is not silently clamped to
+`net.core.rmem_max` — on this carrier that buffer is precisely where the drops happen.
+
+### Settings (`"icmp"` block)
+
+Read the two groups differently. The first three are **local** to one host — they change how it
+talks to its own kernel and nothing on the wire, so the two ends may differ. The rest change
+what the packets look like; nothing is negotiated, so a mismatch means every packet fails to
+authenticate.
+
+| key | default | effect |
+|---|---|---|
+| `readers` | `0` | receive goroutines; 0 = one per core, capped at 8 |
+| `batch` | `32` | messages per `sendmmsg`/`recvmmsg`; 1 disables batching |
+| `kernel_filter` | `true` | attach the BPF filter to the raw socket |
+| `suppress_replies` | `true` | install the echo-reply drop rule |
+| `id` | `0` | pin an explicit identifier; 0 = derive it from the key |
+| `id_pool` | `1` | identifiers to rotate through (max 8) — **must match on both ends** |
+| `id_rotate_sec` | `60` | seconds per identifier — **must match on both ends** |
+| `mimic_ping` | `false` | prepend ping(8)'s 16-byte timeval — **must match on both ends** |
+
+**Identifier rotation** is port hopping's idea applied to the one field an ICMP flow has to key
+on. Both ends derive the same set from the pre-shared key and step through it on a keyed
+schedule, exactly as the epoch keys and the hop ports do. The receive side, the BPF filter and
+the firewall rules always cover the **whole** set, so a packet in flight across an epoch
+boundary is never dropped. A middlebox that learns to rate-limit "the ping with identifier
+0x62F9" has to learn all of them, and by then the schedule has moved.
+
+**Ping mimicry** prepends the `struct timeval` that iputils' `ping` writes at the start of its
+payload, so `tcpdump` and every ICMP dissector render the flow as ordinary pings with a
+plausible round-trip time rather than as echo requests full of opaque bytes. It costs 16 bytes
+per packet.
+
+### What does *not* apply, and why
+
+* **`obfs` must be `none`.** An echo request is not a datagram protocol with a handshake to
+  imitate. A QUIC or DTLS header inside a ping is not cover — no real ping carries one — so it
+  would be the single anomalous thing about an otherwise ordinary packet. The binary refuses
+  the combination rather than ignoring it.
+* **Port hopping does not apply**: there are no ports.
+* **zapret / `nfqws` cannot act on this carrier.** It desyncs TCP and UDP flows through
+  NFQUEUE; there is no ICMP mode. Arming it on an ICMP carrier installs rules that match
+  nothing while systemd reports the unit *active* — which is worse than not running it, so
+  the installer and the menus refuse and say so.
+* **The `desync` block still applies**, dispatched to an injector that fits this carrier
+  (below). Same config key, same meaning, different packet.
+* **The DPI self-test does not apply**: it sends UDP at the carrier's listen port, and this
+  carrier binds none. The observer itself is fully live.
+
+### Native decoy-ping desync — the ICMP equivalent of `--dpi-desync=fake`
+
+With `"desync": {"enabled": true}` on this carrier, the binary emits a burst of **ordinary
+64-byte pings** carrying the tunnel's own identifier, at a TTL tuned to expire a hop or two
+before the peer (from the hop count the DPI observer already learned from the peer's packets).
+
+The choice of decoy is the whole point. On a UDP carrier the decoy is a fake QUIC handshake,
+because that is what a plausible flow to that port would open with. Here the flow *is* ping, and
+the anomaly is not its protocol but its **shape**: a real ping is 64 bytes once a second, and
+this one is full-MTU packets tens of thousands of times a second. So the decoy is what a real
+ping looks like — the same 56-byte payload, the same `0x10 0x11 0x12 …` fill pattern. A
+classifier watching from the first packet sees an ordinary ping session that later grows,
+rather than one born at hundreds of megabits. The fakes never arrive, so they cost the peer
+nothing and cannot be confused with data.
+
+### Honest limits
+
+* **IPv4 only.** The raw path is v4; a v6 peer is refused with a clear message.
+* **Needs `CAP_NET_RAW`** (the unit grants it) and **ICMP echo allowed inbound** in the cloud
+  firewall on both ends. A provider security group that only opens TCP/UDP silently drops this
+  carrier.
+* **The volumetric exposure is real and is not solved by any disguise.** Hundreds of megabits
+  of echo traffic between two hosts is not what ping looks like, and an operator that decides
+  to rate-limit ICMP will hit it regardless of identifier or payload. Identifier rotation and
+  mimicry raise the cost of *identifying the flow*; they do nothing about its *volume*. If you
+  want to bound that exposure, `rate_mbps` is the knob that actually does it — it is the one
+  setting on this carrier that trades throughput for looking less like an anomaly.
+
+---
+
+## 📋 18. Field-test log (measured under real load)
 
 ### 📊 17.0 Full matrix — every transport × every disguise × every module
 
-Measured on the reference link (🇮🇷 Iran ↔ 🌍 Germany, ~79 ms, both ends
+Measured on the reference link (🇮🇷 Pishgaman AS34918 ↔ 🌍 Leaseweb Germany, ~79 ms, both ends
 `chacha20-poly1305`), each variant reconfigured on both servers and restarted, then measured
 with `iperf3` (4 streams, each direction) and 60 pings across the tunnel. Buffers at 2 MiB.
 
@@ -1152,35 +1321,6 @@ not costing you speed, so there is no throughput argument for running without on
 
 The hardening set costs about 2 % of throughput, so leaving it on is cheap. **`hop` is the one
 expensive module** — turn it on only against an actual 5-tuple block.
-
-**TCP carrier, verified separately.** Every TCP variant was re-run against the shipped
-build, with the crypto layer's `auth_fail` counter checked after each — it stayed at 0
-throughout, so nothing was quietly failing to authenticate:
-
-| Variant | ⬇ down | ⬆ up | RTT | loss | crypto |
-|---|---|---|---|---|---|
-| `tcp` + `none` | 230 Mbit/s | 211 | 83.2 ms | 0 % | `auth_fail=0` |
-| `tcp` + `quic` (TLS) | 202 Mbit/s | 259 | 78.7 ms | 0 % | `auth_fail=0` |
-| `tcp` + `quic2` (TLS) | 195 Mbit/s | 221 | 76.1 ms | 0 % | `auth_fail=0` |
-| `tcp` + `quic` + `tcp_rotate` | 181 Mbit/s | 194 | 79.4 ms | 0 % | `auth_fail=0` |
-
-The **TLS disguise was confirmed on the wire**, not just assumed. Capturing a fresh carrier
-connection from its SYN shows the dialing side opening with a real, parseable ClientHello:
-
-```
-16 03 01 00 9f                     ContentType 22 = handshake, record length 159
-01 00 00 9b  03 03                 ClientHello, legacy_version TLS 1.2
-13 01 13 02 13 03                  the three real TLS 1.3 cipher suites
-00 00 ... www.cloudflare.com       server_name extension, carrying the configured SNI
-```
-
-…after which every sealed datagram travels as a `17 03 03` application-data record. To a
-record-level DPI the flow is an ordinary HTTPS connection being established and then used.
-
-**`tcp_rotate` was verified to actually rotate**: with `interval_sec: 15`, five new
-connections opened in 80 seconds, each from a fresh source port, 12–16 s apart. Expect a
-single dropped packet around each rotation — the ping loss that appears during a rotation
-window is the in-flight datagrams on the connection being retired.
 
 **Handshake cover delivery**, 200 packets of each sent at the peer and counted on arrival:
 

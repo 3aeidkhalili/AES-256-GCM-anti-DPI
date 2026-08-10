@@ -5,16 +5,16 @@
   "listen": "0.0.0.0:51820",
   "peer": "PUBLIC_IP_OF_SERVER_B:51820",
   "transport": "udp",
-  "obfs": "quic",
+  "obfs": "quic2",
   "sni": "www.cloudflare.com",
   "shape": true,
   "tun_name": "tun0",
   "local_ip": "10.8.0.1/24",
   "peer_ip": "10.8.0.2",
-  "mtu": 1420,
+  "mtu": 1300,
   "txqueuelen": 1000,
-  "rcvbuf": 16777216,
-  "sndbuf": 16777216,
+  "rcvbuf": 2097152,
+  "sndbuf": 2097152,
   "offload": true,
   "rate_mbps": 0,
   "pad_max": 64,
@@ -31,5 +31,17 @@
   "desync": { "enabled": false, "repeats": 4, "autottl": true, "delta": -1, "badsum": false },
   "junk":   { "enabled": false, "count": 8, "min_ms": 5, "max_ms": 50 },
   "hop":    { "enabled": false, "ports": [443, 8443, 2053, 2083, 2087, 2096], "interval": 30 },
-  "split":  { "enabled": false, "frag_pos": 24 }
+  "split":  { "enabled": false, "frag_pos": 24 },
+  "tcp_rotate": { "enabled": false, "interval_sec": 15 },
+
+  "icmp": {
+    "readers": 0,
+    "batch": 32,
+    "kernel_filter": true,
+    "suppress_replies": true,
+    "id": 0,
+    "id_pool": 1,
+    "id_rotate_sec": 60,
+    "mimic_ping": false
+  }
 }

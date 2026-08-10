@@ -291,15 +291,6 @@ func (o *obfuscator) unprotectInto(pkt []byte, nonce *[12]byte, sc *hpScratch) b
 	return true
 }
 
-// isCover reports whether a datagram is synthetic handshake cover rather than tunnel
-// traffic. One byte in either format: the QUIC header form bit, or the DTLS content type.
-func (o *obfuscator) isCover(pkt []byte) bool {
-	if o.wire == wireDTLS {
-		return dtlsIsCover(pkt)
-	}
-	return quicIsLongHeader(pkt)
-}
-
 // padTo reports how many bytes of padding bring a datagram of size n up to the next bucket.
 // Returns 0 once n is past the largest bucket, which is where the bulk of the bytes live.
 func obfsPadTo(n int) int {

@@ -45,10 +45,10 @@ var quicInitialSaltV2 = []byte{
 // --- QUIC versions the handshake cover can imitate -------------------------
 //
 // Which version the cover claims is not cosmetic. Some networks blacklist the *deployed*
-// QUIC versions outright: measurement on Iranian carriers showed every long-header packet
-// carrying v1 or the ff0000xx draft series silently dropped, while v2 passed untouched —
-// and worse, one dropped v1 Initial blackholed the whole 5-tuple, so the short-header
-// traffic that followed died with it and the tunnel never came up.
+// QUIC versions outright: measurement on an Iranian carrier (AS25184) showed every
+// long-header packet carrying v1 or the ff0000xx draft series silently dropped, while v2
+// passed untouched — and worse, one dropped v1 Initial blackholed the whole 5-tuple, so
+// the short-header traffic that followed died with it and the tunnel never came up.
 //
 // So the version is a parameter, not a constant. `obfs: quic` keeps emitting v1, which is
 // what the overwhelming majority of real QUIC on the internet is; `obfs: quic2` emits v2,

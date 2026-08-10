@@ -226,6 +226,11 @@ type dpiLogger struct {
 	rttN    atomic.Uint64
 
 	blackholed atomic.Bool
+
+	// Inode of the ICMP carrier's raw socket, published by the carrier once it is open so
+	// icmpWatch can find that socket's line in /proc/net/raw. Atomic because the observer's
+	// goroutines are already running by the time the carrier exists. 0 = not applicable.
+	rawInode atomic.Uint64
 }
 
 func newDPILogger(cfg *DPILogConfig) *dpiLogger {
@@ -455,7 +460,14 @@ func (d *dpiLogger) run(t *Tunnel) {
 	go d.writer()
 	go d.flushLoop()
 	go d.pathWatch(t)
-	go d.kernelWatch()
+	// Which kernel counters are worth reading depends on what the carrier is. Watching
+	// the UDP block while the tunnel runs on ICMP reports on whatever else the host
+	// happens to be doing and says nothing at all about this flow.
+	if t != nil && t.transport == "icmp" {
+		go d.icmpWatch()
+	} else {
+		go d.kernelWatch()
+	}
 }
 
 func (d *dpiLogger) flushLoop() {
@@ -786,15 +798,104 @@ func (d *dpiLogger) kernelWatch() {
 	}
 }
 
+// icmpWatch is the ICMP carrier's equivalent of kernelWatch.
+//
+// Two sources, because neither alone tells the whole story. /proc/net/snmp's Icmp: block
+// counts what the host's ICMP layer rejected — bad checksums, unreachables and time-exceeded
+// coming back — which is where forged or truncated carrier packets die. And /proc/net/raw
+// carries a per-socket drop counter, which is the *only* place a raw socket's receive-buffer
+// overflow is visible: those packets crossed the network fine and were then thrown away on
+// this host for want of a reader. On the link this was written for that number was 22829 in
+// a single 400 Mbit/s run, and nothing in the program could see it.
+func (d *dpiLogger) icmpWatch() {
+	prev := readSNMPBlock("Icmp:")
+	prevDrops, haveDrops := d.rawSocketDrops()
+	for {
+		time.Sleep(30 * time.Second)
+
+		det := map[string]any{}
+		sev := sevInfo
+
+		cur := readSNMPBlock("Icmp:")
+		if cur != nil && prev != nil {
+			for _, k := range []string{"InErrors", "InCsumErrors", "InDestUnreachs", "InTimeExcds", "OutErrors"} {
+				if delta := cur[k] - prev[k]; delta > 0 && cur[k] >= prev[k] {
+					det[k] = delta
+					if k == "InErrors" || k == "InCsumErrors" {
+						sev = sevWarn
+					}
+				}
+			}
+		}
+		if cur != nil {
+			prev = cur
+		}
+
+		if drops, ok := d.rawSocketDrops(); ok {
+			if haveDrops && drops > prevDrops {
+				det["RawRcvbufDrops"] = drops - prevDrops
+				if sev == sevInfo {
+					sev = sevNotice
+				}
+			}
+			prevDrops, haveDrops = drops, true
+		}
+
+		if len(det) == 0 {
+			continue
+		}
+		msg := "kernel ICMP counters moved"
+		if _, ok := det["RawRcvbufDrops"]; ok {
+			msg = "the kernel dropped ICMP carrier packets at the raw socket — they arrived and were " +
+				"discarded here for want of a reader (raise rcvbuf/net.core.rmem_max, or icmp.readers)"
+		} else if _, ok := det["InCsumErrors"]; ok {
+			msg = "the kernel discarded ICMP messages with bad checksums — forged or corrupted packets are reaching this host"
+		}
+		d.emit(dpiEvent{Event: evKernelDrop, Severity: sev, Detail: det, Message: msg})
+	}
+}
+
+// rawSocketDrops reads the drop counter of the carrier's own raw socket out of
+// /proc/net/raw, matched by the socket inode the ICMP carrier published. Returns ok=false
+// until that inode is known, or if the line cannot be found.
+func (d *dpiLogger) rawSocketDrops() (uint64, bool) {
+	ino := d.rawInode.Load()
+	if ino == 0 {
+		return 0, false
+	}
+	want := strconv.FormatUint(ino, 10)
+	b, err := os.ReadFile("/proc/net/raw")
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(b), "\n")[1:] {
+		f := strings.Fields(line)
+		// sl local rem st tx_queue:rx_queue tr tm->when retrnsmt uid timeout inode ... drops
+		if len(f) < 13 || f[9] != want {
+			continue
+		}
+		v, err := strconv.ParseUint(f[len(f)-1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return v, true
+	}
+	return 0, false
+}
+
 // readUDPCounters parses the Udp: line pair out of /proc/net/snmp.
-func readUDPCounters() map[string]uint64 {
+func readUDPCounters() map[string]uint64 { return readSNMPBlock("Udp:") }
+
+// readSNMPBlock parses one header/value line pair out of /proc/net/snmp, which stores each
+// protocol as a line of column names followed by a line of numbers under the same prefix.
+func readSNMPBlock(prefix string) map[string]uint64 {
 	b, err := os.ReadFile("/proc/net/snmp")
 	if err != nil {
 		return nil
 	}
 	lines := strings.Split(string(b), "\n")
 	for i := 0; i+1 < len(lines); i++ {
-		if !strings.HasPrefix(lines[i], "Udp:") || !strings.HasPrefix(lines[i+1], "Udp:") {
+		if !strings.HasPrefix(lines[i], prefix) || !strings.HasPrefix(lines[i+1], prefix) {
 			continue
 		}
 		keys := strings.Fields(lines[i])[1:]
