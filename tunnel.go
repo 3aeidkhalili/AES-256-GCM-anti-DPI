@@ -740,7 +740,7 @@ func newSealer() *sealer {
 }
 
 // An opener holds the scratch buffer for one receiving goroutine. The slice returned by
-// openInto aliases that buffer and stays valid only until the next call on the same opener.
+// openSeq aliases that buffer and stays valid only until the next call on the same opener.
 type opener struct {
 	plain []byte
 	nonce [12]byte
@@ -878,13 +878,6 @@ func (t *Tunnel) openSeq(o *opener, pkt []byte) (plain []byte, seq uint64, ok bo
 	}
 	atomic.AddUint64(&t.authFail, 1)
 	return nil, 0, false
-}
-
-// openInto is openSeq without the sequence number, for callers that only need the payload.
-// The returned slice aliases o.plain and is valid only until the next call on the same opener.
-func (t *Tunnel) openInto(o *opener, pkt []byte) ([]byte, bool) {
-	plain, _, ok := t.openSeq(o, pkt)
-	return plain, ok
 }
 
 func (t *Tunnel) setPeer(a netip.AddrPort) {

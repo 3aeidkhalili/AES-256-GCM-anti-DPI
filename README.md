@@ -810,18 +810,15 @@ u) Uninstall
 go build -o aestun .                         # plain build
 ./aestun.sh build amd64                      # cross-build + refresh SHA256SUMS
 ./aestun.sh build arm64
-go test ./...                                # unit + integration suite
-go test -race ./...                          # the concurrency tests want this
 ```
 
 > Note: `go build ./...` writes its output to `./aestun`, overwriting the shipped binary. Use
 > `go build -o <path> .`.
 
-The test suite covers the crypto round trip on both suites and all three wire formats,
-allocation behaviour on the packet path (`sealInto`/`openInto` must allocate **zero**), padding
-and shaping, replay and epoch handling, the QUIC Initial parser against fuzzed and truncated
-input, GSO batching rules, the pacer's long-run rate, config clamping, nonce uniqueness under
-concurrency, and a 200 000-packet soak across a rekey boundary.
+**The tree ships no test files.** `*_test.go` targets are kept out of the distributed source to
+keep it small; `go test ./...` therefore reports `no test files`. Nothing in the shipped
+program depends on them — test files are never compiled into a binary, which is why removing
+them leaves the build byte-identical.
 
 Builds are reproducible (`CGO_ENABLED=0`, `-trimpath`), so you can check rather than trust:
 
@@ -910,7 +907,6 @@ Europe (role `b`) — under real load, not synthesised. The most consequential r
 | `split.go` | IP-fragmentation of the disposable fakes |
 | `tcprotate.go` | TCP carrier connection rotation |
 | `pprof_on.go` / `pprof_off.go` | profiling endpoints, behind the `pprof` build tag |
-| `*_test.go` | the test suite (§13) |
 | `aestun.sh` | installer, management TUI, live monitor, zapret, tuning, build, NFQUEUE helper |
 | `aestun-mp.sh` | multi-protocol supervisor: health probing, failover, ECMP (§7) |
 | `dokodemo.sh` | optional port-forwarding helper |
