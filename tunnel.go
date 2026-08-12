@@ -308,10 +308,20 @@ func (c *Config) applyDefaults() {
 	if c.Listen == "" {
 		c.Listen = "0.0.0.0:51820"
 	}
-	if c.MTU == 0 {
+	// A negative MTU is not merely rejected by `ip link set`: it also sizes the ICMP
+	// carrier's receive slots, so it has to be a real number before anything downstream
+	// reads it. 576 is the IPv4 minimum reassembly buffer, below which the inner traffic
+	// stops being useful anyway.
+	if c.MTU <= 0 {
 		c.MTU = 1300
+	} else if c.MTU < 576 {
+		c.MTU = 576
+	} else if c.MTU > maxPktSize-256 {
+		c.MTU = maxPktSize - 256
 	}
-	if c.TxQueueLen == 0 {
+	if c.TxQueueLen < 0 {
+		c.TxQueueLen = 0 // negative means "leave the kernel default alone"
+	} else if c.TxQueueLen == 0 {
 		c.TxQueueLen = 1000
 	}
 	if c.RcvBuf == 0 {
@@ -870,6 +880,13 @@ func (t *Tunnel) openSeq(o *opener, pkt []byte) (plain []byte, seq uint64, ok bo
 	return nil, 0, false
 }
 
+// openInto is openSeq without the sequence number, for callers that only need the payload.
+// The returned slice aliases o.plain and is valid only until the next call on the same opener.
+func (t *Tunnel) openInto(o *opener, pkt []byte) ([]byte, bool) {
+	plain, _, ok := t.openSeq(o, pkt)
+	return plain, ok
+}
+
 func (t *Tunnel) setPeer(a netip.AddrPort) {
 	t.peer.Store(&a)
 }
@@ -927,7 +944,8 @@ func (t *Tunnel) writeStats(path string) {
 	if path == "" {
 		return
 	}
-	os.MkdirAll(filepath.Dir(path), 0o755)
+	dir := filepath.Dir(path)
+	os.MkdirAll(dir, 0o755)
 	tmp := path + ".tmp"
 	for {
 		time.Sleep(2 * time.Second)
@@ -957,9 +975,18 @@ func (t *Tunnel) writeStats(path string) {
 		if err != nil {
 			continue
 		}
-		if os.WriteFile(tmp, b, 0o644) == nil {
-			os.Rename(tmp, path)
+		// Recreate the directory if the write fails. It is a RuntimeDirectory, so systemd
+		// removes it whenever a unit that declares it stops — and under the multi-protocol
+		// setup several units share one. MkdirAll only at start-up meant that a single such
+		// stop silently ended stats for every carrier for the life of the process: the
+		// dashboard went blank and stayed blank while the tunnel itself was fine.
+		if os.WriteFile(tmp, b, 0o644) != nil {
+			os.MkdirAll(dir, 0o755)
+			if os.WriteFile(tmp, b, 0o644) != nil {
+				continue
+			}
 		}
+		os.Rename(tmp, path)
 	}
 }
 

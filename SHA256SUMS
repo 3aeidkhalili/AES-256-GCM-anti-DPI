@@ -1,27 +1,22 @@
 # Prebuilt aestun binaries — built from the sources in this directory.
 #
-#   aestun              the core build for this host (run it directly)
-#   aestun-linux-amd64  the same program, cross-built for amd64
-#   aestun-linux-arm64  the same program, cross-built for arm64
-#
 # Go:      go1.26.5
-# Built:   2026-08-10T13:08:28Z
+# Built:   2026-08-12T11:42:32Z
 # Flags:   CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"
 #
-# The build is reproducible: -trimpath and CGO_ENABLED=0 mean the same Go version over
-# the same sources produces byte-identical output, so you can verify these rather than
-# trust them:
+# The build is reproducible: -trimpath and CGO_ENABLED=0 mean the same Go version
+# over the same sources produces byte-identical output, so you can verify these
+# rather than trust them:
 #
 #   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /tmp/v .
 #   sha256sum /tmp/v aestun-linux-amd64      # the two hashes must match
 #
-# aestun.sh compiles from source whenever a Go toolchain is available or can be fetched;
-# these are the fallback for a box that has neither. ./aestun.sh build <arch> rebuilds a
-# binary and regenerates this file, so it can never certify one that no longer exists.
+# aestun.sh compiles from source whenever a Go toolchain is available or can be
+# fetched; these are the fallback for a box that has neither.
 
-da945cf7761ccb30328f7df60affe5b82fedd9dc544e200d19feed4059e83a0f  aestun
-da945cf7761ccb30328f7df60affe5b82fedd9dc544e200d19feed4059e83a0f  aestun-linux-amd64
-194cb3b11291bc447e05cb3f2fb5299ba6beaa87ac9a22c6c57e866cb08c277b  aestun-linux-arm64
+6c809f471114bd26a1ad2ff6deb510b27c82aef7f1ed831be01541a19a5302a8  aestun
+6c809f471114bd26a1ad2ff6deb510b27c82aef7f1ed831be01541a19a5302a8  aestun-linux-amd64
+d94d4c4f4301ffdbd4f0af757084f6070ba0de53709161f31220e6f222930a22  aestun-linux-arm64
 
 # source fingerprint at build time:
-# sources: 0baed493cc3cef28fde57266a7d86d22d127d21c8c59487f1154a181156dd7f9  -
+# sources: 2dc03e8036cd9abe49551a71fbea01c0125609099cd9f1f7369b20a3f6dd7383  -

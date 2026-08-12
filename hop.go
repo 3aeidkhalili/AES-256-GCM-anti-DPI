@@ -80,6 +80,9 @@ type hopCarrier struct {
 	rx       chan hopMsg
 	closed   atomic.Bool
 
+	// Shapes bulk traffic only; owned by the TUN pump, which is single-threaded.
+	pacer *pacer
+
 	// Cache the current epoch's port slot so the send path does not run HKDF per packet.
 	// hopIndex is HMAC-SHA256 extract+expand; at a few thousand packets a second that would
 	// dominate the mode's CPU for a value that changes only once per interval. The epoch is
@@ -123,6 +126,10 @@ func newHopCarrier(cfg *Config, t *Tunnel, rcvbuf, sndbuf int, wantTTL bool) (*h
 	}
 	for _, c := range h.conns {
 		go h.recvLoop(c)
+	}
+	if cfg.RateMbps > 0 {
+		h.pacer = newPacer(cfg.RateMbps)
+		log.Printf("carrier shaped to %.0f Mbit/s", cfg.RateMbps)
 	}
 	log.Printf("port hopping active: ports=%v interval=%ds (offload disabled in this mode)", h.ports, h.interval)
 	return h, nil

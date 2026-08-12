@@ -267,6 +267,10 @@ type tcpCarrier struct {
 	// 2-byte length prefix, and makes Recv skip the synthetic handshake records (tls.go).
 	tlsShape bool
 
+	// Shapes bulk traffic only, and is owned by the TUN pump — keepalives and probes go out
+	// through Send untouched. nil when rate_mbps is 0.
+	pacer *pacer
+
 	hdr  [2]byte // length prefix, plain framing
 	rhdr [5]byte // record header, TLS framing
 	buf  []byte
@@ -663,7 +667,9 @@ func main() {
 // settings mostly cost wakeups: a higher GC target keeps it from running on the little
 // garbage that remains, and an explicit memory limit is what actually bounds RSS.
 func tuneRuntime(cfg *Config) {
-	if p := derefOr(cfg.GCPercent, 400); p > 0 {
+	// applyDefaults has already resolved this; the fallback only covers a caller that skipped
+	// it, and matches the documented default rather than an older, larger one.
+	if p := derefOr(cfg.GCPercent, 100); p > 0 {
 		debug.SetGCPercent(p)
 	}
 	if cfg.MemLimit > 0 {
@@ -991,6 +997,16 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 	if t.tlsShape {
 		log.Printf("tcp carrier shaped as TLS (records + synthetic handshake, sni=%s)", cfg.SNI)
 	}
+	if cfg.RateMbps > 0 {
+		c.pacer = newPacer(cfg.RateMbps)
+		log.Printf("carrier shaped to %.0f Mbit/s", cfg.RateMbps)
+	}
+	// Role a dials cfg.Peer forever; an empty one is a config error that would otherwise
+	// present as a dial failure every three seconds and a tunnel that never comes up.
+	if cfg.Role == "a" && cfg.Peer == "" {
+		log.Fatalf("transport \"tcp\" with role \"a\" dials the peer, so \"peer\" must be set to the " +
+			"other server's host:port (role \"b\" is the side that listens)")
+	}
 
 	// Role a dials out, role b accepts. Whoever is behind the more restrictive network
 	// should be the dialer; role a (the inside server) is that side by construction. The dial
@@ -1093,9 +1109,16 @@ func pumpTUNToCarrier(c carrier, t *Tunnel, tun *os.File) {
 }
 
 // pumpUnbatched is the plain one-packet-per-send path.
+//
+// It paces here rather than inside the carrier because this is the only place that knows the
+// traffic is bulk: keepalives and probes call Send directly and must not be delayed. The
+// carriers that reach this path (TCP, port-hopping UDP, and the ICMP fallback when batching
+// is off) have nowhere else to apply rate_mbps, so without this the option parsed cleanly,
+// logged nothing, and did nothing at all on three of the four carriers.
 func pumpUnbatched(c carrier, t *Tunnel, tun *os.File) {
 	buf := make([]byte, maxPktSize)
 	s := newSealer()
+	pace := carrierPacer(c)
 	errs := 0
 	for {
 		n, err := tun.Read(buf)
@@ -1112,10 +1135,27 @@ func pumpUnbatched(c carrier, t *Tunnel, tun *os.File) {
 		if n == 0 {
 			continue
 		}
-		if err := c.Send(t.sealInto(s, buf[:n])); err != nil {
+		pkt := t.sealInto(s, buf[:n])
+		pace.wait(len(pkt))
+		if err := c.Send(pkt); err != nil {
 			log.Printf("carrier send failed: %v", err)
 		}
 	}
+}
+
+// carrierPacer returns the bulk-traffic shaper for a carrier, or nil when the carrier has
+// none (pacer.wait is nil-safe). The ICMP carrier does its own locking around a shared pacer
+// because several goroutines send on it, so it is deliberately not handed out here.
+func carrierPacer(c carrier) *pacer {
+	switch bc := c.(type) {
+	case *udpCarrier:
+		return bc.pacer
+	case *hopCarrier:
+		return bc.pacer
+	case *tcpCarrier:
+		return bc.pacer
+	}
+	return nil
 }
 
 // pumpUDP is the segmentation-offload path.

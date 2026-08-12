@@ -302,6 +302,11 @@ LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 RuntimeDirectory=aestun
+# The multi-protocol carriers (aestun-path@) write their stats into this same directory.
+# Without Preserve, systemd deletes /run/aestun whenever THIS unit stops — so a stray
+# single-path service that is merely crash-looping (it cannot bind a device the carriers
+# already hold) silently wipes every carrier's stats file and blinds the dashboard.
+RuntimeDirectoryPreserve=yes
 # Gives the DPI observer a place to write that survives ProtectSystem=full, created with
 # the right ownership before the daemon starts.
 LogsDirectory=aestun
@@ -796,6 +801,226 @@ EOF
   done
 }
 
+# =============================================================================
+#  Monitoring plumbing — carrier discovery and fork-free stats reading
+# =============================================================================
+#  Everything below had one assumption baked into it: that the tunnel is a single
+#  process writing /run/aestun/stats.json and logging to aestun.service. Under the
+#  multi-protocol setup (§19) neither is true — four carriers each write their own
+#  stats-<name>.json and log to aestun-path@<name>.service, and aestun.service is
+#  deliberately stopped. So the dashboard read a file that does not exist and showed
+#  zeroes, and "live logs" followed a unit that had been dead since the switch. The
+#  monitoring section was blind on exactly the deployment it most needed to watch.
+#
+#  These helpers discover what is actually running instead of assuming.
+
+# js_load — read a whole stats file into the associative array J, in one pass.
+#
+# The obvious shape for this is a js_get FILE KEY helper, and it is the wrong one: even
+# with a fork-free body, every `$(js_get ...)` at the call site is a command substitution,
+# which is a fork. Twenty keys across four carriers is eighty forks per refresh, twice a
+# second — measured at 311 ms per refresh, which is the same mistake that made the
+# multipath supervisor cost 70x the tunnel. Loading once into J and indexing it costs
+# nothing, because a function call and an array subscript are both builtins.
+declare -A J
+js_load() { # js_load FILE  -> fills J with every scalar field
+  J=()
+  local line
+  [[ -r "$1" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ \"([A-Za-z_][A-Za-z0-9_]*)\"[[:space:]]*:[[:space:]]*(\"([^\"]*)\"|-?[0-9]+(\.[0-9]+)?|true|false) ]]; then
+      if [[ "${BASH_REMATCH[2]}" == \"* ]]; then
+        J["${BASH_REMATCH[1]}"]="${BASH_REMATCH[3]}"
+      else
+        J["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+      fi
+    fi
+  done < "$1"
+  return 0
+}
+
+# jnorm — force the counter fields to integers straight after a load, so the arithmetic
+# below can index J directly. Reading them through a helper would mean $(helper), and a
+# command substitution is a fork however cheap the helper's body is — which is the whole
+# thing this is avoiding. A missing or damaged field becomes 0 rather than a shell error.
+JINTS=(tx_bytes rx_bytes tx_packets rx_packets auth_fail replay_drop
+       uptime_seconds last_rx_unix now_unix rekey_interval
+       dpi_probes dpi_scans dpi_injections dpi_replays dpi_ttl_anomalies)
+jnorm() {
+  local k
+  for k in "${JINTS[@]}"; do
+    [[ "${J[$k]-}" =~ ^[0-9]+$ ]] || J[$k]=0
+  done
+}
+
+# f100 — fixed-point for the two fields that are floats (loss_pct, rtt_ms), so "worst of"
+# can be compared without forking to awk. Sets _F; "-", empty and junk become -1.
+_F=0
+f100() {
+  local x="${1-}" i f
+  if [[ -z "$x" || "$x" == "-" ]]; then _F=-1; return; fi
+  i="${x%%.*}"; [[ "$i" =~ ^[0-9]+$ ]] || { _F=-1; return; }
+  if [[ "$x" == *.* ]]; then f="${x#*.}00"; f="${f:0:2}"; else f="00"; fi
+  [[ "$f" =~ ^[0-9]+$ ]] || f="00"
+  _F=$(( 10#$i * 100 + 10#$f ))
+}
+
+# stats_files — every carrier stats file this host is writing, newest layout first.
+# Prints "name:path" per line; name is "single" for the one-process deployment.
+stats_files() {
+  local f n found=0
+  for f in /run/aestun/stats-*.json; do
+    [[ -r "$f" ]] || continue
+    n="${f##*/stats-}"; n="${n%.json}"
+    printf '%s:%s\n' "$n" "$f"; found=1
+  done
+  (( found )) && return 0
+  [[ -r "$STATS" ]] && printf 'single:%s\n' "$STATS"
+}
+
+# aestun_units — the systemd units that are the tunnel on this host right now.
+# The data sink is a test harness, not the tunnel, so it is left out.
+aestun_units() {
+  local u out=0
+  while read -r u; do
+    [[ -z "$u" || "$u" == aestun-mp-sink.service ]] && continue
+    printf '%s\n' "$u"; out=1
+  done < <(systemctl list-units 'aestun*.service' --state=active --no-legend --plain 2>/dev/null | awk '{print $1}')
+  (( out )) || printf 'aestun.service\n'
+}
+
+# read_stats — aggregate every carrier's counters into S_* globals in one pass.
+# Sums what adds up (bytes, packets, failures), takes the worst of what does not
+# (loss), the longest uptime, and the freshest receive.
+read_stats() {
+  S_TXB=0; S_RXB=0; S_TXP=0; S_RXP=0; S_AF=0; S_RD=0; S_UP=0; S_LASTRX=0; S_NOW=0
+  S_PROBES=0; S_SCANS=0; S_INJ=0; S_REPL=0; S_TTLA=0; S_BH=""; S_DPI=""
+  S_PEER=""; S_CIPHER=""; S_REKEY=0; S_LOSS="-"; S_RTT="-"
+  S_CARRIERS=(); S_NAMES=()
+  local entry name f v worst
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    name="${entry%%:*}"; f="${entry#*:}"
+    js_load "$f" || continue
+    jnorm
+    S_NAMES+=("$name")
+    S_TXB=$((     S_TXB    + J[tx_bytes] ));         S_RXB=$((   S_RXB   + J[rx_bytes] ))
+    S_TXP=$((     S_TXP    + J[tx_packets] ));       S_RXP=$((   S_RXP   + J[rx_packets] ))
+    S_AF=$((      S_AF     + J[auth_fail] ));        S_RD=$((    S_RD    + J[replay_drop] ))
+    S_PROBES=$((  S_PROBES + J[dpi_probes] ));       S_SCANS=$(( S_SCANS + J[dpi_scans] ))
+    S_INJ=$((     S_INJ    + J[dpi_injections] ));   S_REPL=$((  S_REPL  + J[dpi_replays] ))
+    S_TTLA=$((    S_TTLA   + J[dpi_ttl_anomalies] ))
+    v=${J[uptime_seconds]}; (( v > S_UP ))     && S_UP=$v
+    v=${J[last_rx_unix]};   (( v > S_LASTRX )) && S_LASTRX=$v
+    v=${J[now_unix]};       (( v > S_NOW ))    && S_NOW=$v
+    v=${J[rekey_interval]}; (( v > S_REKEY ))  && S_REKEY=$v
+    [[ -z "$S_PEER"   ]] && S_PEER="${J[peer]-}"
+    [[ -z "$S_CIPHER" ]] && S_CIPHER="${J[cipher]-}"
+    [[ "${J[dpi_enabled]-}"        == true ]] && S_DPI=true
+    [[ "${J[dpi_blackholed_now]-}" == true ]] && S_BH=true
+    S_CARRIERS+=("$name|${J[rx_bytes]:-0}|${J[tx_bytes]:-0}|${J[auth_fail]:-0}|${J[loss_pct]:--}|${J[rtt_ms]:--}")
+    # Worst loss and worst RTT across carriers is what an operator needs to see.
+    f100 "$S_LOSS"; worst=$_F; f100 "${J[loss_pct]-}"; (( _F > worst )) && S_LOSS="${J[loss_pct]}"
+    f100 "$S_RTT";  worst=$_F; f100 "${J[rtt_ms]-}";   (( _F > worst )) && S_RTT="${J[rtt_ms]}"
+  done < <(stats_files)
+  (( ${#S_NAMES[@]} > 0 ))
+}
+
+# =============================================================================
+#  Live log — follow the tunnel processes themselves
+# =============================================================================
+#  "Live from the tunnel process" is the point: this is the journal of whichever
+#  aestun units are actually running, merged, so it works the same on a single-path
+#  and a multi-protocol install. The DPI observer already writes its non-routine
+#  findings to stdout, so those arrive on this stream too and no second source is
+#  needed.
+#
+#  Ctrl+C returns to the menu instead of killing the manager: `trap ':' INT` makes
+#  the interrupt tear down the foreground pipeline and leave this shell running.
+LIVE_DIR="/var/log/aestun"
+
+# colourise_log — highlight the lines that mean something. Line-buffered via fflush,
+# or the follow would arrive in 4 KiB lumps and stop being live.
+colourise_log() {
+  awk -v R="$R" -v Y="$Y" -v G="$G" -v C="$C" -v D="$D" -v N="$N" '
+    { l=$0
+      if (l ~ /\[dpi\] high|blackhole|inject|replay|FATAL|fatal|panic/)        printf "%s%s%s\n", R, l, N
+      else if (l ~ /\[dpi\] warn|warning|throttle|loss_burst|rtt_spike|error/) printf "%s%s%s\n", Y, l, N
+      else if (l ~ /recovered|tunnel up|carrier up|traffic ready|Started/)     printf "%s%s%s\n", G, l, N
+      else if (l ~ /\[dpi\]/)                                                  printf "%s%s%s\n", C, l, N
+      else                                                                     print l
+      fflush() }'
+}
+
+live_log() {
+  local -a units sel=()
+  mapfile -t units < <(aestun_units)
+  local u; for u in "${units[@]}"; do sel+=(-u "$u"); done
+  clear; hdr "Live tunnel log — following the tunnel processes"
+  printf '%s\n' "${D}  units: ${units[*]}${N}"
+  printf '%s\n' "${D}  red = high severity / blackhole / injection   yellow = warn / throttle / loss${N}"
+  printf '%s\n\n' "${D}  Ctrl+C returns to the menu.${N}"
+  trap ':' INT
+  journalctl "${sel[@]}" -f -n 40 --no-hostname -o short-iso 2>/dev/null | colourise_log
+  trap - INT
+  printf '\n'; msg "stopped following."
+  pause
+}
+
+# record_log — the same live stream, captured to a file.
+#
+# Separate from the viewer on purpose: watching and keeping are different jobs. This
+# one is what you run before reproducing a problem, so there is something to read
+# afterwards and something to send to somebody else.
+record_log() {
+  mkdir -p "$LIVE_DIR"
+  local -a units sel=()
+  mapfile -t units < <(aestun_units)
+  local u; for u in "${units[@]}"; do sel+=(-u "$u"); done
+
+  local dur; dur="$(ask_int 'Record for how many seconds (0 = until Ctrl+C)' '0')"
+  local out="${LIVE_DIR}/live-$(date +%Y%m%d-%H%M%S).log"
+  clear; hdr "Recording the live tunnel log"
+  printf '%s\n'   "${D}  units : ${units[*]}${N}"
+  printf '%s\n'   "  file  : ${W}${out}${N}"
+  [[ "$dur" == 0 ]] && printf '%s\n\n' "${D}  Ctrl+C to stop.${N}" \
+                    || printf '%s\n\n' "${D}  stopping automatically after ${dur}s (Ctrl+C to stop sooner).${N}"
+
+  # A header in the file itself, so a capture is self-describing when it is read back
+  # somewhere else with no idea what produced it.
+  {
+    printf '# aestun live capture\n# host    : %s\n# started : %s\n# units   : %s\n' \
+      "$(hostname)" "$(date -Is)" "${units[*]}"
+    printf '# wire    : %s+%s  peer %s\n#\n' \
+      "$(json_get "$CONF" transport)" "$(json_get "$CONF" obfs)" "$(json_get "$CONF" peer)"
+  } > "$out"
+
+  trap ':' INT
+  if (( dur > 0 )); then
+    timeout "$dur" journalctl "${sel[@]}" -f -n 0 --no-hostname -o short-iso 2>/dev/null \
+      | tee -a "$out" | colourise_log
+  else
+    journalctl "${sel[@]}" -f -n 0 --no-hostname -o short-iso 2>/dev/null \
+      | tee -a "$out" | colourise_log
+  fi
+  trap - INT
+
+  # grep -c prints the count and still exits 1 when that count is zero, so the usual
+  # `|| echo 0` idiom appends a second zero and the summary reads "0 0".
+  local lines size hi wa
+  lines="$(grep -vc '^#' "$out" 2>/dev/null)"; : "${lines:=0}"
+  size="$(human "$(stat -c%s "$out" 2>/dev/null || echo 0)")"
+  printf '\n'
+  msg "capture saved: ${out}  (${lines} lines, ${size})"
+  # A capture nobody reads is wasted; say what is in it up front.
+  hi="$(grep -ci 'high\|blackhole\|inject\|replay\|fatal\|panic' "$out" 2>/dev/null)"; : "${hi:=0}"
+  wa="$(grep -ci 'warn\|throttle\|loss_burst\|rtt_spike' "$out" 2>/dev/null)"; : "${wa:=0}"
+  printf '  %shigh-severity lines: %s%s%s%s   warnings: %s%s%s\n' \
+    "$D" "$R" "$hi" "$N" "$D" "$Y" "$wa" "$N"
+  printf '  %sread it with:  less -R %s%s\n' "$D" "$out" "$N"
+  pause
+}
+
 # --------------------------------------------------------------------- live monitor
 monitor() {
   [[ -f "$CONF" ]] || { err "Set up the tunnel first."; pause; return; }
@@ -803,75 +1028,106 @@ monitor() {
   local prev_tx=0 prev_rx=0 first=1 prev_epoch
   prev_epoch="$(date +%s)"
   while true; do
-    local now_tx now_rx txp rxp af rd up peer lastrx nowu rekey
-    now_tx="$(json_get "$STATS" tx_bytes)";  now_rx="$(json_get "$STATS" rx_bytes)"
-    txp="$(json_get "$STATS" tx_packets)";   rxp="$(json_get "$STATS" rx_packets)"
-    af="$(json_get "$STATS" auth_fail)";     rd="$(json_get "$STATS" replay_drop)"
-    up="$(json_get "$STATS" uptime_seconds)"; peer="$(json_get "$STATS" peer)"
-    lastrx="$(json_get "$STATS" last_rx_unix)"; nowu="$(json_get "$STATS" now_unix)"
-    rekey="$(json_get "$STATS" rekey_interval)"
-    : "${now_tx:=0}" "${now_rx:=0}" "${txp:=0}" "${rxp:=0}" "${af:=0}" "${rd:=0}" "${up:=0}" "${lastrx:=0}" "${nowu:=0}" "${rekey:=0}"
+    # One pass over whatever carriers exist — single-path or all four of them.
+    if ! read_stats; then
+      clear; err "No carrier is publishing stats yet."
+      printf '%s\n' "${D}  Nothing is writing /run/aestun/stats*.json. Start the tunnel (menu 3),${N}"
+      printf '%s\n' "${D}  or the multi-protocol carriers (menu m -> 5).${N}"
+      printf '%s\n' "${D}press q to quit, any other key to retry${N}"
+      read -r -t 2 -n 1 key || true; [[ "${key:-}" == "q" ]] && break
+      continue
+    fi
 
     local now_epoch el dtx=0 drx=0
     now_epoch="$(date +%s)"; el=$(( now_epoch - prev_epoch )); (( el < 1 )) && el=1
-    if [[ $first -eq 0 ]]; then dtx=$(( (now_tx - prev_tx) / el )); drx=$(( (now_rx - prev_rx) / el )); fi
+    if [[ $first -eq 0 ]]; then dtx=$(( (S_TXB - prev_tx) / el )); drx=$(( (S_RXB - prev_rx) / el )); fi
     (( dtx < 0 )) && dtx=0; (( drx < 0 )) && drx=0
-    prev_tx=$now_tx; prev_rx=$now_rx; prev_epoch=$now_epoch; first=0
+    prev_tx=$S_TXB; prev_rx=$S_RXB; prev_epoch=$now_epoch; first=0
 
-    local svc_state; svc_state="$(svc_active aestun)"
-    local svc_c="$R"; [[ "$svc_state" == active ]] && svc_c="$G"
+    # Under multipath the meaningful "service" state is how many carriers are alive,
+    # not whether the single-path unit happens to be running.
+    local mode="single-path" svc_state svc_c="$R" live=0 total=${#S_NAMES[@]}
+    declare -A UP=()
+    if [[ "${S_NAMES[0]}" != "single" ]]; then
+      mode="multipath"
+      # One systemctl call for every carrier rather than one each: this runs twice a
+      # second, and `is-active` takes a list and answers in order.
+      local -a want=() states=()
+      local n; for n in "${S_NAMES[@]}"; do want+=("aestun-path@${n}.service"); done
+      mapfile -t states < <(systemctl is-active "${want[@]}" 2>/dev/null)
+      local i
+      for i in "${!S_NAMES[@]}"; do
+        UP[${S_NAMES[$i]}]="${states[$i]:-unknown}"
+        [[ "${states[$i]:-}" == active ]] && live=$(( live + 1 ))
+      done
+      svc_state="${live}/${total} carriers up"
+      (( live == total )) && svc_c="$G" || { (( live > 0 )) && svc_c="$Y"; }
+    else
+      svc_state="$(svc_active aestun)"; [[ "$svc_state" == active ]] && svc_c="$G"
+    fi
 
     local link="down" link_c="$R"
-    if ip link show "$iface" >/dev/null 2>&1; then
-      if ip link show "$iface" 2>/dev/null | grep -q "state UP\|UNKNOWN"; then link="up"; link_c="$G"; fi
+    if [[ -d "/sys/class/net/$iface" ]]; then
+      local op; read -r op < "/sys/class/net/$iface/operstate" 2>/dev/null || op=""
+      [[ "$op" == up || "$op" == unknown ]] && { link="up"; link_c="$G"; }
     fi
 
     local age="-" age_c="$Y"
-    if [[ "$lastrx" -gt 0 && "$nowu" -gt 0 ]]; then
-      age=$(( nowu - lastrx )); (( age <= 15 )) && age_c="$G"; age="${age}s"
+    if (( S_LASTRX > 0 && S_NOW > 0 )); then
+      age=$(( S_NOW - S_LASTRX )); (( age <= 15 )) && age_c="$G"; age="${age}s"
     fi
-
-    local rk="static"; [[ "$rekey" -gt 0 ]] && rk="every ${rekey}s"
+    local rk="static"; (( S_REKEY > 0 )) && rk="every ${S_REKEY}s"
 
     clear
     printf '%s\n' "${BOLD}${C}+-- aestun live monitor -------------------------------+${N}"
-    printf '  service  : %s%-8s%s   interface %s: %s%s%s\n' "$svc_c" "$svc_state" "$N" "$iface" "$link_c" "$link" "$N"
-    printf '  uptime   : %-12s last RX: %s%s%s ago\n' "$(fmt_dur "$up")" "$age_c" "$age" "$N"
-    printf '  peer     : %s%s%s\n' "$W" "${peer:-–}" "$N"
-    printf '%s\n' "${C}+-- traffic -------------------------------------------+${N}"
-    printf '  TX : %s%12s%s  (%s%s%s/s)  packets: %s\n' "$W" "$(human "$now_tx")" "$N" "$G" "$(human "$dtx")" "$N" "$txp"
-    printf '  RX : %s%12s%s  (%s%s%s/s)  packets: %s\n' "$W" "$(human "$now_rx")" "$N" "$G" "$(human "$drx")" "$N" "$rxp"
+    printf '  mode     : %-12s %s%s%s\n' "$mode" "$svc_c" "$svc_state" "$N"
+    printf '  uptime   : %-12s last RX: %s%s%s ago   iface %s: %s%s%s\n' \
+      "$(fmt_dur "$S_UP")" "$age_c" "$age" "$N" "$iface" "$link_c" "$link" "$N"
+    printf '  peer     : %s%s%s\n' "$W" "${S_PEER:-–}" "$N"
+    printf '%s\n' "${C}+-- traffic (all carriers) ----------------------------+${N}"
+    printf '  TX : %s%12s%s  (%s%s%s/s)  packets: %s\n' "$W" "$(human "$S_TXB")" "$N" "$G" "$(human "$dtx")" "$N" "$S_TXP"
+    printf '  RX : %s%12s%s  (%s%s%s/s)  packets: %s\n' "$W" "$(human "$S_RXB")" "$N" "$G" "$(human "$drx")" "$N" "$S_RXP"
+
+    # Per-carrier breakdown: under multipath the aggregate hides the one dead carrier,
+    # which is precisely the thing worth seeing.
+    if [[ "$mode" == multipath ]]; then
+      printf '%s\n' "${C}+-- per carrier ---------------------------------------+${N}"
+      printf '  %-6s %10s %10s %8s %7s %8s\n' "NAME" "RX" "TX" "AUTHFAIL" "LOSS%" "RTT_ms"
+      local row nm rxb txb afl lsp rtm cc
+      for row in "${S_CARRIERS[@]}"; do
+        IFS='|' read -r nm rxb txb afl lsp rtm <<<"$row"
+        cc="$G"; [[ "${UP[$nm]-}" == active ]] || cc="$R"
+        (( afl > 0 )) && cc="$Y"
+        printf '  %b%-6s%b %10s %10s %8s %7s %8s\n' "$cc" "$nm" "$N" \
+          "$(human "$rxb")" "$(human "$txb")" "$afl" "$lsp" "$rtm"
+      done
+    fi
+
     printf '%s\n' "${C}+-- security ------------------------------------------+${N}"
-    printf '  auth failures (auth_fail) : %s%s%s\n' "$Y" "$af" "$N"
-    printf '  replay drops              : %s%s%s\n' "$Y" "$rd" "$N"
+    printf '  auth failures (auth_fail) : %s%s%s\n' "$Y" "$S_AF" "$N"
+    printf '  replay drops              : %s%s%s\n' "$Y" "$S_RD" "$N"
     printf '  key rotation              : %s\n' "$rk"
 
-    local dpi probes scans inj repl ttla loss rtt bh ciph
-    dpi="$(json_get "$STATS" dpi_enabled)"
-    if [[ "$dpi" == "true" ]]; then
-      probes="$(json_get "$STATS" dpi_probes)"; scans="$(json_get "$STATS" dpi_scans)"
-      inj="$(json_get "$STATS" dpi_injections)"; repl="$(json_get "$STATS" dpi_replays)"
-      ttla="$(json_get "$STATS" dpi_ttl_anomalies)"; loss="$(json_get "$STATS" loss_pct)"
-      rtt="$(json_get "$STATS" rtt_ms)"; bh="$(json_get "$STATS" dpi_blackholed_now)"
-      : "${probes:=0}" "${scans:=0}" "${inj:=0}" "${repl:=0}" "${ttla:=0}" "${loss:=-}" "${rtt:=-}"
+    if [[ "$S_DPI" == true ]]; then
       # Anything non-zero in the first row is somebody paying attention to this port.
-      local pc="$G"; (( probes > 0 || repl > 0 || inj > 0 || ttla > 0 )) 2>/dev/null && pc="$R"
+      local pc="$G"; (( S_PROBES > 0 || S_REPL > 0 || S_INJ > 0 || S_TTLA > 0 )) && pc="$R"
       printf '%s\n' "${C}+-- DPI observer --------------------------------------+${N}"
-      printf '  active probes / replays   : %s%s%s / %s%s%s\n' "$pc" "$probes" "$N" "$pc" "$repl" "$N"
-      printf '  injections / TTL anomalies: %s%s%s / %s%s%s\n' "$pc" "$inj" "$N" "$pc" "$ttla" "$N"
-      printf '  background scanning       : %s\n' "$scans"
-      printf '  path loss / RTT           : %s%%  /  %s ms\n' "$loss" "$rtt"
-      if [[ "$bh" == "true" ]]; then
-        printf '  %scarrier looks BLOCKED — sending, nothing coming back%s\n' "$R" "$N"
-      fi
+      printf '  active probes / replays   : %s%s%s / %s%s%s\n' "$pc" "$S_PROBES" "$N" "$pc" "$S_REPL" "$N"
+      printf '  injections / TTL anomalies: %s%s%s / %s%s%s\n' "$pc" "$S_INJ" "$N" "$pc" "$S_TTLA" "$N"
+      printf '  background scanning       : %s\n' "$S_SCANS"
+      printf '  worst loss / RTT          : %s%%  /  %s ms\n' "$S_LOSS" "$S_RTT"
+      [[ "$S_BH" == true ]] && printf '  %scarrier looks BLOCKED — sending, nothing coming back%s\n' "$R" "$N"
     fi
-    ciph="$(json_get "$STATS" cipher)"
-    [[ -n "$ciph" ]] && printf '%s\n' "${D}  cipher: ${ciph}${N}"
+    [[ -n "$S_CIPHER" ]] && printf '%s\n' "${D}  cipher: ${S_CIPHER}${N}"
     printf '%s\n' "${C}+-----------------------------------------------------+${N}"
-    printf '%s\n' "${D}refresh every 2s — press q to quit${N}"
+    printf '%s\n' "${D}refresh every 2s — press l for the live log, r to record it, q to quit${N}"
 
     read -r -t 2 -n 1 key || true
-    [[ "${key:-}" == "q" ]] && break
+    case "${key:-}" in
+      q) break ;;
+      l|L) live_log ;;
+      r|R) record_log ;;
+    esac
   done
 }
 
@@ -897,8 +1153,17 @@ test_conn() {
 }
 
 show_logs() {
+  # Follows whatever is actually running. It used to name aestun.service outright, which
+  # on a multi-protocol install is the one unit deliberately stopped — so this screen was
+  # empty on exactly the deployment with four carriers to watch.
+  local -a units sel=()
+  mapfile -t units < <(aestun_units)
+  local u; for u in "${units[@]}"; do sel+=(-u "$u"); done
   hdr "Live logs (Ctrl+C to exit)"
-  journalctl -u aestun -f --no-hostname 2>/dev/null || journalctl -u aestun -n 50 --no-pager
+  printf '%s\n\n' "${D}units: ${units[*]}${N}"
+  trap ':' INT
+  journalctl "${sel[@]}" -f -n 50 --no-hostname 2>/dev/null || journalctl "${sel[@]}" -n 50 --no-pager
+  trap - INT
 }
 
 edit_config() {
@@ -1585,6 +1850,33 @@ autotest() {
   if ! $RSSH 'echo ok' >/dev/null 2>&1; then err "SSH to foreign failed."; shred -u "$pwf" 2>/dev/null||rm -f "$pwf"; pause; return; fi
   msg "SSH to foreign OK."
 
+  # --- throughput measurement: make sure it can actually run -------------------------------
+  # The Mbit/s column is produced by iperf3 running ACROSS the tunnel (client here, server on
+  # the foreign end). iperf3 is not part of the install, so on a fresh pair of servers it is
+  # missing and the sweep used to skip the measurement in silence — every variant reported a
+  # bare "-" and the ranking collapsed to loss-only, because a missing rate scores as 0 for
+  # every variant. Install it on BOTH ends up front, and if that is impossible say so once
+  # here instead of leaving an unexplained empty column.
+  local IPERF_OK=1
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    msg "Installing iperf3 locally (needed for the Mbit/s column)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 >/dev/null 2>&1 \
+      || { apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 >/dev/null 2>&1; }
+  fi
+  command -v iperf3 >/dev/null 2>&1 || IPERF_OK=0
+  if ! $RSSH 'command -v iperf3 >/dev/null 2>&1'; then
+    msg "Installing iperf3 on the foreign server..."
+    $RSSH 'DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3 >/dev/null 2>&1; }' >/dev/null 2>&1
+    $RSSH 'command -v iperf3 >/dev/null 2>&1' || IPERF_OK=0
+  fi
+  if [[ "$IPERF_OK" == 1 ]]; then
+    msg "Throughput per variant: iperf3 across the tunnel (60 Mbit cap, 24s, 2 slices)."
+  else
+    warn "iperf3 is not available on both ends — falling back to a timed SSH bulk transfer"
+    warn "over the tunnel for the Mbit/s column (approximate: ssh does its own crypto, so it"
+    warn "under-reports on a fast link, but it is the same path for every variant)."
+  fi
+
   # remote config path (assume the same /etc/aestun/config.json)
   local RCONF="/etc/aestun/config.json"
   # back up both configs
@@ -1616,9 +1908,10 @@ autotest() {
   )
 
   local best_name="" best_loss=100 best_rate="-" best_score=-1000000 best_over="{}"
+  local SSH_FB_OK=1   # the no-iperf3 throughput fallback is still worth trying
   local RESULTFILE; RESULTFILE="$(mktemp)"
-  printf '%-18s %6s %8s %8s  %s\n' "VARIANT" "LOSS%" "PING_ms" "Mbit/s" "NOTE" | tee "$RESULTFILE"
-  printf '%s\n' "--------------------------------------------------------------" | tee -a "$RESULTFILE"
+  printf '%-18s %6s %8s %9s %-7s %s\n' "VARIANT" "LOSS%" "PING_ms" "Mbit/s" "VIA" "NOTE" | tee "$RESULTFILE"
+  printf '%s\n' "----------------------------------------------------------------------" | tee -a "$RESULTFILE"
 
   local v name over
   for v in "${variants[@]}"; do
@@ -1662,6 +1955,7 @@ PY
       [[ "${r2:-0}" -gt "${r1:-0}" ]] && { up=1; break; }
     done
     local loss pingms rate transport throttled=0
+    local rate_via="-" rate_why=""
     transport="$(json_get "$CONF" transport)"; transport="${transport:-udp}"
     if [[ "$up" == 1 ]]; then
       # SUSTAINED measurement, not a quick burst. A volumetric throttle (the kind that kills a
@@ -1670,19 +1964,83 @@ PY
       # over a 45s window in 15s slices and treat a flow that STARTS fast then COLLAPSES as
       # throttled (disqualified), and rank on the SUSTAINED (last-slice) rate, not the peak.
       rate="-"; local r_start="-" r_end="-"
-      if command -v iperf3 >/dev/null 2>&1 && $RSSH "command -v iperf3 >/dev/null 2>&1"; then
-        $RSSH "pkill -x iperf3 2>/dev/null; (iperf3 -s -B $peer_ip -D 2>/dev/null || true)" >/dev/null 2>&1
+      if [[ "$IPERF_OK" == 1 ]]; then
+        # Restart the receiver for THIS variant and VERIFY it came up. The tunnel was just
+        # restarted, so an iperf3 left over from the previous variant is still bound to an
+        # address on an interface that has since been torn down and re-created: it accepts
+        # nothing, the client fails, and the rate silently goes missing. If binding the tunnel
+        # IP fails (tun not up yet on the far end), fall back to binding every address —
+        # the client still connects over the tunnel because peer_ip routes through it.
+        $RSSH "pkill -x iperf3 >/dev/null 2>&1; sleep 1; iperf3 -s -B $peer_ip -D >/dev/null 2>&1; sleep 1; pgrep -x iperf3 >/dev/null 2>&1 || iperf3 -s -D >/dev/null 2>&1" >/dev/null 2>&1
         sleep 1
         # Rate-limited (60 Mbit) and shorter, so the sweep does NOT hammer the link at line
         # rate — sustained max-rate testing is exactly what trips an ISP volumetric block, and
         # the UDP preference in the scoring is the real safeguard against picking a TCP variant.
         # Two 12s slices are still enough to catch a gross throttle-collapse.
-        local ivals; ivals="$(iperf3 -c "$peer_ip" -b 60M -t 24 -i 12 -O 1 2>/dev/null \
-          | awk '/sec/ && /bits\/sec/ && !/sender|receiver/{for(i=1;i<=NF;i++)if($i ~ /bits\/sec/){v=$(i-1); if($i=="Gbits/sec")v=v*1000; print v}}')"
-        r_start="$(printf '%s\n' "$ivals" | head -1)"; r_end="$(printf '%s\n' "$ivals" | tail -1)"
-        rate="${r_end:--}"
+        #
+        # Read the numbers from -J (JSON), not the human table. The table parse was wrong in
+        # two ways: it took the value in front of ANY "bits/sec" token, so a slow variant
+        # reporting "Kbits/sec" was recorded as if it were Mbit/s (and a plain "bits/sec" the
+        # same), and the "(omitted)" warm-up line produced by -O 1 became r_start, which is
+        # what the start-fast/collapse check compares against. The timeout is a backstop for a
+        # variant whose path blackholes mid-transfer, so one bad variant cannot hang the sweep.
+        local jf; jf="$(mktemp)"
+        timeout 60 iperf3 -c "$peer_ip" -b 60M -t 24 -i 12 -O 1 -J >"$jf" 2>/dev/null
+        local parsed; parsed="$(python3 - "$jf" <<'PY' 2>/dev/null
+import json,sys
+def out(a,b): print(a,b); sys.exit(0)
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    out("-","-")
+if d.get("error"): out("-","-")
+r=[s["bits_per_second"]/1e6 for s in (i.get("sum",{}) for i in d.get("intervals",[]))
+   if not s.get("omitted") and isinstance(s.get("bits_per_second"),(int,float))]
+if not r:
+    e=d.get("end",{}); s=e.get("sum_received") or e.get("sum_sent") or e.get("sum") or {}
+    if isinstance(s.get("bits_per_second"),(int,float)): r=[s["bits_per_second"]/1e6]
+if not r: out("-","-")
+out("%.1f"%r[0], "%.1f"%r[-1])
+PY
+)"
+        rm -f "$jf"
+        read -r r_start r_end <<<"${parsed:-- -}"
+        if [[ "$r_end" =~ ^[0-9.]+$ ]]; then
+          rate="$r_end"; rate_via="iperf3"
+        else
+          rate_why="iperf3-failed"
+        fi
         if [[ "$r_start" =~ ^[0-9.]+$ && "$r_end" =~ ^[0-9.]+$ ]]; then
           awk "BEGIN{exit !($r_start>20 && $r_end < $r_start*0.5)}" && throttled=1
+        fi
+      else
+        rate_why="no-iperf3"
+      fi
+      if [[ ! "$rate" =~ ^[0-9.]+$ && "$SSH_FB_OK" == 1 ]]; then
+        # Fallback so the column is never empty: push a fixed block of zeros to the peer's
+        # TUNNEL IP over SSH and time it. It needs nothing installed (sshpass is already a
+        # requirement) and it crosses the same carrier, which is all the ranking needs. The
+        # cost of the SSH handshake is measured separately and subtracted, otherwise a fast
+        # link would be dominated by connection setup rather than transfer.
+        local SSHOPT="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
+        local SZ=26214400 t0 t1 b0 b1 base_ns el_ns
+        b0="$(date +%s%N)"
+        sshpass -f "$pwf" ssh $SSHOPT "$fuser@$peer_ip" true >/dev/null 2>&1
+        b1="$(date +%s%N)"; base_ns=$(( b1 - b0 )); (( base_ns < 0 )) && base_ns=0
+        t0="$(date +%s%N)"
+        # Feed the zeros in by redirection rather than a pipe: `set -o pipefail` is in effect
+        # for this script, and in a pipe a SIGPIPE on head would mark a completed transfer as
+        # a failure. This way the status is ssh's (or timeout's) alone.
+        if timeout 90 sshpass -f "$pwf" ssh $SSHOPT "$fuser@$peer_ip" 'cat >/dev/null' \
+             < <(head -c "$SZ" /dev/zero) 2>/dev/null; then
+          t1="$(date +%s%N)"; el_ns=$(( t1 - t0 - base_ns )); (( el_ns < 1000000 )) && el_ns=1000000
+          rate="$(awk -v n="$el_ns" -v sz="$SZ" 'BEGIN{printf "%.1f", sz*8/(n/1e9)/1e6}')"
+          rate_via="ssh~"; rate_why=""
+        else
+          # sshd is not reachable on the tunnel IP. Do not retry it on the remaining variants:
+          # each attempt burns two connect timeouts and the answer will not change.
+          SSH_FB_OK=0
+          rate_why="${rate_why:+$rate_why/}ssh-failed"
         fi
       fi
       # loss + latency from a 20s ping (also catches a blackhole the throttle causes)
@@ -1692,11 +2050,14 @@ PY
       # high sustained loss is itself a throttle/blackhole signature
       awk "BEGIN{exit !(${loss:-0} >= 25)}" && throttled=1
     else
-      loss="100"; pingms="-"; rate="0"; throttled=1
+      loss="100"; pingms="-"; rate="0"; rate_via="-"; rate_why="no-carrier"; throttled=1
     fi
     : "${loss:=100}" "${pingms:=-}" "${rate:=-}"
     local tag=""; [[ "$throttled" == 1 ]] && tag="THROTTLED"
-    printf '%-18s %6s %8s %8s  %s\n' "$name" "$loss" "$pingms" "$rate" "$tag" | tee -a "$RESULTFILE"
+    # Say WHY a rate is missing instead of printing a bare "-": an unmeasured variant scores as
+    # 0 Mbit/s, so the operator has to be able to tell "this link is slow" from "nothing measured".
+    [[ -n "$rate_why" ]] && tag="${tag:+$tag }${rate_why}"
+    printf '%-18s %6s %8s %9s %-7s %s\n' "$name" "$loss" "$pingms" "$rate" "$rate_via" "$tag" | tee -a "$RESULTFILE"
     # Scoring: a throttled variant is disqualified outright. Otherwise rank on sustained
     # throughput, penalise loss hard, and give the datagram carriers a bonus — neither risks
     # the volumetric TCP throttle, and both report honest latency (the TCP path can report a
@@ -1723,7 +2084,9 @@ PY
   cat "$RESULTFILE"
   echo
   if [[ -n "$best_name" ]]; then
-    msg "Best variant: ${BOLD}${best_name}${N} (loss ${best_loss}%, ~${best_rate} Mbit/s)"
+    local rate_txt="throughput not measured"
+    [[ "$best_rate" =~ ^[0-9.]+$ ]] && rate_txt="~${best_rate} Mbit/s"
+    msg "Best variant: ${BOLD}${best_name}${N} (loss ${best_loss}%, ${rate_txt})"
     if ask_yn "Apply '${best_name}' to BOTH servers now" "Y"; then
       # Apply the winning OVERRIDES onto EACH end's own pre-test base — never copy one end's
       # whole config to the other, which would clobber the role/listen/peer/IPs and blackhole
@@ -1799,6 +2162,59 @@ status_line() {
   printf '%s\n' "${D}status: ${st_c}${st}${N}${D} | ${ins} | peer: ${peer:-–} | wire: ${tr:-udp}+${ob:-none} | arch: $(arch_tag)${N}"
 }
 
+# =============================================================================
+#  Multi-protocol carrier menu — front end for aestun-mp.sh
+# =============================================================================
+#  The supervisor itself is a separate script because it also runs unattended as
+#  aestun-mp.service; this menu is only the operator's view of it.
+MP="${MP_BIN:-/usr/local/sbin/aestun-mp.sh}"
+mp_have() {
+  [[ -x "$MP" ]] && return 0
+  local here="${BASH_SOURCE[0]%/*}/aestun-mp.sh"
+  [[ -x "$here" ]] && { MP="$here"; return 0; }
+  return 1
+}
+
+multipath_menu() {
+  while true; do
+    clear; hdr "Multi-protocol tunnel (failover + multipath)"
+    if ! mp_have; then
+      err "aestun-mp.sh not found (expected $MP or next to this script)."; pause; return
+    fi
+    printf '%s\n' "${D}  Runs udp/quic2, udp/dtls, tcp/tls and icmp as four independent carriers at"
+    printf '%s\n' "  once. Applications address one stable overlay IP; the supervisor decides"
+    printf '%s\n' "  which protocol carries each packet and reroutes within seconds when one is"
+    printf '%s\n' "  blocked. Run 'setup' on BOTH servers before 'start'.${N}"
+    cat <<EOF
+
+  ${C}1${N}) Status (carriers, health, current route)
+  ${C}2${N}) Probe every protocol now
+  ${C}3${N}) Send test data over each protocol
+  ${C}4${N}) Setup   (generate a config per protocol — run on BOTH servers)
+  ${C}5${N}) Start   (stand down single-path service, bring all carriers up)
+  ${C}6${N}) Mode -> multipath   (all healthy protocols at once)
+  ${C}7${N}) Mode -> failover    (first responsive protocol only)
+  ${C}8${N}) Stop multipath
+  ${C}9${N}) Revert to the single-path tunnel
+  ${C}0${N}) Back
+EOF
+    local c; c="$(ask 'Choose' '')" || return
+    case "$c" in
+      1) "$MP" status; pause ;;
+      2) "$MP" probe; pause ;;
+      3) local sz; sz="$(ask 'MiB per protocol' '8')"; "$MP" bench "$sz"; pause ;;
+      4) "$MP" setup; warn "Run the same option on the OTHER server too."; pause ;;
+      5) ask_yn "Stop the single-path service and start all carriers" "Y" && { "$MP" start; }; pause ;;
+      6) "$MP" mode multipath; pause ;;
+      7) "$MP" mode failover; pause ;;
+      8) ask_yn "Stop multipath" "N" && "$MP" stop; pause ;;
+      9) ask_yn "Revert to the stock single-path tunnel" "N" && "$MP" revert; pause ;;
+      0|"") return ;;
+      *) ;;
+    esac
+  done
+}
+
 main_menu() {
   while true; do
     clear
@@ -1813,6 +2229,8 @@ main_menu() {
   ${C}3${N}) Service management (start/stop/restart/...)
   ${C}4${N}) Connectivity test (ping through tunnel)
   ${C}5${N}) Live logs
+  ${C}l${N}) Live tunnel log            <- follow the tunnel processes themselves
+  ${C}r${N}) Record live log to file    <- capture that stream for later / to send on
   ${C}6${N}) Show config
   ${C}7${N}) Edit config
   ${C}8${N}) Generate new key
@@ -1821,6 +2239,7 @@ main_menu() {
   ${C}x${N}) Anti-DPI hardening         <- desync / junk / port-hop / split (native, §15)
   ${C}i${N}) ICMP carrier settings      <- readers / batching / id rotation / ping mimicry
   ${C}t${N}) Auto-test methods          <- sweep every method/protocol, apply the best (§16)
+  ${C}m${N}) Multi-protocol tunnel      <- run 4 carriers at once: failover + multipath (§19)
   ${C}z${N}) zapret module (DPI bypass)
   ${C}u${N}) Uninstall tunnel
   ${C}0${N}) Exit
@@ -1832,6 +2251,8 @@ EOF
       3) service_menu ;;
       4) test_conn ;;
       5) show_logs ;;
+      l|L) live_log ;;
+      r|R) record_log ;;
       6) show_config ;;
       7) edit_config ;;
       8) do_keygen ;;
@@ -1840,6 +2261,7 @@ EOF
       x|X) antidpi_menu ;;
       i|I) icmp_menu ;;
       t|T) autotest ;;
+      m|M) multipath_menu ;;
       z|Z) zapret_menu ;;
       u|U) uninstall_all ;;
       0) clear; exit 0 ;;
@@ -1955,9 +2377,17 @@ do_build() {
     tags=(-tags pprof); out="${out}-pprof"
   fi
   ( cd "$LIB_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build "${tags[@]}" -trimpath -ldflags "-s -w" -o "$out" . ) \
-    && msg "built: ${out}" \
-    && printf '   copy to a server:  scp %s root@SERVER:/usr/local/bin/aestun\n' "$out" \
-    && zap_refresh_sums "$out"
+    || return 1
+  msg "built: ${out}"
+  # SHA256SUMS calls ./aestun "the core build for this host (run it directly)", so when the
+  # build was for this host's own architecture that file has to move too. Without this, a
+  # build refreshed the cross binary and left ./aestun as the previous program — the exact
+  # stale-binary trap the header warns about, produced by the command meant to prevent it.
+  if [[ "$mode" == "plain" && "$arch" == "$(arch_tag)" ]]; then
+    ( cd "$LIB_DIR" && install -m 0755 "$out" aestun ) && msg "refreshed ./aestun (this host's arch)."
+  fi
+  printf '   copy to a server:  scp %s root@SERVER:/usr/local/bin/aestun\n' "$out"
+  zap_refresh_sums "$out"
 }
 
 # zap_refresh_sums — keep SHA256SUMS in step with a binary that was just rebuilt.

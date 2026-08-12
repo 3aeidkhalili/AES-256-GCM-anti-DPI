@@ -65,7 +65,7 @@ type DPILogConfig struct {
 	Keep        int    `json:"keep"`         // rotated generations to keep; default 2
 	MaxPerMin   int    `json:"max_per_min"`  // event rate limit; default 240
 	FlushSec    int    `json:"flush_sec"`    // how often per-source aggregates are emitted; default 60
-	HealthSec   int    `json:"health_sec"`   // flow-health heartbeat interval; default 300 (0 = off)
+	HealthSec   int    `json:"health_sec"`   // flow-health heartbeat interval; default 300 (negative = off)
 	Probe       *bool  `json:"probe"`        // send in-tunnel RTT probes; default true
 	ProbeSec    int    `json:"probe_sec"`    // probe interval; default 20
 	SilenceSec  int    `json:"silence_sec"`  // silence before a blackhole is declared; default 60
@@ -74,6 +74,13 @@ type DPILogConfig struct {
 	Stdout      *bool  `json:"stdout"`       // also write events to the journal; default true
 }
 
+// applyDefaults fills in the unset fields.
+//
+// Every numeric field is treated as "0 or negative means unset". A negative value in the
+// config is not merely odd here, it is fatal: FlushSec and ProbeSec become time.NewTicker
+// arguments, which panics on a non-positive duration, and SampleBytes becomes a slice bound
+// on the receive path — so a stray minus sign in a JSON file would take the tunnel down from
+// an unauthenticated packet. Clamping is the whole of the fix.
 func (c *DPILogConfig) applyDefaults() {
 	if c.Enabled == nil {
 		v := true
@@ -82,35 +89,37 @@ func (c *DPILogConfig) applyDefaults() {
 	if c.Path == "" {
 		c.Path = "/var/log/aestun/dpi.jsonl"
 	}
-	if c.MaxSizeMB == 0 {
+	if c.MaxSizeMB <= 0 {
 		c.MaxSizeMB = 16
 	}
-	if c.Keep == 0 {
+	if c.Keep <= 0 {
 		c.Keep = 2
 	}
-	if c.MaxPerMin == 0 {
+	if c.MaxPerMin <= 0 {
 		c.MaxPerMin = 240
 	}
-	if c.FlushSec == 0 {
+	if c.FlushSec <= 0 {
 		c.FlushSec = 60
 	}
-	if c.HealthSec == 0 {
+	if c.HealthSec < 0 {
+		c.HealthSec = 0 // an explicit 0 disables the heartbeat; negative means the same
+	} else if c.HealthSec == 0 {
 		c.HealthSec = 300
 	}
 	if c.Probe == nil {
 		v := true
 		c.Probe = &v
 	}
-	if c.ProbeSec == 0 {
+	if c.ProbeSec <= 0 {
 		c.ProbeSec = 20
 	}
-	if c.SilenceSec == 0 {
+	if c.SilenceSec <= 0 {
 		c.SilenceSec = 60
 	}
-	if c.MaxSources == 0 {
+	if c.MaxSources <= 0 {
 		c.MaxSources = 2048
 	}
-	if c.SampleBytes == 0 {
+	if c.SampleBytes <= 0 {
 		c.SampleBytes = 16
 	}
 	if c.Stdout == nil {
