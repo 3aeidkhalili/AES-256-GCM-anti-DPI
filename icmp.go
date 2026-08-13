@@ -871,7 +871,8 @@ func setICMPPeerFromConfig(cfg *Config, t *Tunnel) {
 	t.setPeer(netip.AddrPortFrom(addr.Unmap(), 0))
 }
 
-func runICMP(cfg *Config, t *Tunnel, tun *os.File) {
+func runICMP(cfg *Config, t *Tunnel, tuns []*os.File) {
+	tun := tuns[0]
 	setICMPPeerFromConfig(cfg, t)
 
 	c := newICMPCarrier(cfg, t)
@@ -943,9 +944,12 @@ func runICMP(cfg *Config, t *Tunnel, tun *os.File) {
 	var wg sync.WaitGroup
 	for n := 0; n < readers; n++ {
 		wg.Add(1)
+		// Spread the readers over the TUN queues so the writes fan out too; with one queue
+		// they all share it, exactly as before.
+		q := tuns[n%len(tuns)]
 		go func() {
 			defer wg.Done()
-			icmpReadLoop(c, t, tun, probe)
+			icmpReadLoop(c, t, q, probe)
 		}()
 	}
 	wg.Wait()

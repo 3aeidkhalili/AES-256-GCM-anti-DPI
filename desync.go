@@ -182,6 +182,13 @@ func newDesyncAgent(t *Tunnel, cfg *Config) *desyncAgent {
 		sni = "www.cloudflare.com"
 	}
 
+	if cfg.UDPRotate.on() && cfg.Role == "a" && cfg.Transport == "udp" && !cfg.Hop.on() {
+		// The fake is pinned to the source port the carrier had when this agent was built.
+		// udp_rotate moves that port on a timer, so after the first rotation the fake shares
+		// the peer and destination port but not the exact tuple — still a plausible QUIC
+		// handshake to that host, which is most of its value, but no longer riding the flow.
+		log.Printf("desync: note — udp_rotate is on, so the fake 5-tuple match is approximate after the first rotation")
+	}
 	if cfg.Hop.on() {
 		// The injector pins the fake to the carrier's fixed source and destination ports so
 		// it shares the real flow's 5-tuple. Port hopping moves those every epoch, so under

@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -105,22 +106,45 @@ type carrier interface {
 // --- UDP -------------------------------------------------------------------
 
 type udpCarrier struct {
-	conn *net.UDPConn
+	// The socket, behind an atomic so udp_rotate can swap it without a lock on the packet
+	// path: this is loaded once per send and once per receive, and written once per interval.
+	conn atomic.Pointer[net.UDPConn]
 	t    *Tunnel
-	buf  []byte
-	oob  []byte
 	gso  bool
+
+	// Everything rotate() needs to build a replacement socket exactly like the first one.
+	cfg *Config
 	// Shapes bulk traffic only; keepalives and probes go out through Send untouched.
 	pacer *pacer
 
+	// The reader used by the carrier-interface Recv, for the single-reader callers. The
+	// data path gives every receive goroutine its own, because the scratch below cannot
+	// be shared.
+	rd *udpReader
+}
+
+// udpReader is one receive goroutine's private scratch. recvmsg on a shared UDP socket is
+// atomic per datagram, so several goroutines may read the same socket at once as long as each
+// brings its own buffers — which is what lets the receive path use more than one core.
+type udpReader struct {
+	buf []byte
+	oob []byte
+
 	// When the kernel coalesces several datagrams into one recvmsg, the surplus waits
-	// here and Recv hands it out a segment at a time. Keeping the split inside the
-	// carrier means the receive loop above is identical whether GRO is on or off.
+	// here and the next call hands it out a segment at a time. Keeping the split inside the
+	// reader means the loop above is identical whether GRO is on or off.
 	pend    []byte
 	pendSeg int
 	pendSrc netip.AddrPort
 	pendTTL uint8
 }
+
+func newUDPReader() *udpReader {
+	return &udpReader{buf: make([]byte, maxPktSize), oob: make([]byte, 256)}
+}
+
+// sock is the socket in force right now. One atomic load; the rotator swaps underneath.
+func (u *udpCarrier) sock() *net.UDPConn { return u.conn.Load() }
 
 func (u *udpCarrier) Send(pkt []byte) error {
 	peer, ok := u.t.getPeer()
@@ -128,21 +152,24 @@ func (u *udpCarrier) Send(pkt []byte) error {
 		return nil // peer address not known yet; nothing to do but drop
 	}
 	// The AddrPort form, so the send path does not build a *net.UDPAddr per datagram.
-	_, err := u.conn.WriteToUDPAddrPort(pkt, peer)
+	_, err := u.conn.Load().WriteToUDPAddrPort(pkt, peer)
 	return err
 }
 
-func (u *udpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
+func (u *udpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) { return u.recvInto(u.rd) }
+
+// recvInto is Recv against a caller-owned reader, so N goroutines can share the socket.
+func (u *udpCarrier) recvInto(r *udpReader) ([]byte, netip.AddrPort, uint8, error) {
 	// Anything the kernel coalesced on the previous call is handed out first, one
 	// datagram at a time, before the socket is touched again.
-	if len(u.pend) > 0 {
-		n := u.pendSeg
-		if n > len(u.pend) {
-			n = len(u.pend) // the trailing segment may be shorter
+	if len(r.pend) > 0 {
+		n := r.pendSeg
+		if n > len(r.pend) {
+			n = len(r.pend) // the trailing segment may be shorter
 		}
-		pkt := u.pend[:n]
-		u.pend = u.pend[n:]
-		return pkt, u.pendSrc, u.pendTTL, nil
+		pkt := r.pend[:n]
+		r.pend = r.pend[n:]
+		return pkt, r.pendSrc, r.pendTTL, nil
 	}
 	// ReadMsgUDPAddrPort rather than ReadFromUDP, for two reasons. It is the same recvmsg
 	// syscall underneath but also returns the ancillary data carrying the datagram's IP
@@ -150,18 +177,25 @@ func (u *udpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
 	// one a middlebox forged with the peer's address on it. And the AddrPort form returns
 	// the source by value, where the *net.UDPAddr forms allocate a fresh address, with a
 	// heap-allocated IP slice inside it, for every datagram received.
-	n, oobn, _, src, err := u.conn.ReadMsgUDPAddrPort(u.buf, u.oob)
+	conn := u.conn.Load()
+	n, oobn, _, src, err := conn.ReadMsgUDPAddrPort(r.buf, r.oob)
 	if err != nil {
+		// A rotation deliberately unblocks this read by expiring the old socket's deadline.
+		// That is not a failure: the replacement is already installed, so report nothing and
+		// let the caller come straight back round to it.
+		if u.conn.Load() != conn {
+			return nil, netip.AddrPort{}, 0, errRotated
+		}
 		return nil, netip.AddrPort{}, 0, err
 	}
-	oob := u.oob[:oobn]
+	oob := r.oob[:oobn]
 	addr, ttl := normAddr(src), parseTTL(oob)
 	// A segment size smaller than what arrived means the kernel merged several datagrams.
 	if seg := parseGROSegment(oob); seg > 0 && seg < n {
-		u.pend, u.pendSeg, u.pendSrc, u.pendTTL = u.buf[seg:n], seg, addr, ttl
-		return u.buf[:seg], addr, ttl, nil
+		r.pend, r.pendSeg, r.pendSrc, r.pendTTL = r.buf[seg:n], seg, addr, ttl
+		return r.buf[:seg], addr, ttl, nil
 	}
-	return u.buf[:n], addr, ttl, nil
+	return r.buf[:n], addr, ttl, nil
 }
 
 // sendBatch delivers a run of equally sized datagrams in one syscall, letting the kernel
@@ -185,13 +219,13 @@ func (u *udpCarrier) sendBatch(b *txBatch) error {
 			if end > b.n {
 				end = b.n
 			}
-			if _, e := u.conn.WriteToUDPAddrPort(b.buf[off:end], peer); e != nil && err == nil {
+			if _, e := u.conn.Load().WriteToUDPAddrPort(b.buf[off:end], peer); e != nil && err == nil {
 				err = e
 			}
 		}
 	} else {
 		oob := gsoControl(b.oob, uint16(b.segSize))
-		_, _, err = u.conn.WriteMsgUDPAddrPort(b.buf[:b.n], oob, peer)
+		_, _, err = u.conn.Load().WriteMsgUDPAddrPort(b.buf[:b.n], oob, peer)
 	}
 	b.reset()
 	return err
@@ -214,7 +248,11 @@ func normAddr(a netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
 }
 
-func (u *udpCarrier) Close() error { return u.conn.Close() }
+func (u *udpCarrier) Close() error { return u.conn.Load().Close() }
+
+// errRotated means the read was interrupted because udp_rotate swapped the socket. The
+// receive loop treats it as "try again", not as an error worth counting or logging.
+var errRotated = fmt.Errorf("carrier socket rotated")
 
 // parseTTL digs the hop count out of the recvmsg control messages. Returns 0 when the
 // kernel did not supply one, which the callers treat as "unknown" rather than an anomaly.
@@ -364,6 +402,46 @@ func (c *tcpCarrier) Send(pkt []byte) error {
 	}
 	copy(c.wbuf[hdrLen:], pkt)
 	_, err := c.conn.Write(c.wbuf[:hdrLen+len(pkt)])
+	return err
+}
+
+// frameInto appends one framed datagram to dst, using whichever framing this carrier speaks.
+// Split out from Send so the pump can build a run of them and pay for one write, not N.
+func (c *tcpCarrier) frameInto(dst []byte, pkt []byte) []byte {
+	if c.tlsShape {
+		var h [tlsRecordHeaderLen]byte
+		h[0], h[1], h[2] = tlsRecAppData, 0x03, 0x03
+		binary.BigEndian.PutUint16(h[3:5], uint16(len(pkt)))
+		dst = append(dst, h[:]...)
+	} else {
+		var h [2]byte
+		binary.BigEndian.PutUint16(h[:], uint16(len(pkt)))
+		dst = append(dst, h[:]...)
+	}
+	return append(dst, pkt...)
+}
+
+// sendFramed writes an already-framed run of datagrams in a single Write.
+//
+// This is where the TCP carrier's throughput was. The path carries TCP at 1.8 Gbit/s and UDP
+// at a hard ~30,500 packets/second, so TCP is the one carrier with real headroom — and the
+// pump was spending it one write syscall per datagram. Concatenating a run costs nothing on
+// the wire (a stream has no datagram boundaries to preserve; the length prefixes already
+// carry them) and divides the syscall across the whole batch.
+func (c *tcpCarrier) sendFramed(buf []byte) error {
+	if len(buf) == 0 {
+		return nil
+	}
+	conn := c.current()
+	if conn == nil {
+		return nil // not connected yet; the inner protocols will retransmit
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != conn {
+		return nil // replaced under us; drop rather than write to a dead socket
+	}
+	_, err := c.conn.Write(buf)
 	return err
 }
 
@@ -630,12 +708,53 @@ func main() {
 	tuneRuntime(&cfg)
 
 	// TUN
-	tun, ifname, err := openTUNNonblock(cfg.TunName)
+	// How many TUN queues to open. This is not a free dial: the kernel hashes outbound
+	// packets across every attached queue, so a queue nobody reads is a blackhole for
+	// whatever hashes onto it. The count must therefore match the number of goroutines that
+	// will actually drain it, which depends on the carrier.
+	queues := 1
+	switch cfg.Transport {
+	case "udp":
+		// One pump and one receive loop per queue.
+		queues = cfg.TunQueues
+		if queues <= 0 {
+			queues = runtime.GOMAXPROCS(0)
+			if queues > 4 {
+				queues = 4 // past this the socket and the link, not the TUN device, are the limit
+			}
+		}
+	case "icmp":
+		// The ICMP carrier's readers are spread over the queues; it uses one pump, so a
+		// second queue would only be drained on the receive side. Keep it at one.
+		queues = 1
+	case "tcp":
+		// The stream is read back by one goroutine (a byte stream has to be), but the
+		// send side is N pumps feeding one connection: each flushes a whole framed run
+		// under the carrier's mutex, so the framing stays intact and the TUN read — which
+		// is what actually capped this carrier — spreads across cores. Worth doing here
+		// precisely because TCP is the transport with headroom: the path carries it at
+		// 1.8 Gbit/s while rate-limiting UDP to ~30,500 packets/second.
+		queues = cfg.TunQueues
+		if queues <= 0 {
+			queues = runtime.GOMAXPROCS(0)
+			if queues > 4 {
+				queues = 4
+			}
+		}
+	}
+	if cfg.Hop.on() {
+		queues = 1 // the hopping carrier funnels every socket through one channel
+	}
+	tuns, ifname, err := openTUNMultiQueue(cfg.TunName, queues)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-	defer tun.Close()
-	log.Printf("interface %s created", ifname)
+	defer func() {
+		for _, f := range tuns {
+			f.Close()
+		}
+	}()
+	log.Printf("interface %s created (%d queue(s))", ifname, len(tuns))
 
 	if *cfg.ManageIP {
 		configureIface(&cfg, ifname)
@@ -654,11 +773,11 @@ func main() {
 
 	switch cfg.Transport {
 	case "tcp":
-		runTCP(&cfg, t, tun)
+		runTCP(&cfg, t, tuns)
 	case "icmp":
-		runICMP(&cfg, t, tun)
+		runICMP(&cfg, t, tuns)
 	default:
-		runUDP(&cfg, t, tun)
+		runUDP(&cfg, t, tuns)
 	}
 }
 
@@ -772,6 +891,32 @@ func startJunk(cfg *Config, t *Tunnel, c carrier) {
 }
 
 // newUDPCarrier builds the ordinary single-socket carrier with its buffers, offload and pacer.
+// setupUDPSocket applies every option the carrier's socket needs. Factored out because
+// udp_rotate builds replacement sockets that must be configured identically to the first
+// one — a replacement missing GSO or the enlarged buffers would quietly halve throughput
+// after the first rotation, which is exactly the kind of drift that is never noticed.
+func setupUDPSocket(conn *net.UDPConn, cfg *Config, t *Tunnel, quiet bool) (gso bool) {
+	// Enlarge the socket buffers so traffic bursts are absorbed instead of dropped
+	// (kernel UDP RcvbufErrors). The kernel caps these at net.core.rmem_max / wmem_max.
+	if err := conn.SetReadBuffer(cfg.RcvBuf); err != nil && !quiet {
+		log.Printf("warning: SetReadBuffer(%d) failed: %v", cfg.RcvBuf, err)
+	}
+	if err := conn.SetWriteBuffer(cfg.SndBuf); err != nil && !quiet {
+		log.Printf("warning: SetWriteBuffer(%d) failed: %v", cfg.SndBuf, err)
+	}
+	if t.dpi.enabled() {
+		enableTTLInfo(conn)
+	}
+	if *cfg.Offload {
+		gso = enableGSO(conn)
+		gro := enableGRO(conn)
+		if !quiet {
+			log.Printf("kernel offload: udp_gso=%v udp_gro=%v", gso, gro)
+		}
+	}
+	return gso
+}
+
 func newUDPCarrier(cfg *Config, t *Tunnel) *udpCarrier {
 	laddr, err := net.ResolveUDPAddr("udp", cfg.Listen)
 	if err != nil {
@@ -782,29 +927,9 @@ func newUDPCarrier(cfg *Config, t *Tunnel) *udpCarrier {
 		log.Fatalf("UDP listen failed: %v", err)
 	}
 
-	// Enlarge the socket buffers so traffic bursts are absorbed instead of dropped
-	// (kernel UDP RcvbufErrors). The kernel caps these at net.core.rmem_max / wmem_max.
-	if err := conn.SetReadBuffer(cfg.RcvBuf); err != nil {
-		log.Printf("warning: SetReadBuffer(%d) failed: %v", cfg.RcvBuf, err)
-	}
-	if err := conn.SetWriteBuffer(cfg.SndBuf); err != nil {
-		log.Printf("warning: SetWriteBuffer(%d) failed: %v", cfg.SndBuf, err)
-	}
-	if t.dpi.enabled() {
-		enableTTLInfo(conn)
-	}
-
-	c := &udpCarrier{
-		conn: conn,
-		t:    t,
-		buf:  make([]byte, maxPktSize),
-		oob:  make([]byte, 256),
-	}
-	if *cfg.Offload {
-		c.gso = enableGSO(conn)
-		gro := enableGRO(conn)
-		log.Printf("kernel offload: udp_gso=%v udp_gro=%v", c.gso, gro)
-	}
+	c := &udpCarrier{t: t, cfg: cfg, rd: newUDPReader()}
+	c.conn.Store(conn)
+	c.gso = setupUDPSocket(conn, cfg, t, false)
 	if cfg.RateMbps > 0 {
 		c.pacer = newPacer(cfg.RateMbps)
 		log.Printf("carrier shaped to %.0f Mbit/s", cfg.RateMbps)
@@ -812,7 +937,77 @@ func newUDPCarrier(cfg *Config, t *Tunnel) *udpCarrier {
 	return c
 }
 
-func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
+// rotateOnce moves the carrier to a freshly bound source port, make-before-break.
+//
+// The destination is untouched — only our own source port moves — so the peer's firewall,
+// its config and its listen socket all stay exactly as they were. The peer follows because
+// maybeRoam already updates the stored address from any authenticated packet, which is why
+// this needs no negotiation and is safe against a peer running an older build.
+func (u *udpCarrier) rotateOnce() error {
+	old := u.conn.Load()
+	// Bind on the same local address, port 0: the kernel picks an unused one.
+	host, _, err := net.SplitHostPort(u.cfg.Listen)
+	if err != nil {
+		return err
+	}
+	laddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return err
+	}
+	conn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return err
+	}
+	// Configure it before it carries anything, or the first packets out of the new socket
+	// go without offload and with default buffers.
+	setupUDPSocket(conn, u.cfg, u.t, true)
+	u.conn.Store(conn)
+
+	// The receive loop is parked in a blocking read on the old socket and would sit there
+	// until something arrived on a socket nothing is addressed to any more. Expiring the
+	// deadline returns that read immediately; Recv sees the swap and comes back on the new one.
+	_ = old.SetReadDeadline(time.Now())
+
+	// Hold the old socket open, unread, for a grace period. Closing it at once would make the
+	// kernel answer the peer's in-flight datagrams with ICMP port-unreachable — a loud signal
+	// on a link where the whole point is not to emit any. Open-but-unread absorbs them silently.
+	go func() {
+		time.Sleep(udpRotateGrace)
+		old.Close()
+	}()
+	return nil
+}
+
+// udpRotateGrace is how long the retired socket stays open to swallow in-flight datagrams.
+// Longer than one keepalive interval, so the peer has certainly roamed before it goes.
+const udpRotateGrace = 40 * time.Second
+
+// udpRotateLoop rotates the source port on a jittered timer. Only role a runs it: role b is
+// the fixed point both ends are addressed at, and two ends moving at once could lose each other.
+func udpRotateLoop(cfg *Config, t *Tunnel, c *udpCarrier) {
+	base := time.Duration(cfg.UDPRotate.IntervalSec) * time.Second
+	s := newSealer()
+	for {
+		time.Sleep(jitter(base))
+		if _, ok := t.getPeer(); !ok {
+			continue // nothing to announce ourselves to yet
+		}
+		if err := c.rotateOnce(); err != nil {
+			log.Printf("udp_rotate: could not bind a replacement socket: %v", err)
+			continue
+		}
+		// Announce the new source port immediately so the peer roams within one round trip
+		// instead of waiting for the next keepalive.
+		if err := c.Send(t.sealInto(s, nil)); err != nil {
+			log.Printf("udp_rotate: announce failed: %v", err)
+		}
+		if a, ok := c.conn.Load().LocalAddr().(*net.UDPAddr); ok {
+			log.Printf("udp_rotate: carrier source port moved to %d", a.Port)
+		}
+	}
+}
+
+func runUDP(cfg *Config, t *Tunnel, tuns []*os.File) {
 	// The peer is needed by every carrier (hopping sends to peer.IP:hop_port, the single
 	// socket sends to the whole AddrPort), so install it before either is built.
 	setPeerFromConfig(cfg, t)
@@ -869,19 +1064,65 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 		go keepaliveLoop(c, t, *cfg.Keepalive)
 	}
 
+	// Source-port rotation, so no single 5-tuple lives long enough to be blocked for what it
+	// has carried. Role a only, and not under port hopping, which already moves the tuple.
+	if uc, ok := c.(*udpCarrier); ok && cfg.UDPRotate.on() && cfg.Role == "a" && !cfg.Hop.on() {
+		log.Printf("udp_rotate on: a fresh carrier source port every ~%ds (the destination port never moves)",
+			cfg.UDPRotate.IntervalSec)
+		go udpRotateLoop(cfg, t, uc)
+	}
+
 	var probe *probeAgent
 	if t.dpi.enabled() && t.dpi.cfg.Probe != nil && *t.dpi.cfg.Probe {
 		probe = newProbeAgent(t, c, time.Duration(t.dpi.cfg.ProbeSec)*time.Second)
 		go probe.run()
 	}
 
-	go pumpTUNToCarrier(c, t, tun)
+	// One pump and one receive loop per TUN queue. A single goroutine doing
+	// read -> seal -> send is one core's worth of work however many cores the box has, and
+	// that was the carrier's real ceiling; the same is true of recv -> open -> write coming
+	// back. Everything they touch is either goroutine-owned (buffers, sealer, opener, reader)
+	// or internally synchronised (the replay window, the counters, the socket).
+	for i := range tuns {
+		go pumpTUNToCarrier(c, t, tuns[i])
+	}
 
+	var wg sync.WaitGroup
+	for i := range tuns {
+		wg.Add(1)
+		go func(tun *os.File) {
+			defer wg.Done()
+			udpReceiveLoop(cfg, t, c, tun, probe)
+		}(tuns[i])
+	}
+	wg.Wait()
+}
+
+// udpReceiveLoop is one receive goroutine: take a datagram off the carrier, authenticate it,
+// and write it to a TUN queue. Several run at once, each with its own reader and opener.
+func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *probeAgent) {
 	op := newOpener()
+	// The single-socket carrier can be read by several goroutines at once, each with its own
+	// scratch. The hopping carrier already funnels every socket through one channel, so it
+	// keeps the plain Recv.
+	uc, _ := c.(*udpCarrier)
+	var rd *udpReader
+	if uc != nil {
+		rd = newUDPReader()
+	}
+	recv := func() ([]byte, netip.AddrPort, uint8, error) {
+		if uc != nil {
+			return uc.recvInto(rd)
+		}
+		return c.Recv()
+	}
 	errs := 0
 	var lastInitialReply time.Time
 	for {
-		pkt, src, ttl, err := c.Recv()
+		pkt, src, ttl, err := recv()
+		if err == errRotated {
+			continue // the socket moved under us; the replacement is already installed
+		}
 		if err != nil {
 			errs++
 			if errs >= maxReadErrors {
@@ -992,7 +1233,10 @@ func runUDP(cfg *Config, t *Tunnel, tun *os.File) {
 	}
 }
 
-func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
+func runTCP(cfg *Config, t *Tunnel, tuns []*os.File) {
+	// The receive side reads one connection, so it writes into one queue; the send side gets
+	// a pump per queue (see the queue-count comment in main).
+	tun := tuns[0]
 	c := &tcpCarrier{buf: make([]byte, maxPktSize), tlsShape: t.tlsShape}
 	if t.tlsShape {
 		log.Printf("tcp carrier shaped as TLS (records + synthetic handshake, sni=%s)", cfg.SNI)
@@ -1056,7 +1300,11 @@ func runTCP(cfg *Config, t *Tunnel, tun *os.File) {
 		go probe.run()
 	}
 
-	go pumpTUNToCarrier(c, t, tun)
+	// One pump per TUN queue; they all feed the single connection, serialised by the
+	// carrier's own mutex at flush time.
+	for i := range tuns {
+		go pumpTUNToCarrier(c, t, tuns[i])
+	}
 
 	op := newOpener()
 	for {
@@ -1097,6 +1345,8 @@ func pumpTUNToCarrier(c carrier, t *Tunnel, tun *os.File) {
 	switch bc := c.(type) {
 	case *udpCarrier:
 		pumpUDP(bc, t, tun)
+	case *tcpCarrier:
+		pumpTCP(bc, t, tun)
 	case *icmpCarrier:
 		if bc.batch > 1 {
 			pumpICMPBatched(bc, t, tun)
@@ -1156,6 +1406,63 @@ func carrierPacer(c carrier) *pacer {
 		return bc.pacer
 	}
 	return nil
+}
+
+// pumpTCP is the TCP carrier's pump: the same blocking-read-then-drain shape as pumpUDP, but
+// the batch is a run of framed datagrams concatenated into one buffer and written once.
+//
+// A stream has no datagram boundaries of its own — the length prefixes carry them — so this
+// changes nothing the peer sees while turning N write syscalls into one. It also stops the
+// carrier emitting a separate TCP segment per tunnel datagram, which was both twice the packet
+// rate on the wire and unlike anything a real TLS peer produces.
+func pumpTCP(bc *tcpCarrier, t *Tunnel, tun *os.File) {
+	buf := make([]byte, maxPktSize)
+	s := newSealer()
+	tr := newTunReader(tun)
+	pace := bc.pacer
+	// Bounded so one flush stays a sane write and the latency of the first packet in a batch
+	// is never held up for long.
+	const maxBatchBytes = 256 << 10
+	batch := make([]byte, 0, maxBatchBytes+maxPktSize)
+	errs := 0
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		pace.wait(len(batch))
+		if err := bc.sendFramed(batch); err != nil {
+			log.Printf("carrier send failed: %v", err)
+		}
+		batch = batch[:0]
+	}
+	for {
+		n, err := tr.read(buf)
+		if err != nil {
+			errs++
+			if errs >= maxReadErrors {
+				log.Fatalf("TUN read failing persistently: %v", err)
+			}
+			log.Printf("TUN read error (%d/%d): %v", errs, maxReadErrors, err)
+			time.Sleep(readErrBackoff)
+			continue
+		}
+		errs = 0
+		if n == 0 {
+			continue
+		}
+		batch = bc.frameInto(batch, t.sealInto(s, buf[:n]))
+		// Drain whatever else is already queued, but never wait for it: on a quiet link the
+		// first attempt returns nothing and the packet goes out on its own.
+		for len(batch) < maxBatchBytes {
+			m, err := tr.tryRead(buf)
+			if err != nil || m == 0 {
+				break
+			}
+			batch = bc.frameInto(batch, t.sealInto(s, buf[:m]))
+		}
+		flush()
+	}
 }
 
 // pumpUDP is the segmentation-offload path.

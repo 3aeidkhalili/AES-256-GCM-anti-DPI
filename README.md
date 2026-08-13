@@ -68,7 +68,7 @@ Everything else is per-server.
 | `obfs` | `quic2` | Same wire format as `quic`, but its handshake cover actually survives Iranian carriers (§5.2) |
 | `cipher` | `aes-gcm` if **both** CPUs have AES-NI, else `chacha20-poly1305` | Without AES-NI, AES-GCM runs in software at ~1/6 the speed (§10.1) |
 | socket buffers | leave at the default | A buffer is a queue; oversizing it trades latency for throughput you may not need (§10.3) |
-| anti-DPI modules | all off | Turn them on against an observed problem, not pre-emptively (§8) |
+| anti-DPI modules | leave the defaults | All off except `udp_rotate`, which is on because it prevents an observed production failure (§8.5). Turn the rest on against a problem you have actually seen, not pre-emptively (§8) |
 
 ---
 
@@ -226,6 +226,8 @@ unauthenticated packet.
 ### Anti-DPI module blocks (§8)
 
 `desync`, `junk`, `hop`, `split`, `tcp_rotate` — all `{"enabled": false}` by default.
+`udp_rotate` is the exception: `{"enabled": true, "interval_sec": 900}`, because it prevents a
+failure that was observed in production rather than one that might occur (§8.5).
 
 ### `icmp` — the ICMP carrier (§6.3)
 
@@ -535,7 +537,56 @@ desync fakes, which are throwaway by construction. A DPI that does not reassembl
 truncated first fragment of the cover handshake; one that does sees the same legitimate Initial
 as before. Either way the real flow is untouched.
 
-### 8.5 `tcp_rotate` — dodge volumetric throttling
+### 8.5 `udp_rotate` — keep the 5-tuple moving (on by default)
+
+**This one is on by default**, because the failure it prevents is one that actually happened
+on the reference pair rather than one that might.
+
+The quic carrier ran on a fixed pair of ports and carried ~33 GB over it. That exact 5-tuple
+then stopped passing **in both directions, permanently** — while the *same destination port
+from any other source port* kept working, and the other three carriers were untouched.
+Measured in a single window with `tcpdump` running on both servers:
+
+| flow | delivered |
+|---|---|
+| `A:1376 → B:1376` (the carrier's own pair) | **0 packets** |
+| `A:40606 → B:1376` | 18 packets |
+| `B:48584 → A:1376` | 15 packets |
+
+The block keys on the tuple and is triggered by what that tuple accumulates. The port is fine;
+the *pair* is burned. The carrier went silent at the same instant on both ends and stayed dead
+for over an hour, with `auth_fail` at zero the whole time — nothing was wrong with the tunnel.
+
+`udp_rotate` binds a fresh source port on a jittered timer and switches onto it,
+make-before-break, so no tuple lives long enough to be worth blocking. It works because of a
+property the protocol already had: the peer learns our address from any authenticated packet
+(roaming). So:
+
+* **nothing is negotiated** — a peer on an older build follows automatically;
+* **the destination port never moves** — no firewall on either end has to be touched;
+* **only role `a` rotates** — role b is the fixed point both ends are addressed at, and two
+  ends moving at once could lose each other. Same rule as `tcp_rotate`, where only the dialer
+  rotates.
+
+Unlike `hop` it keeps one socket at a time, so segmentation offload is preserved and there is
+no throughput cost — `hop` measured −38 % for the same idea because it binds a whole port set
+and sends one datagram per syscall. The retired socket is held open, unread, for 40 s: closing
+it at once would make the kernel answer in-flight datagrams with ICMP port-unreachable, which
+is a loud signal on a link where the point is to emit none.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | set `false` if a stateful middlebox on your path pins the source port |
+| `interval_sec` | `900` | seconds between rotations, jittered ±40 %; floored at 60 |
+
+The cost is whatever was in flight to the old port for about one round trip; the inner TCP
+retransmits it. The new socket sends a keepalive immediately so the peer roams within that RTT.
+It is skipped under `hop`, which already moves the tuple, and does not apply to `tcp` or `icmp`.
+
+If a tuple gets blocked anyway despite rotation, `hop` (§8.3) is the stronger answer — it moves
+both ends' ports on a keyed schedule, at the cost of offload.
+
+### 8.6 `tcp_rotate` — dodge volumetric throttling
 
 The field test found a TCP+TLS carrier, however perfectly it parsed as HTTPS, throttled to a
 blackhole within ~30 s: a single long-lived, high-rate TLS connection is anomalous on rate and
@@ -558,7 +609,7 @@ per-carrier breakdown:
 +-- aestun live monitor -------------------------------+
   mode     : multipath    4/4 carriers up
   uptime   : 4h 48m       last RX: 0s ago   iface tun0: up
-  peer     : 185.17600.10.0002:1378
+  peer     : 185.126.14.202:1378
 +-- traffic (all carriers) ----------------------------+
   TX :      4.36 GB  (0 B/s)  packets: 6154870
   RX :      7.18 GB  (0 B/s)  packets: 8128375

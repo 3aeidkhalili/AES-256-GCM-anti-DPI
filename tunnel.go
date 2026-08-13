@@ -75,8 +75,13 @@ type Config struct {
 	GCPercent *int `json:"gc_percent"` // Go GC target; omitted = 100. The packet path allocates
 	//                                          nothing, so there is no garbage to amortise and a
 	//                                          higher target would only inflate RSS for no gain.
-	MemLimit  int64  `json:"mem_limit"`  // soft heap limit in bytes; 0 = 64 MiB
-	MaxProcs  int    `json:"max_procs"`  // GOMAXPROCS override; 0 = leave to the runtime
+	MemLimit int64 `json:"mem_limit"` // soft heap limit in bytes; 0 = 64 MiB
+	MaxProcs int   `json:"max_procs"` // GOMAXPROCS override; 0 = leave to the runtime
+	// TunQueues is how many parallel queues to open on the TUN device, and with them how many
+	// goroutines drain it and feed it. One goroutine doing read->seal->send is one core's worth
+	// of work however many cores the box has, and that — not the network, not the qdisc — was
+	// what capped a carrier at ~290 Mbit/s on a 2.12 Gbit/s path. 0 = one per core, capped at 4.
+	TunQueues int    `json:"tun_queues"`
 	PprofAddr string `json:"pprof_addr"` // e.g. 127.0.0.1:6060 to expose net/http/pprof; empty = off
 
 	// --- observability ---
@@ -88,6 +93,7 @@ type Config struct {
 	Hop       HopConfig       `json:"hop"`        // keyed synchronised port hopping
 	Split     SplitConfig     `json:"split"`      // IP-fragment the disposable desync fakes
 	TCPRotate TCPRotateConfig `json:"tcp_rotate"` // rotate the TCP carrier connection to dodge volumetric throttling
+	UDPRotate UDPRotateConfig `json:"udp_rotate"` // rotate the UDP carrier's source port so no 5-tuple lives long enough to be blocked
 
 	// --- ICMP carrier (only consulted when transport is "icmp"; see icmp.go) ---
 	ICMP ICMPConfig `json:"icmp"`
@@ -282,6 +288,53 @@ func (c *TCPRotateConfig) applyDefaults() {
 
 func (c *TCPRotateConfig) on() bool { return c != nil && c.Enabled != nil && *c.Enabled }
 
+// UDPRotateConfig configures periodic source-port rotation of the UDP carrier.
+//
+// It exists because of a production failure, not a theory. The reference pair ran the quic
+// carrier on a fixed pair of ports and pushed ~33 GB over it; the exact 5-tuple then stopped
+// passing in BOTH directions, permanently, while the SAME destination port from any other
+// source port kept working and the other three carriers were untouched. Measured in one
+// window: 0 packets delivered on 1376->1376, against 18 and 15 delivered on 40606->1376 and
+// 48584->1376. The block keys on the tuple and is triggered by what that tuple accumulates.
+//
+// Port hopping (hop.go) already answers this, but it binds every port in a set, sends one
+// datagram per syscall, and measured -38% throughput because it forgoes segmentation offload.
+// This is the cheap version of the same idea, and it works because of a property the tunnel
+// already has: the peer learns our address from any authenticated packet (maybeRoam). So only
+// ONE side has to move, nothing has to be negotiated, and the destination port never changes —
+// which means no firewall on either end has to be touched.
+//
+// Only role "a" rotates. Role b is the fixed point both ends are addressed at; if both moved
+// at once they could lose each other. This mirrors tcp_rotate, where only the dialer rotates.
+//
+// The cost is one socket swap per interval and the loss of whatever was in flight to the old
+// port for about one round trip — the inner TCP retransmits it, exactly as with tcp_rotate.
+// The new socket sends a keepalive immediately so the peer roams within that one RTT.
+type UDPRotateConfig struct {
+	Enabled     *bool `json:"enabled"`      // master switch; default true for role a on udp
+	IntervalSec int   `json:"interval_sec"` // seconds between rotations, jittered; default 900
+}
+
+func (c *UDPRotateConfig) applyDefaults() {
+	if c.Enabled == nil {
+		// On by default. It needs no coordination with the peer, changes nothing a firewall
+		// can be keyed on (the destination port is untouched), and the failure it prevents is
+		// a silent, permanent, one-carrier outage. Set it to false if a stateful middlebox on
+		// your path pins the source port.
+		v := true
+		c.Enabled = &v
+	}
+	if c.IntervalSec <= 0 {
+		c.IntervalSec = 900
+	}
+	// A tuple that moves faster than the peer can follow is worse than one that does not move.
+	if c.IntervalSec < 60 {
+		c.IntervalSec = 60
+	}
+}
+
+func (c *UDPRotateConfig) on() bool { return c != nil && c.Enabled != nil && *c.Enabled }
+
 func (c *Config) applyDefaults() {
 	if c.TunName == "" {
 		c.TunName = "tun0"
@@ -377,6 +430,7 @@ func (c *Config) applyDefaults() {
 	c.Hop.applyDefaults()
 	c.Split.applyDefaults()
 	c.TCPRotate.applyDefaults()
+	c.UDPRotate.applyDefaults()
 	c.ICMP.applyDefaults()
 }
 

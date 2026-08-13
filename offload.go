@@ -37,6 +37,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"syscall"
@@ -181,13 +182,20 @@ func (b *txBatch) reset() { b.n, b.count, b.segSize = 0, 0, 0 }
 // is ever polled removes that ordering dependency, and gives us a descriptor that is
 // genuinely non-blocking, which is what makes the batched drain below possible.
 func openTUNNonblock(name string) (*os.File, string, error) {
+	return openTUNQueue(name, 0)
+}
+
+// openTUNQueue opens one queue of a TUN device. extraFlags carries IFF_MULTI_QUEUE when the
+// caller wants more than one; every queue of the same device is opened with the same name and
+// the same flags, and the kernel hands each its own share of the traffic.
+func openTUNQueue(name string, extraFlags uint16) (*os.File, string, error) {
 	fd, err := syscall.Open(devNetTun, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, "", &os.PathError{Op: "open", Path: devNetTun, Err: err}
 	}
 	var req ifReq
 	copy(req.Name[:], name)
-	req.Flags = iffTun | iffNoPI
+	req.Flags = iffTun | iffNoPI | extraFlags
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tunSetIff,
 		uintptr(unsafe.Pointer(&req))); errno != 0 {
 		syscall.Close(fd)
@@ -207,6 +215,61 @@ func openTUNNonblock(name string) (*os.File, string, error) {
 		return nil, "", os.ErrInvalid
 	}
 	return f, got, nil
+}
+
+// iffMultiQueue is IFF_MULTI_QUEUE from linux/if_tun.h: the device may be opened several
+// times over, each open becoming an independent queue the kernel load-balances across.
+const iffMultiQueue = 0x0100
+
+// openTUNMultiQueue opens n queues on one TUN device.
+//
+// Why this exists: the TUN device was the throughput ceiling, and it was a *software* one.
+// A single reader goroutine doing read -> seal -> send is one core's worth of work no matter
+// how many cores the box has, and on the reference link that capped a carrier at ~290 Mbit/s
+// against a 2.12 Gbit/s path — while the device itself dropped 301210 packets in ten seconds
+// because nothing was draining it fast enough. Changing the qdisc moved that by 4%; the queue
+// was never the problem, the single reader was.
+//
+// Multi-queue is the kernel's own answer: N file descriptors on the same device, each with its
+// own queue, distributed by flow hash. N readers then drain in parallel and every one of them
+// gets a whole core to work with. Nothing on the wire changes.
+//
+// Degrades cleanly: a kernel without IFF_MULTI_QUEUE fails on the first open and the caller
+// gets the single-queue device it has always had.
+func openTUNMultiQueue(name string, n int) ([]*os.File, string, error) {
+	if n < 1 {
+		n = 1
+	}
+	if n == 1 {
+		f, got, err := openTUNQueue(name, 0)
+		if err != nil {
+			return nil, "", err
+		}
+		return []*os.File{f}, got, nil
+	}
+	files := make([]*os.File, 0, n)
+	var ifname string
+	for i := 0; i < n; i++ {
+		f, got, err := openTUNQueue(name, iffMultiQueue)
+		if err != nil {
+			for _, x := range files {
+				x.Close()
+			}
+			if i == 0 {
+				// The kernel will not do multi-queue at all; fall back to one plain queue.
+				f1, got1, err1 := openTUNQueue(name, 0)
+				if err1 != nil {
+					return nil, "", err1
+				}
+				log.Printf("warning: TUN multi-queue unavailable (%v); using a single queue", err)
+				return []*os.File{f1}, got1, nil
+			}
+			return nil, "", err
+		}
+		ifname = got
+		files = append(files, f)
+	}
+	return files, ifname, nil
 }
 
 // tunReader wraps the device with a non-blocking drain used to fill a send batch.

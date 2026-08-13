@@ -95,8 +95,15 @@ log()  { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 #  the kernel picks a nexthop per flow with no idea that one carrier might fit
 #  fewer bytes than another, so a smaller MTU on one path would blackhole exactly
 #  the flows hashed onto it — a bug that only shows up under load.
+#  A note on the quic carrier's port. It ran on 1376 and was killed there: after ~33 GB on
+#  that one flow the pair (1376 -> 1376) stopped passing in BOTH directions, while the SAME
+#  destination port from any other source port kept working and the other three carriers were
+#  untouched. That is a 5-tuple block, not a port block — measured, 0 packets on 1376->1376
+#  against 18 and 15 delivered on 40606->1376 and 48584->1376 in the same window. Moving to a
+#  fresh pair restores it; if it recurs, `hop` (§8.3) is the standing answer, at the cost of
+#  send-side offload.
 PROTO_TABLE=(
-  "quic|udp|quic2|1376|tun0|10.8.0.1|10.8.0.2|24"
+  "quic|udp|quic2|19387|tun0|10.8.0.1|10.8.0.2|24"
   "dtls|udp|dtls|1378|mpdtls|10.9.1.5|10.9.1.6|30"
   "tls|tcp|quic|1377|mptls|10.9.1.9|10.9.1.10|30"
   "icmp|icmp|none|0|mpicmp|10.9.1.13|10.9.1.14|30"
@@ -257,6 +264,15 @@ if isinstance(c.get("dpi_log"),dict) and c["dpi_log"].get("enabled"):
 # a dead carrier rather than a misconfiguration.
 for b in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(b,{})["enabled"]=False
+
+# udp_rotate is the exception: it is ON for the UDP carriers, because the failure it prevents
+# is the one that actually happened here. The quic carrier ran on a fixed port pair, carried
+# ~33 GB, and that exact 5-tuple was then blocked in both directions while the same
+# destination port from any other source port kept working. Rotating our own source port on a
+# timer means no tuple ever accumulates enough to be worth blocking. It needs no coordination
+# (the peer follows by roaming) and never moves the destination port, so no firewall changes.
+# Meaningless on tcp (tcp_rotate does this job) and on icmp (no ports at all).
+c["udp_rotate"] = {"enabled": transport == "udp", "interval_sec": 900}
 
 # The ICMP sub-block MUST be byte-identical on both servers. mimic_ping prepends a
 # ping(8)-style timeval to the plaintext (icmp.go), so if one end mimics and the
