@@ -629,7 +629,7 @@ SNI را بازسازی کند. آن ترفند کار می‌کند چون DPI 
 +-- aestun live monitor -------------------------------+
   mode     : multipath    4/4 carriers up
   uptime   : 4h 48m       last RX: 0s ago   iface tun0: up
-  peer     : 185.126.14.202:1378
+  peer     : 1gagee3233234285222212a6.14.2aasd02:1378
 +-- traffic (all carriers) ----------------------------+
   TX :      4.36 GB  (0 B/s)  packets: 6154870
   RX :      7.18 GB  (0 B/s)  packets: 8128375
