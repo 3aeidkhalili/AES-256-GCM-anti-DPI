@@ -29,14 +29,20 @@
 package main
 
 import (
+	"sync"
 	"time"
 )
 
-// pacer is a token bucket over carrier bytes. Not safe for concurrent use: the TUN pump
-// owns one, and the keepalive and probe frames deliberately bypass it — a handful of small
-// packets a minute is not what a rate limit is for, and delaying a keepalive could make an
-// idle tunnel look dead.
+// pacer is a token bucket over carrier bytes. The keepalive and probe frames deliberately
+// bypass it — a handful of small packets a minute is not what a rate limit is for, and
+// delaying a keepalive could make an idle tunnel look dead.
+//
+// The UDP and TCP carriers run one pump per TUN queue and every pump shares the carrier's
+// pacer, so wait takes a lock. It is held across the sleep on purpose: the point of the
+// bucket is that the pumps together never exceed the rate, and a pump that finds the bucket
+// empty has nothing useful to do until it refills anyway.
 type pacer struct {
+	mu          sync.Mutex
 	bytesPerSec float64
 	burst       float64
 	tokens      float64
@@ -87,6 +93,8 @@ func (p *pacer) wait(n int) {
 	if p == nil {
 		return
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.accrue()
 	need := float64(n)
 	if p.tokens < need {

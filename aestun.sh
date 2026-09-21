@@ -5,7 +5,8 @@
 #    sudo ./aestun.sh              # management menu (default)
 #    sudo ./aestun.sh install      # interactive installer (run on each server)
 #    ./aestun.sh build [amd64|arm64]   # cross-compile a static binary (dev machine)
-#    ./aestun.sh zap-rule {add|del|rearm}   # NFQUEUE helper, invoked by systemd
+#    ./aestun.sh zap-rule {add|del|rearm} [NAME]   # NFQUEUE helper, invoked by systemd
+#    sudo ./aestun.sh peer ...      # multi-location: one foreign <-> many Iran servers
 #
 #  Replaces the former install.sh / menu.sh / lib.sh / build.sh / zapret-rules.sh.
 # =============================================================================
@@ -699,9 +700,9 @@ interactive_setup() {
   fi
 
   write_config
-  write_service
+  [[ -z "$PEER" ]] && write_service   # a location runs from the aestun@ template
   systemctl daemon-reload
-  systemctl enable --now aestun >/dev/null 2>&1 && msg "Service enabled and started."
+  systemctl enable --now "$UNIT" >/dev/null 2>&1 && msg "Service enabled and started."
   if [[ "$CFG_TRANSPORT" == "icmp" ]]; then
     open_firewall_icmp
   else
@@ -737,7 +738,7 @@ d.setdefault("min_ttl",3); d.setdefault("max_ttl",20); d.setdefault("badsum",Fal
 json.dump(c,open(p,"w"),indent=2)
 PY
       chmod 600 "$CONF"
-      systemctl restart aestun >/dev/null 2>&1 && msg "native ICMP desync enabled."
+      systemctl restart "$UNIT" >/dev/null 2>&1 && msg "native ICMP desync enabled."
     fi
   else
     printf '%sDPI desync (zapret/nfqws) on the carrier port%s — recommended, on by default.\n' "$BOLD" "$N"
@@ -771,7 +772,7 @@ PY
   return 0
 }
 # ------------------------------------------------------------------ service control
-svc() { systemctl "$1" aestun && msg "service: $1 done." || err "operation '$1' failed."; }
+svc() { systemctl "$1" "$UNIT" && msg "service: $1 done." || err "operation '$1' failed."; }
 
 service_menu() {
   while true; do
@@ -793,7 +794,7 @@ EOF
       3) svc restart ;;
       4) svc enable ;;
       5) svc disable ;;
-      6) systemctl --no-pager status aestun | head -n 20 ;;
+      6) systemctl --no-pager status "$UNIT" | head -n 20 ;;
       0) return ;;
       *) warn "invalid option" ;;
     esac
@@ -882,6 +883,8 @@ stats_files() {
 # The data sink is a test harness, not the tunnel, so it is left out.
 aestun_units() {
   local u out=0
+  # Inside a location only that location's process is "the tunnel".
+  [[ -n "$PEER" ]] && { printf '%s.service\n' "$UNIT"; return; }
   while read -r u; do
     [[ -z "$u" || "$u" == aestun-mp-sink.service ]] && continue
     printf '%s\n' "$u"; out=1
@@ -1169,7 +1172,7 @@ show_logs() {
 edit_config() {
   [[ -f "$CONF" ]] || { err "No config present."; pause; return; }
   "${EDITOR:-nano}" "$CONF"
-  if confirm "Restart the service to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
+  if confirm "Restart the service to apply changes?"; then systemctl restart "$UNIT" && msg "restarted."; fi
   pause
 }
 
@@ -1441,6 +1444,14 @@ uninstall_all() {
   local port; port="$(json_get "$CONF" listen)"; port="${port##*:}"
   local iface; iface="$(json_get "$CONF" tun_name)"; iface="${iface:-tun0}"
   systemctl disable --now aestun >/dev/null 2>&1 || true
+  local pn
+  while read -r pn; do
+    [[ -n "$pn" ]] || continue
+    systemctl disable --now "$(peer_unit "$pn")" "aestun-zapret@$pn" >/dev/null 2>&1 || true
+    use_peer "$pn"; zap_rule del 2>/dev/null || true; use_peer ""
+    ip link del "$(json_get "$(peer_conf "$pn")" tun_name)" 2>/dev/null || true
+  done < <(peer_names)
+  rm -f "$PEER_UNIT_TMPL" "$PEER_ZAP_TMPL"
   zap_rule del 2>/dev/null || true
   systemctl disable --now aestun-zapret >/dev/null 2>&1 || true
   rm -f "$SERVICE" "$ZAP_SERVICE" "$ZAP_RULES" "$BIN_DST"
@@ -1504,7 +1515,7 @@ PY
   fi
   chmod 600 "$CONF"
   msg "dpi_log.enabled = $want"
-  if ask_yn "Restart aestun now to apply" "Y"; then systemctl restart aestun && msg "restarted."; fi
+  if ask_yn "Restart aestun now to apply" "Y"; then systemctl restart "$UNIT" && msg "restarted."; fi
 }
 
 dpi_menu() {
@@ -1536,7 +1547,7 @@ EOF
       3) clear
          printf '%s\n' "${D}streaming findings — Ctrl-C to stop${N}"
          # journalctl carries the same lines because the daemon mirrors non-info events there.
-         journalctl -u aestun -f -o cat 2>/dev/null | grep --line-buffered '\[dpi\]' ;;
+         journalctl -u "$UNIT" -f -o cat 2>/dev/null | grep --line-buffered '\[dpi\]' ;;
       4) clear; tail -f "$lp" ;;
       5) dpi_selftest ;;
       6) if dpi_enabled_in_cfg; then dpi_set_enabled false; else dpi_set_enabled true; fi; pause ;;
@@ -1719,7 +1730,7 @@ EOF
       6) icmp_toggle mimic_ping
          warn "Ping mimicry must match on BOTH servers, or every packet fails to authenticate." ;;
       7) icmp_toggle suppress_replies ;;
-      0) if confirm "Restart aestun now to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
+      0) if confirm "Restart aestun now to apply changes?"; then systemctl restart "$UNIT" && msg "restarted."; fi
          return ;;
       *) warn "invalid option"; sleep 1 ;;
     esac
@@ -1773,7 +1784,7 @@ EOF
       case "$ic" in
         1) if [[ "$st" == *desync=on* ]]; then antidpi_set desync false; else antidpi_set desync true; fi ;;
         2) if [[ "$st" == *junk=on* ]]; then antidpi_set junk false; else antidpi_set junk true; fi ;;
-        0) if confirm "Restart aestun now to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
+        0) if confirm "Restart aestun now to apply changes?"; then systemctl restart "$UNIT" && msg "restarted."; fi
            return ;;
         *) warn "invalid option"; sleep 1 ;;
       esac
@@ -1811,7 +1822,7 @@ EOF
       4) if [[ "$state" == *split=on* ]]; then antidpi_set split false; else antidpi_set split true; fi ;;
       5) antidpi_set_hop_ports ;;
       6) antidpi_set_obfs; pause ;;
-      0) if confirm "Restart aestun now to apply changes?"; then systemctl restart aestun && msg "restarted."; fi
+      0) if confirm "Restart aestun now to apply changes?"; then systemctl restart "$UNIT" && msg "restarted."; fi
          return ;;
       *) warn "invalid option"; sleep 1 ;;
     esac
@@ -1849,6 +1860,7 @@ autotest() {
   local RSCP="sshpass -f $pwf scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
   if ! $RSSH 'echo ok' >/dev/null 2>&1; then err "SSH to foreign failed."; shred -u "$pwf" 2>/dev/null||rm -f "$pwf"; pause; return; fi
   msg "SSH to foreign OK."
+  [[ -n "$PEER" ]] && ! $RSSH "test -f $RCONF" >/dev/null 2>&1 && RCONF="/etc/aestun/config.json"
 
   # --- throughput measurement: make sure it can actually run -------------------------------
   # The Mbit/s column is produced by iperf3 running ACROSS the tunnel (client here, server on
@@ -1878,7 +1890,10 @@ autotest() {
   fi
 
   # remote config path (assume the same /etc/aestun/config.json)
-  local RCONF="/etc/aestun/config.json"
+  # The far end mirrors this host's layout: a location lives at the same peers/NAME.json there —
+  # unless the far end runs it as its stock single tunnel (an Iran server with one foreign
+  # peer usually does), in which case config.json is the one facing us.
+  local RCONF="$CONF"
   # back up both configs
   cp -a "$CONF" "${CONF}.autotest.bak"
   $RSSH "cp -a $RCONF ${RCONF}.autotest.bak" >/dev/null 2>&1
@@ -1946,8 +1961,8 @@ m(c,o); json.dump(c,sys.stdout)
 PY
     $RSSH "cp ${RCONF}.try $RCONF" >/dev/null 2>&1
     printf '%s testing %-20s%s ' "$D" "$name" "$N"
-    $RSSH 'systemctl restart aestun' >/dev/null 2>&1
-    systemctl restart aestun >/dev/null 2>&1
+    $RSSH "systemctl restart $UNIT" >/dev/null 2>&1
+    systemctl restart "$UNIT" >/dev/null 2>&1
     # wait up to ~16s for rx to climb
     local up=0 r1 r2 i
     for i in 1 2 3 4 5 6 7 8; do
@@ -2094,18 +2109,18 @@ PY
       autotest_merge "${CONF}.autotest.bak" "$best_over" "$CONF"
       $RSSH "$(autotest_merge_remote_cmd "${RCONF}.autotest.bak" "$best_over" "$RCONF")" >/dev/null 2>&1
       chmod 600 "$CONF"; $RSSH "chmod 600 $RCONF" >/dev/null 2>&1
-      $RSSH 'systemctl restart aestun' >/dev/null 2>&1; systemctl restart aestun >/dev/null 2>&1
+      $RSSH "systemctl restart $UNIT" >/dev/null 2>&1; systemctl restart "$UNIT" >/dev/null 2>&1
       msg "Applied. The tunnel is now running: ${best_name}."
       echo "Enabled: $(jq -c '{transport,obfs,desync:.desync.enabled,split:.split.enabled,junk:.junk.enabled,hop:.hop.enabled,tcp_rotate:.tcp_rotate.enabled}' "$CONF")"
     else
       cp "${CONF}.autotest.bak" "$CONF"; $RSSH "cp ${RCONF}.autotest.bak $RCONF" >/dev/null 2>&1
-      $RSSH 'systemctl restart aestun' >/dev/null 2>&1; systemctl restart aestun >/dev/null 2>&1
+      $RSSH "systemctl restart $UNIT" >/dev/null 2>&1; systemctl restart "$UNIT" >/dev/null 2>&1
       warn "Reverted to the pre-test config on both ends."
     fi
   else
     err "No variant came up cleanly; reverting."
     cp "${CONF}.autotest.bak" "$CONF"; $RSSH "cp ${RCONF}.autotest.bak $RCONF" >/dev/null 2>&1
-    $RSSH 'systemctl restart aestun' >/dev/null 2>&1; systemctl restart aestun >/dev/null 2>&1
+    $RSSH "systemctl restart $UNIT" >/dev/null 2>&1; systemctl restart "$UNIT" >/dev/null 2>&1
   fi
   shred -u "$pwf" 2>/dev/null || rm -f "$pwf"
   rm -f "${CONF}.try" "${CONF}.best" "$RESULTFILE"
@@ -2152,8 +2167,9 @@ PY
 
 status_line() {
   local st ins peer tr ob
-  st="$(svc_active aestun)"
+  st="$(svc_active "$UNIT")"
   ins="not configured"; [[ -f "$CONF" ]] && ins="configured"
+  [[ -n "$PEER" ]] && ins="location: ${BOLD}${PEER}${N}${D} (${UNIT}.service)"
   local st_c="$R"; [[ "$st" == active ]] && st_c="$G"
   peer="$(json_get "$CONF" peer 2>/dev/null)"
   # The wire format is the thing most likely to be wrong (it has to match on both ends and
@@ -2240,11 +2256,12 @@ main_menu() {
   ${C}i${N}) ICMP carrier settings      <- readers / batching / id rotation / ping mimicry
   ${C}t${N}) Auto-test methods          <- sweep every method/protocol, apply the best (§16)
   ${C}m${N}) Multi-protocol tunnel      <- run 4 carriers at once: failover + multipath (§19)
+  ${C}p${N}) Locations (multi-peer)     <- one foreign server to many Iran servers, or the reverse
   ${C}z${N}) zapret module (DPI bypass)
   ${C}u${N}) Uninstall tunnel
   ${C}0${N}) Exit
 EOF
-    local __c; __c="$(ask 'Choose' '')" || { clear; exit 0; }
+    local __c; __c="$(ask 'Choose' '')" || { [[ -n "$PEER" ]] && return; clear; exit 0; }
     case "$__c" in
       1) interactive_setup; pause ;;
       2) monitor ;;
@@ -2262,9 +2279,10 @@ EOF
       i|I) icmp_menu ;;
       t|T) autotest ;;
       m|M) multipath_menu ;;
+      p|P) if [[ -n "$PEER" ]]; then warn "already inside location '$PEER'"; sleep 1; else peers_menu; fi ;;
       z|Z) zapret_menu ;;
       u|U) uninstall_all ;;
-      0) clear; exit 0 ;;
+      0) [[ -n "$PEER" ]] && return; clear; exit 0 ;;
       *) warn "invalid option"; sleep 1 ;;
     esac
   done
@@ -2551,6 +2569,12 @@ PY
     confirm "Restart aestun now anyway" || { warn "Not restarting. Run: systemctl restart aestun"; return 0; }
   fi
   systemctl restart aestun && msg "aestun restarted." || err "restart failed — see: journalctl -u aestun -n 50"
+  # Locations run the same binary; refresh their templates and roll them too.
+  local pn
+  if [[ -n "$(peer_names)" ]]; then
+    write_peer_units
+    while read -r pn; do [[ -n "$pn" ]] && { systemctl restart "$(peer_unit "$pn")" && msg "location '$pn' restarted." || err "location '$pn' failed to restart"; }; done < <(peer_names)
+  fi
   sleep 2
   systemctl is-active --quiet aestun && msg "service is active." || {
     err "service is not active. Roll back with:"
@@ -2581,10 +2605,485 @@ BANNER
 }
 
 # =============================================================================
+#  Multi-location peers — one foreign server to several Iran servers (or the reverse)
+# =============================================================================
+#  The daemon is deliberately one process per peer: each location gets its own key, TUN
+#  device, subnet, stats file and DPI log, and one location breaking or being throttled
+#  cannot touch the others. What was missing was the management layer, so a second
+#  location used to be a hand-written unit next to the stock one. This section gives every
+#  extra location a NAME and drives it through systemd templates:
+#
+#    config   /etc/aestun/peers/NAME.json          (same schema as config.json)
+#    unit     aestun@NAME.service                   (one template, N instances)
+#    stats    /run/aestun/peers/NAME/stats.json
+#    dpi log  /var/log/aestun/peers/NAME/dpi.jsonl
+#    zapret   aestun-zapret@NAME.service            (queues the peer's flow into the shared
+#                                                    nfqws; armed by the NAME.zapret marker)
+#    shaping  /etc/aestun/peers/NAME.shape          (Mbit/s; cake on the peer's TUN — see
+#                                                    'peer shape', measured with 'peer sweep')
+#
+#  The stock single tunnel (config.json / aestun.service) is untouched and keeps working as
+#  the "default" location, so existing installs migrate nothing. Every menu that acts on
+#  "the tunnel" (monitor, DPI log, anti-DPI, zapret, auto-test, service) can be pointed at a
+#  peer with use_peer, which re-targets the handful of globals they read.
+#
+#  Naming rule: a location has the SAME name on both ends. 'peer push' relies on it to find
+#  the far end's config, and it keeps "which tunnel is this" unambiguous in every log.
+PEER_DIR="${CONF_DIR}/peers"
+PEER_UNIT_TMPL="/etc/systemd/system/aestun@.service"
+PEER_ZAP_TMPL="/etc/systemd/system/aestun-zapret@.service"
+PEER=""                      # empty = the stock single tunnel
+UNIT="aestun"                # systemd unit the menus act on; use_peer swaps it
+
+peer_conf()  { printf '%s/%s.json' "$PEER_DIR" "$1"; }
+peer_unit()  { printf 'aestun@%s' "$1"; }
+peer_stats() { printf '/run/aestun/peers/%s/stats.json' "$1"; }
+peer_dpilog(){ printf '/var/log/aestun/peers/%s/dpi.jsonl' "$1"; }
+peer_valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; }
+peer_exists() { [[ -f "$(peer_conf "$1")" ]]; }
+
+# peer_names — every configured location, sorted.
+peer_names() {
+  local f
+  for f in "$PEER_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    f="${f##*/}"; printf '%s\n' "${f%.json}"
+  done
+}
+
+# use_peer NAME — point the manager's globals at one location. With an empty NAME it goes
+# back to the stock tunnel. Everything downstream (monitor, dpi_menu, antidpi_menu,
+# zap_rule, autotest, service_menu) reads these and needs no other change.
+use_peer() {
+  PEER="${1:-}"
+  if [[ -z "$PEER" ]]; then
+    CONF="${CONF_DIR}/config.json"; UNIT="aestun"
+    STATS="/run/aestun/stats.json"; DPI_LOG="/var/log/aestun/dpi.jsonl"
+  else
+    CONF="$(peer_conf "$PEER")"; UNIT="$(peer_unit "$PEER")"
+    STATS="$(peer_stats "$PEER")"; DPI_LOG="$(peer_dpilog "$PEER")"
+  fi
+}
+
+# write_peer_units — the two templates. Idempotent; called by peer add/import and upgrade.
+write_peer_units() {
+  cat > "$PEER_UNIT_TMPL" <<EOF
+[Unit]
+Description=aestun location %i - obfuscated server-to-server tunnel
+After=network-online.target
+Wants=network-online.target
+# Optional per-location zapret rules; the instance is skipped unless its marker exists.
+Wants=aestun-zapret@%i.service
+After=aestun-zapret@%i.service
+
+[Service]
+Type=simple
+ExecStart=${BIN_DST} -config ${PEER_DIR}/%i.json
+# Shaping for this location, if /etc/aestun/peers/%i.shape exists (see 'peer shape').
+ExecStartPost=${MGR_DST} peer-qdisc %i
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+RuntimeDirectory=aestun/peers/%i
+RuntimeDirectoryPreserve=yes
+LogsDirectory=aestun/peers/%i
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$PEER_ZAP_TMPL" <<EOF
+[Unit]
+Description=aestun-zapret rules for location %i (queues its carrier into the shared nfqws)
+# The shared nfqws (aestun-zapret.service) is started by 'zapret enable' on the stock
+# tunnel; its second profile (--dpi-desync-any-protocol) covers every carrier port.
+After=aestun-zapret.service
+BindsTo=aestun-zapret.service
+Before=aestun@%i.service
+ConditionPathExists=${PEER_DIR}/%i.zapret
+ConditionPathExists=${ZAP_SERVICE}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${MGR_DST} zap-rule add %i
+ExecStartPost=${MGR_DST} zap-rule rearm %i
+ExecStop=${MGR_DST} zap-rule del %i
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# peer_qdisc NAME — systemd path (ExecStartPost). Applies cake on the location's TUN when
+# a .shape file names a rate; a no-op otherwise so the unit never fails because of it.
+peer_qdisc() {
+  local name="$1" f dev mbit i
+  f="$PEER_DIR/$name.shape"
+  [[ -s "$f" ]] || return 0
+  read -r mbit < "$f"; [[ "$mbit" =~ ^[0-9]+$ && "$mbit" -gt 0 ]] || return 0
+  dev="$(json_get "$(peer_conf "$name")" tun_name)"; [[ -n "$dev" ]] || return 0
+  # The daemon creates the device a moment after it starts; wait for it.
+  for i in $(seq 1 50); do ip link show "$dev" >/dev/null 2>&1 && break; sleep 0.2; done
+  ip link show "$dev" >/dev/null 2>&1 || return 0
+  # overhead 40: what the carrier adds to each inner packet on the wire (outer IP/UDP +
+  # obfs header + sequence + AEAD tag), measured at 1339 bytes for a 1300-byte TUN packet.
+  # 'flows' shares the rate per inner connection, so one download cannot starve the rest.
+  tc qdisc replace dev "$dev" root cake bandwidth "${mbit}mbit" diffserv3 flows nonat overhead 40 mpu 64 rtt 100ms 2>/dev/null \
+    || tc qdisc replace dev "$dev" root tbf rate "${mbit}mbit" burst 64k latency 50ms 2>/dev/null || true
+  # A long device queue in front of the shaper is pure latency; 300 packets is ~25 ms at 135 Mbit/s.
+  ip link set dev "$dev" txqueuelen 300 2>/dev/null || true
+  return 0
+}
+
+# ------------------------------------------------------------------ allocation
+# The next free UDP port / subnet / TUN device across the stock config and every peer, so
+# adding a location never collides with one that exists.
+_peer_all_confs() { [[ -f "${CONF_DIR}/config.json" ]] && printf '%s\n' "${CONF_DIR}/config.json"; local f; for f in "$PEER_DIR"/*.json; do [[ -f "$f" ]] && printf '%s\n' "$f"; done; }
+_peer_used() { # _peer_used KEY -> values of KEY across all configs
+  local f; while read -r f; do json_get "$f" "$1"; done < <(_peer_all_confs)
+}
+peer_next_port() {
+  local used p; used="$(_peer_used listen | sed 's/.*://'; _peer_used peer | sed 's/.*://')"
+  for p in $(seq 9091 9199); do grep -qx "$p" <<<"$used" || { printf '%s' "$p"; return; }; done
+  printf '9091'
+}
+peer_next_subnet() { # -> third octet N of 10.8.N.0/24
+  local used n; used="$(_peer_used local_ip | awk -F. '{print $3}')"
+  for n in $(seq 1 250); do grep -qx "$n" <<<"$used" || { printf '%s' "$n"; return; }; done
+  printf '1'
+}
+peer_next_tun() {
+  local used n; used="$(_peer_used tun_name)"
+  for n in $(seq 1 99); do grep -qx "tun$n" <<<"$used" && continue; ip link show "tun$n" >/dev/null 2>&1 && continue; printf 'tun%s' "$n"; return; done
+  printf 'tun1'
+}
+# The address this host is reached at, offered as the default for the far end's "peer".
+peer_my_ip() {
+  local ip; ip="$(curl -4 -s -m 4 https://ifconfig.me 2>/dev/null || true)"
+  [[ "$ip" =~ ^[0-9.]+$ ]] || ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
+  printf '%s' "$ip"
+}
+
+# peer_write_config NAME ROLE KEY PORT PEERHOSTPORT TUN LOCALIP PEERIP TEMPLATE
+# The wire settings (cipher, obfs, sni, mtu, pad, keepalive, anti-DPI modules...) are
+# copied from TEMPLATE (normally this host's stock config, so a new location behaves like
+# the one already proven to work) and the identity fields are replaced.
+peer_write_config() {
+  local name="$1" role="$2" key="$3" port="$4" peer="$5" tun="$6" lip="$7" pip="$8" tmpl="$9"
+  mkdir -p "$PEER_DIR"
+  python3 - "$tmpl" "$(peer_conf "$name")" "$role" "$key" "$port" "$peer" "$tun" "$lip" "$pip" "$(peer_stats "$name")" "$(peer_dpilog "$name")" <<'PY'
+import json, sys
+tmpl, out, role, key, port, peer, tun, lip, pip, stats, dlog = sys.argv[1:12]
+try:
+    c = json.load(open(tmpl))
+except Exception:
+    c = {"cipher": "chacha20-poly1305", "transport": "udp", "obfs": "quic2", "sni": "www.cloudflare.com",
+         "mtu": 1300, "txqueuelen": 1000, "rcvbuf": 8388608, "sndbuf": 8388608, "pad_max": 64,
+         "rekey_interval": 3600, "keepalive": 25, "dpi_log": {"enabled": True, "probe": True}}
+c.update({"role": role, "key": key, "listen": "0.0.0.0:%s" % port, "peer": peer, "tun_name": tun,
+          "local_ip": lip, "peer_ip": pip, "manage_ip": True, "stats_path": stats})
+c.setdefault("dpi_log", {})["path"] = dlog
+c.pop("rate_mbps", None)   # shaping is per location; set it with 'peer shape'
+json.dump(c, open(out, "w"), indent=2); open(out, "a").write("\n")
+PY
+  chmod 600 "$(peer_conf "$name")"
+}
+
+# peer_mirror NAME OUT MYIP — the far end's config for this location: roles and tunnel
+# addresses swapped, "peer" pointing back at this host, same key/port/wire settings.
+peer_mirror() {
+  local name="$1" out="$2" myip="$3"
+  python3 - "$(peer_conf "$name")" "$out" "$myip" "$(peer_stats "$name")" "$(peer_dpilog "$name")" <<'PY'
+import json, sys
+src, out, myip, stats, dlog = sys.argv[1:6]
+c = json.load(open(src))
+port = c["listen"].rsplit(":", 1)[1]
+c["role"] = "a" if c["role"] == "b" else "b"
+c["local_ip"], c["peer_ip"] = c["peer_ip"] + "/" + c["local_ip"].split("/")[1], c["local_ip"].split("/")[0]
+c["peer"] = "%s:%s" % (myip, port)
+c["stats_path"] = stats
+c.setdefault("dpi_log", {})["path"] = dlog
+c.pop("rate_mbps", None)
+json.dump(c, open(out, "w"), indent=2); open(out, "a").write("\n")
+PY
+}
+
+# ------------------------------------------------------------------ commands
+peer_add() {
+  need_root
+  # An installed binary is all a new location needs; only build/fetch one when there is none.
+  [[ -x "$BIN_DST" ]] || ensure_binary || return 1
+  install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true
+  hdr "Add a location"
+  local name="${1:-}"
+  while :; do
+    [[ -n "$name" ]] || name="$(ask 'Location name (same on both ends, e.g. ir2, tehran, de1)' '')" || return 1
+    peer_valid_name "$name" || { err "name: lowercase letters, digits, dashes"; name=""; continue; }
+    peer_exists "$name" && { err "location '$name' already exists"; name=""; continue; }
+    break
+  done
+  local drole="b" tmpl="${CONF_DIR}/config.json"
+  [[ -f "$tmpl" ]] && drole="$(json_get "$tmpl" role)"; drole="${drole:-b}"
+  local role; role="$(ask "This server's role for '$name' (a = Iran/inside, b = foreign/outside)" "$drole")"
+  [[ "$role" == a || "$role" == b ]] || { err "role must be a or b"; return 1; }
+  local host; host="$(ask_req 'Far end public IP / host')" || return 1
+  local port; port="$(ask 'UDP port (same on both ends)' "$(peer_next_port)")"; is_port "$port" || { err "bad port"; return 1; }
+  local n; n="$(peer_next_subnet)"
+  local sub; sub="$(ask 'Tunnel subnet (/24)' "10.8.${n}.0/24")"
+  local base="${sub%.*}"; [[ "$sub" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.0/24$ ]] || { err "subnet must look like 10.8.${n}.0/24"; return 1; }
+  local lip pip
+  if [[ "$role" == a ]]; then lip="${base}.1/24"; pip="${base}.2"; else lip="${base}.2/24"; pip="${base}.1"; fi
+  local tun; tun="$(ask 'TUN device' "$(peer_next_tun)")"
+  local key; key="$(ask 'Shared key (Enter = generate; paste the far end'"'"'s if it was made there)' '')"
+  [[ -n "$key" ]] || key="$("$BIN_DST" keygen)"
+  [[ -f "$tmpl" ]] && msg "wire settings (cipher/obfs/sni/mtu/anti-DPI) copied from ${tmpl}"
+  peer_write_config "$name" "$role" "$key" "$port" "${host}:${port}" "$tun" "$lip" "$pip" "$tmpl"
+  write_peer_units
+  open_firewall "$port"
+  # Inherit the stock tunnel's zapret choice: if it is armed there, arm it here too.
+  systemctl is-enabled -q aestun-zapret 2>/dev/null && : > "$PEER_DIR/$name.zapret"
+  systemctl enable --now "$(peer_unit "$name")" >/dev/null 2>&1 && msg "location '$name' started: $(peer_unit "$name").service" \
+    || { err "failed to start $(peer_unit "$name") — journalctl -u $(peer_unit "$name") -n 30"; return 1; }
+  printf '\n  key for the far end:  %s%s%s\n' "$BOLD" "$key" "$N"
+  printf '  far end config:       peer %s:%s  role %s  local_ip %s  peer_ip %s  tun %s\n\n' "$(peer_my_ip)" "$port" "$([[ $role == a ]] && echo b || echo a)" "${pip}/24" "${lip%/*}" "$tun"
+  if ask_yn "Configure the far end over SSH now (copies binary + config, starts it)" "Y"; then
+    peer_push "$name" "$host"
+  else
+    warn "Run on the far end:  aestun.sh peer import $name <config.json>   (or add it there with the values above)"
+  fi
+}
+
+# peer_push NAME [HOST] — install this location on the far end over SSH, mirrored.
+peer_push() {
+  need_root
+  local name="$1"; peer_exists "$name" || { err "no location '$name'"; return 1; }
+  ensure_deps >/dev/null 2>&1 || true
+  command -v sshpass >/dev/null 2>&1 || { err "sshpass is required (apt-get install sshpass)"; return 1; }
+  local dhost="${2:-}"; [[ -n "$dhost" ]] || { dhost="$(json_get "$(peer_conf "$name")" peer)"; dhost="${dhost%:*}"; }
+  local fhost fuser fpass myip
+  fhost="$(ask 'Far end SSH host' "$dhost")"; fuser="$(ask 'SSH user' 'root')"
+  printf '%sSSH password%s (hidden): ' "$W" "$N"; read -rs fpass; printf '\n'
+  myip="$(ask 'This host'"'"'s public IP as seen from the far end' "$(peer_my_ip)")"
+  local pwf; pwf="$(mktemp)"; chmod 600 "$pwf"; printf '%s\n' "$fpass" > "$pwf"
+  local SSH="sshpass -f $pwf ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12 $fuser@$fhost"
+  local SCP="sshpass -f $pwf scp -q -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12"
+  local rc=1 mir; mir="$(mktemp)"
+  if ! $SSH 'echo ok' >/dev/null 2>&1; then err "SSH to $fhost failed."; else
+    peer_mirror "$name" "$mir" "$myip"
+    msg "SSH ok; copying binary, manager and config..."
+    $SCP "$BIN_DST" "$fuser@$fhost:/tmp/aestun.bin" && $SCP "$SELF" "$fuser@$fhost:/tmp/aestun-mgr" \
+      && $SCP "$mir" "$fuser@$fhost:/tmp/aestun-peer-$name.json" \
+      && $SSH "install -m 0755 /tmp/aestun-mgr $MGR_DST && ( [ -x $BIN_DST ] || install -m 0755 /tmp/aestun.bin $BIN_DST ) && rm -f /tmp/aestun-mgr /tmp/aestun.bin && $MGR_DST peer import $name /tmp/aestun-peer-$name.json && rm -f /tmp/aestun-peer-$name.json" \
+      && rc=0
+    if (( rc == 0 )); then
+      msg "far end configured and started."
+      sleep 3; local pip; pip="$(json_get "$(peer_conf "$name")" peer_ip)"
+      if ping -c 3 -W 2 "$pip" >/dev/null 2>&1; then msg "tunnel '$name' is up: $pip answers through it."; else warn "no answer from $pip yet — check both firewalls for udp/$(json_get "$(peer_conf "$name")" listen | sed 's/.*://')"; fi
+    else err "remote install failed."; fi
+  fi
+  shred -u "$pwf" 2>/dev/null || rm -f "$pwf"; rm -f "$mir"
+  return $rc
+}
+
+# peer_import NAME FILE — install a ready config (from 'peer push' or by hand) as a location.
+peer_import() {
+  need_root
+  local name="$1" src="$2"
+  peer_valid_name "$name" || { err "bad location name '$name'"; return 1; }
+  [[ -f "$src" ]] || { err "no such file: $src"; return 1; }
+  [[ -x "$BIN_DST" ]] || ensure_binary || { err "aestun binary missing at $BIN_DST"; return 1; }
+  install -m 0755 "$SELF" "$MGR_DST" 2>/dev/null || true
+  mkdir -p "$PEER_DIR"
+  python3 - "$src" "$(peer_conf "$name")" "$(peer_stats "$name")" "$(peer_dpilog "$name")" <<'PY' || { err "config is not valid JSON"; return 1; }
+import json, sys
+src, out, stats, dlog = sys.argv[1:5]
+c = json.load(open(src))
+c["stats_path"] = stats; c.setdefault("dpi_log", {})["path"] = dlog; c["manage_ip"] = True
+json.dump(c, open(out, "w"), indent=2); open(out, "a").write("\n")
+PY
+  chmod 600 "$(peer_conf "$name")"
+  write_peer_units
+  local port; port="$(json_get "$(peer_conf "$name")" listen)"; port="${port##*:}"; [[ -n "$port" ]] && open_firewall "$port"
+  systemctl is-enabled -q aestun-zapret 2>/dev/null && : > "$PEER_DIR/$name.zapret"
+  systemctl enable --now "$(peer_unit "$name")" >/dev/null 2>&1 && msg "location '$name' started." || { err "failed to start $(peer_unit "$name")"; return 1; }
+}
+
+peer_del() {
+  need_root
+  local name="$1"; peer_exists "$name" || { err "no location '$name'"; return 1; }
+  confirm "Remove location '$name' (service, config, rules; the far end is not touched)" || return 1
+  local port tun; port="$(json_get "$(peer_conf "$name")" listen)"; port="${port##*:}"; tun="$(json_get "$(peer_conf "$name")" tun_name)"
+  systemctl disable --now "$(peer_unit "$name")" "aestun-zapret@$name" >/dev/null 2>&1 || true
+  use_peer "$name"; zap_rule del >/dev/null 2>&1 || true; use_peer ""
+  rm -f "$(peer_conf "$name")" "$PEER_DIR/$name.zapret" "$PEER_DIR/$name.shape"
+  [[ -n "$tun" ]] && ip link del "$tun" 2>/dev/null || true
+  [[ -n "$port" ]] && close_firewall "$port"
+  systemctl daemon-reload
+  msg "location '$name' removed."
+}
+
+# peer_shape NAME MBIT|off — cake on the location's TUN, applied now and on every start.
+# The number comes from 'peer sweep': the rate just under where the path starts losing.
+peer_shape() {
+  need_root
+  local name="$1" v="${2:-}"; peer_exists "$name" || { err "no location '$name'"; return 1; }
+  local dev; dev="$(json_get "$(peer_conf "$name")" tun_name)"
+  if [[ "$v" == off || "$v" == 0 ]]; then
+    rm -f "$PEER_DIR/$name.shape"; tc qdisc del dev "$dev" root 2>/dev/null || true
+    msg "shaping off for '$name'."; return 0
+  fi
+  [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 ]] || { err "usage: peer shape NAME <Mbit/s|off>"; return 1; }
+  printf '%s\n' "$v" > "$PEER_DIR/$name.shape"
+  peer_qdisc "$name" && msg "'$name' shaped to ${v} Mbit/s on $dev (cake, per-flow fair)."
+  tc qdisc show dev "$dev" | head -1
+}
+
+# peer_zapret NAME on|off — arm/disarm the per-location NFQUEUE rules.
+peer_zapret() {
+  need_root
+  local name="$1" v="${2:-on}"; peer_exists "$name" || { err "no location '$name'"; return 1; }
+  if [[ "$v" == on ]]; then
+    [[ -f "$ZAP_SERVICE" ]] || { err "enable zapret on the stock tunnel first (menu z) — it runs the shared nfqws"; return 1; }
+    : > "$PEER_DIR/$name.zapret"; write_peer_units
+    systemctl enable --now "aestun-zapret@$name" >/dev/null 2>&1 && msg "zapret armed for '$name'." || err "could not start aestun-zapret@$name"
+  else
+    systemctl disable --now "aestun-zapret@$name" >/dev/null 2>&1 || true
+    rm -f "$PEER_DIR/$name.zapret"; msg "zapret disarmed for '$name'."
+  fi
+}
+
+# peer_sweep NAME — find the loss cliff toward the far end: UDP through the tunnel at
+# rising rates via iperf3 (started on the far end over SSH). Prints delivered/loss per step
+# and suggests a 'peer shape' value. This is how the 150 Mbit/s policer on one Iran path
+# was found; TCP alone never shows it.
+peer_sweep() {
+  need_root
+  local name="${1:-}"; local conf="$CONF"
+  [[ -n "$name" ]] && { peer_exists "$name" || { err "no location '$name'"; return 1; }; conf="$(peer_conf "$name")"; }
+  command -v iperf3 >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1
+  command -v iperf3 >/dev/null 2>&1 || { err "iperf3 is needed here"; return 1; }
+  local pip lip host; pip="$(json_get "$conf" peer_ip)"; lip="$(json_get "$conf" local_ip)"; lip="${lip%/*}"
+  host="$(json_get "$conf" peer)"; host="${host%:*}"
+  local fhost fuser fpass; fhost="$(ask 'Far end SSH host' "$host")"; fuser="$(ask 'SSH user' 'root')"
+  printf '%sSSH password%s (hidden): ' "$W" "$N"; read -rs fpass; printf '\n'
+  local pwf; pwf="$(mktemp)"; chmod 600 "$pwf"; printf '%s\n' "$fpass" > "$pwf"
+  local SSH="sshpass -f $pwf ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12 $fuser@$fhost"
+  $SSH "command -v iperf3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1; pkill -x iperf3; sleep 0.3; iperf3 -s -B $pip -D" >/dev/null 2>&1 \
+    || { err "could not start iperf3 on the far end"; shred -u "$pwf" 2>/dev/null; return 1; }
+  hdr "UDP sweep $lip -> $pip (5 s per step; live traffic adds to these numbers)"
+  local r best=0
+  for r in 60 90 120 150 180 220 280; do
+    printf '  offered %4d Mbit/s: ' "$r"
+    iperf3 -c "$pip" -B "$lip" -u -b "${r}M" -l 1200 -t 5 -i 0 --json 2>/dev/null | python3 -c '
+import json,sys
+try:
+    s=json.load(sys.stdin)["end"]["sum"]; d=s["bits_per_second"]/1e6*(1-s["lost_percent"]/100); l=s["lost_percent"]
+    print(f"delivered {d:5.0f} Mbit/s  loss {l:5.1f}%"); sys.exit(0 if l < 2 else 1)
+except Exception: print("no result"); sys.exit(2)' && best=$r || { (( $? == 2 )) || break; }
+    sleep 2
+  done
+  $SSH 'pkill -x iperf3' >/dev/null 2>&1; shred -u "$pwf" 2>/dev/null || rm -f "$pwf"
+  if (( best > 0 )); then
+    local sug=$(( best * 90 / 100 ))
+    printf '\n  clean up to %s Mbit/s. Suggested: %speer shape %s %s%s   (10%% under the last clean step)\n' "$best" "$BOLD" "${name:-<name>}" "$sug" "$N"
+  else warn "every step lost packets; the path may be congested right now — try again later."; fi
+}
+
+peer_list() {
+  hdr "Locations on this host"
+  printf '%-10s %-4s %-6s %-22s %-6s %-14s %-8s %7s %8s %s\n' NAME ROLE PORT PEER TUN LOCAL STATE LOSS% RTT SHAPE
+  local n st loss rtt shape c role port peer tun lip
+  _peer_row() { # _peer_row NAME CONF UNIT STATS SHAPEFILE
+    c="$2"; [[ -f "$c" ]] || return
+    role="$(json_get "$c" role)"; port="$(json_get "$c" listen)"; port="${port##*:}"; peer="$(json_get "$c" peer)"
+    tun="$(json_get "$c" tun_name)"; lip="$(json_get "$c" local_ip)"
+    st="$(svc_active "$3")"; loss="-"; rtt="-"
+    if js_load "$4" 2>/dev/null; then loss="${J[loss_pct]:--}"; rtt="${J[rtt_ms]:--}"; fi
+    shape="-"; [[ -s "$5" ]] && read -r shape < "$5" && shape="${shape}M"
+    local sc="$R"; [[ "$st" == active ]] && sc="$G"
+    printf '%-10s %-4s %-6s %-22s %-6s %-14s %s%-8s%s %7s %8s %s\n' "$1" "$role" "$port" "$peer" "$tun" "$lip" "$sc" "$st" "$N" "$loss" "$rtt" "$shape"
+  }
+  _peer_row default "${CONF_DIR}/config.json" aestun /run/aestun/stats.json /dev/null
+  while read -r n; do [[ -n "$n" ]] && _peer_row "$n" "$(peer_conf "$n")" "$(peer_unit "$n")" "$(peer_stats "$n")" "$PEER_DIR/$n.shape"; done < <(peer_names)
+  printf '\n'
+}
+
+peer_cmd() {
+  local verb="${1:-list}"; shift || true
+  case "$verb" in
+    list|ls)  peer_list ;;
+    add)      peer_add "$@" ;;
+    del|rm)   [[ -n "${1:-}" ]] || { err "usage: peer del NAME"; return 1; }; peer_del "$1" ;;
+    push)     [[ -n "${1:-}" ]] || { err "usage: peer push NAME [HOST]"; return 1; }; peer_push "$@" ;;
+    import)   [[ -n "${2:-}" ]] || { err "usage: peer import NAME FILE"; return 1; }; peer_import "$1" "$2" ;;
+    shape)    [[ -n "${2:-}" ]] || { err "usage: peer shape NAME <Mbit/s|off>"; return 1; }; peer_shape "$1" "$2" ;;
+    zapret)   [[ -n "${1:-}" ]] || { err "usage: peer zapret NAME on|off"; return 1; }; peer_zapret "$1" "${2:-on}" ;;
+    sweep)    peer_sweep "${1:-}" ;;
+    start|stop|restart|status)
+              [[ -n "${1:-}" ]] || { err "usage: peer $verb NAME"; return 1; }; peer_exists "$1" || { err "no location '$1'"; return 1; }
+              systemctl --no-pager "$verb" "$(peer_unit "$1")" ;;
+    log)      [[ -n "${1:-}" ]] || { err "usage: peer log NAME"; return 1; }; journalctl -u "$(peer_unit "$1")" -n 50 -f ;;
+    menu)     [[ -n "${1:-}" ]] || { err "usage: peer menu NAME"; return 1; }; peer_exists "$1" || { err "no location '$1'"; return 1; }
+              use_peer "$1"; main_menu ;;
+    *) cat <<'USAGE'
+aestun.sh peer <verb> ...      multi-location: one foreign server <-> many Iran servers (or the reverse)
+
+  peer list                      every location on this host with state / loss / RTT / shaping
+  peer add [NAME]                wizard: new location (port, subnet, TUN and key chosen for you),
+                                 then optionally installs the mirrored config on the far end over SSH
+  peer push NAME [HOST]          (re)install this location on the far end over SSH
+  peer import NAME FILE          install a config file as location NAME (what 'push' runs remotely)
+  peer del NAME                  remove a location from this host
+  peer sweep [NAME]              find the path's loss cliff with a UDP sweep; suggests a shape value
+  peer shape NAME <Mbit|off>     cake shaping on that location's TUN (fair per flow, low latency)
+  peer zapret NAME on|off        per-location NFQUEUE rules into the shared nfqws
+  peer start|stop|restart|status|log NAME
+  peer menu NAME                 open the full management menu (monitor, DPI, anti-DPI, auto-test)
+                                 pointed at that location
+USAGE
+       return 1 ;;
+  esac
+}
+
+peers_menu() {
+  while true; do
+    clear; peer_list
+    cat <<EOF
+  ${C}1${N}) Add a location (wizard, optional SSH install of the far end)
+  ${C}2${N}) Open the management menu for a location
+  ${C}3${N}) Sweep a location's path and set shaping
+  ${C}4${N}) Restart a location
+  ${C}5${N}) zapret on/off for a location
+  ${C}6${N}) Remove a location
+  ${C}0${N}) Back
+EOF
+    local c n; c="$(ask 'Choose' '')" || return
+    case "$c" in
+      1) peer_add; pause ;;
+      2) n="$(ask 'Location name' '')" || continue; peer_exists "$n" || { err "no such location"; sleep 1; continue; }
+         use_peer "$n"; main_menu; use_peer "" ;;
+      3) n="$(ask 'Location name' '')" || continue; peer_sweep "$n"
+         local v; v="$(ask 'Shape to (Mbit/s, empty = leave as is)' '')"; [[ -n "$v" ]] && peer_shape "$n" "$v"; pause ;;
+      4) n="$(ask 'Location name' '')" || continue; peer_cmd restart "$n"; pause ;;
+      5) n="$(ask 'Location name' '')" || continue; v="$(ask 'on/off' 'on')"; peer_zapret "$n" "$v"; pause ;;
+      6) n="$(ask 'Location name' '')" || continue; peer_del "$n"; pause ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+# =============================================================================
 #  dispatcher
 # =============================================================================
 case "${1:-menu}" in
-  zap-rule) shift; zap_rule "$@"; exit $? ;;   # systemd path — no menu, no root prompt
+  zap-rule) shift; [[ -n "${2:-}" ]] && use_peer "$2"; zap_rule "${1:-}"; exit $? ;;   # systemd path — no menu, no root prompt
+  peer-qdisc) shift; peer_qdisc "${1:-}"; exit $? ;;                                 # systemd path (aestun@ ExecStartPost)
+  peer)     shift; need_root; peer_cmd "$@"; exit $? ;;
   build)    shift; do_build "$@"; exit $? ;;
   dpi-report) shift; "$BIN_DST" dpi-report -config "$CONF" "$@"; exit $? ;;
   install)  do_install; exit $? ;;
@@ -2600,8 +3099,9 @@ aestun.sh — one file: installer + manager + monitor + zapret + build
   ./aestun.sh build [arch] [pprof|obfuscate]
                                 cross-compile a static binary (dev machine)
   ./aestun.sh dpi-report        summarise the DPI/probe log
-  ./aestun.sh zap-rule VERB     NFQUEUE helper {add|del|rearm}, invoked by systemd
+  ./aestun.sh zap-rule VERB [NAME]  NFQUEUE helper {add|del|rearm}, invoked by systemd
+  sudo ./aestun.sh peer ...     multi-location (one foreign <-> many Iran servers); 'peer help'
 USAGE
     exit 0 ;;
-  *) err "unknown command: $1  (try: install | menu | zap-rule | build)"; exit 1 ;;
+  *) err "unknown command: $1  (try: install | menu | peer | zap-rule | build)"; exit 1 ;;
 esac

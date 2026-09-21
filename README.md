@@ -31,6 +31,7 @@ manages it, and a second script that runs four carriers at once and bonds them t
 14. [Security model and honest limits](#14-security-model-and-honest-limits)
 15. [Measurement appendix](#15-measurement-appendix)
 16. [File map](#16-file-map)
+17. [Multi-location — one foreign server, many Iran servers](#17-multi-location--one-foreign-server-many-iran-servers)
 
 ---
 
@@ -832,6 +833,7 @@ x) Anti-DPI hardening             <- desync / junk / port-hop / split (§8)
 i) ICMP carrier settings          <- readers / batching / id rotation / ping mimicry (§6.3)
 t) Auto-test methods              <- sweep every method/protocol, apply the best
 m) Multi-protocol tunnel          <- run 4 carriers at once: failover + multipath (§7)
+p) Locations (multi-peer)         <- one foreign server to many Iran servers, or the reverse (§17)
 z) zapret module                  <- optional external DPI desync layer
 u) Uninstall
 ```
@@ -966,3 +968,103 @@ Europe (role `b`) — under real load, not synthesised. The most consequential r
 | `aestun` | the build for this host — run it straight out of the directory |
 | `aestun-linux-amd64` / `aestun-linux-arm64` | the same program, cross-built |
 | `SHA256SUMS` | their checksums, the Go version and flags used, and a source fingerprint |
+
+---
+
+## 17. Multi-location — one foreign server, many Iran servers
+
+One `aestun` process is one tunnel between two servers. A foreign server that serves several
+Iran servers (or an Iran server with several foreign exits) simply runs several processes,
+and that is the right shape: every location has its own key, TUN device, subnet, stats file
+and DPI log, so a location that is throttled or blocked cannot touch the others. What this
+section adds is the management layer, so a second location is no longer a hand-written
+systemd unit next to the stock one.
+
+```
+                         ┌──────────────┐
+   Iran server A  ◀──────┤              │        location "default"  tun0  10.8.0.0/24   :9090
+                         │   foreign    │
+   Iran server B  ◀──────┤   server     │        location "ir2"      tun1  10.8.10.0/24  :9091
+                         │              │
+   Iran server C  ◀──────┤              │        location "ir3"      tun2  10.8.1.0/24   :9092
+                         └──────────────┘
+```
+
+The stock tunnel (`config.json` / `aestun.service`) is the location named **default** and is
+not changed by any of this. Every additional location has a **name** and lives in:
+
+| what | where |
+|---|---|
+| config | `/etc/aestun/peers/NAME.json` — same schema as `config.json` |
+| service | `aestun@NAME.service` — one systemd template, N instances |
+| stats | `/run/aestun/peers/NAME/stats.json` |
+| DPI log | `/var/log/aestun/peers/NAME/dpi.jsonl` |
+| zapret | `aestun-zapret@NAME.service`, armed by the marker `peers/NAME.zapret`; queues that location's carrier into the shared `nfqws` started by the stock tunnel's zapret module |
+| shaping | `peers/NAME.shape` — a rate in Mbit/s, applied as `cake` on that location's TUN on every start |
+
+A location has the **same name on both ends**. On an Iran server that has one foreign exit,
+the far side of a location is usually its stock tunnel (`config.json`); the tools accept
+that and fall back to it when `peers/NAME.json` does not exist there.
+
+### 17.1 Commands
+
+```
+sudo ./aestun.sh peer list                  every location: state, loss, RTT, shaping
+sudo ./aestun.sh peer add [NAME]            wizard — port, subnet, TUN and key are chosen for
+                                            you; wire settings are copied from config.json;
+                                            then optionally installs the far end over SSH
+sudo ./aestun.sh peer push NAME [HOST]      (re)install this location on the far end over SSH:
+                                            copies the binary + manager, writes the mirrored
+                                            config (roles and tunnel addresses swapped), starts it
+sudo ./aestun.sh peer import NAME FILE      what push runs on the far end; also for by-hand setups
+sudo ./aestun.sh peer del NAME              remove a location from this host (far end untouched)
+sudo ./aestun.sh peer sweep [NAME]          UDP sweep through the tunnel to find the path's loss
+                                            cliff (§17.2); suggests a shape value
+sudo ./aestun.sh peer shape NAME <Mbit|off> cake shaping on that location's TUN
+sudo ./aestun.sh peer zapret NAME on|off    per-location NFQUEUE rules
+sudo ./aestun.sh peer start|stop|restart|status|log NAME
+sudo ./aestun.sh peer menu NAME             the whole management menu (dashboard, DPI log,
+                                            anti-DPI, auto-test, service) pointed at that location
+```
+
+`p` in the menu opens the same thing interactively. Adding a location from the foreign
+server end to end is one command:
+
+```
+sudo ./aestun.sh peer add ir3
+  This server's role for 'ir3' (a = Iran/inside, b = foreign/outside) [b]:
+  Far end public IP / host: 185.126.x.x
+  UDP port (same on both ends) [9092]:
+  Tunnel subnet (/24) [10.8.1.0/24]:
+  TUN device [tun2]:
+  Shared key (Enter = generate):
+  [OK] location 'ir3' started: aestun@ir3.service
+  Configure the far end over SSH now (copies binary + config, starts it) [Y/n]: y
+  ...
+  [OK] tunnel 'ir3' is up: 10.8.1.1 answers through it.
+```
+
+The reverse topology — several Iran servers into one foreign server, or one Iran server with
+several foreign exits — is the same thing seen from the other side: each pair is a location on
+both hosts. Run `peer add` from whichever end has SSH access to the other.
+
+### 17.2 Per-location shaping — why it exists
+
+Paths into Iran differ per datacentre. Measured on this project's own servers on the same
+night: one Iran path carried 400 Mbit/s with no loss, the other had a **policer at ~150
+Mbit/s** — 160 Mbit/s offered delivered 127 with 20 % loss, 220 delivered 170 with 23 %.
+TCP cannot see a policer; it probes until it loses packets and then sits permanently on the
+wrong side of the cliff, so every user on that location saw loss and retransmits whenever
+one of them started a download. `peer sweep` finds the cliff (UDP at rising rates through the
+tunnel, iperf3 on both ends), and `peer shape` puts a `cake` qdisc on that location's TUN just
+under it: `flows` shares the rate fairly per inner connection, and its AQM keeps the queue
+short. On the policed path this went from 79 Mbit/s with 19 785 retransmits and 325 ms ping
+under load to 96 Mbit/s, 1 retransmit and 82 ms. The `rate_mbps` pacer in the daemon (§10)
+does the same thing one layer lower, without the per-flow fairness; with both set, keep the
+cake rate a few Mbit/s below `rate_mbps` so the pacer never has to drop at the TUN ring.
+
+### 17.3 What `upgrade` and `uninstall` do with locations
+
+`upgrade` refreshes the two templates and restarts every location after the stock tunnel.
+`uninstall` stops and removes every location (units, rules, TUN devices) together with the
+stock tunnel. The far ends are never touched by either.

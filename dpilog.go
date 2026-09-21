@@ -139,6 +139,7 @@ const (
 	evScanUnauth  = "scan.unauth"         // unauthenticated datagram from a stranger
 	evInjectSpoof = "inject.spoofed_peer" // unauthenticated datagram claiming the peer's address
 	evTTLAnomaly  = "anomaly.ttl"         // peer-addressed packet with the wrong hop count
+	evTTLChanged  = "path.ttl_changed"    // the peer's hop count moved and stayed moved
 	evPeerRoam    = "peer.roam"           // authenticated peer moved to a new address
 
 	// path behaviour
@@ -227,6 +228,10 @@ type dpiLogger struct {
 	// peer TTL learning: the modal hop count seen from the peer
 	peerTTL     atomic.Uint32 // 0 = not yet learned
 	peerTTLSeen atomic.Uint64
+	// A run of authenticated packets that all disagree with peerTTL by the same value.
+	// ttlAltRun counts them; ttlAlt is the value they carry. See checkPeerTTL.
+	ttlAlt    atomic.Uint32
+	ttlAltRun atomic.Uint64
 
 	// RTT, in microseconds
 	rttLast atomic.Uint64
@@ -331,9 +336,37 @@ func (d *dpiLogger) checkPeerTTL(ttl uint8) {
 		return
 	}
 	if uint32(ttl) == known {
+		d.ttlAltRun.Store(0)
 		return
 	}
 	d.cTTLAnom.Add(1)
+	// Every packet that reaches here has already passed AEAD authentication, so an
+	// injector cannot produce a run of them. When the peer's hop count moves and stays
+	// moved (a route change - seen in the wild as 52 -> 50 for a whole day), flagging every
+	// packet forever is not detection, it is a flood: ~150k records a day that rotate the
+	// real history out of the log. A single stray packet or a short flap still raises the
+	// anomaly; only a sustained run of agreeing authenticated packets moves the baseline,
+	// and that move is logged once so it is visible in the timeline.
+	if d.ttlAlt.Load() != uint32(ttl) {
+		d.ttlAlt.Store(uint32(ttl))
+		d.ttlAltRun.Store(0)
+	}
+	if run := d.ttlAltRun.Add(1); run >= ttlRelearnAfter {
+		if d.peerTTL.CompareAndSwap(known, uint32(ttl)) {
+			d.ttlAltRun.Store(0)
+			d.emit(dpiEvent{
+				Event:    evTTLChanged,
+				Severity: sevNotice,
+				Detail: map[string]any{
+					"old_ttl": known,
+					"new_ttl": ttl,
+					"packets": run,
+				},
+				Message: "peer hop count moved and stayed there across a long run of authenticated packets — path change, baseline updated",
+			})
+		}
+		return
+	}
 	d.emit(dpiEvent{
 		Event:    evTTLAnomaly,
 		Severity: sevHigh,
@@ -343,9 +376,12 @@ func (d *dpiLogger) checkPeerTTL(ttl uint8) {
 		},
 		Message: "packet from the peer address arrived with an unexpected hop count — consistent with an on-path injector",
 	})
-	// Do not relearn: if the path genuinely changed, the restart or a roam event will
-	// re-establish it, and relearning here would let an injector move the baseline.
 }
+
+// ttlRelearnAfter is how many consecutive authenticated packets must carry the same new hop
+// count before checkPeerTTL accepts it as the peer's path. At a few thousand packets per
+// second under load that is seconds; at keepalive-only rates it is minutes, which is fine.
+const ttlRelearnAfter = 2000
 
 // observeStranger is called for any datagram that is not authenticated peer traffic.
 // It aggregates by source; the writer emits at most one record per source per flush window.
@@ -422,6 +458,7 @@ func (d *dpiLogger) peerRoamed(from, to string) {
 	// The hop count belongs to the old path; forget it so the new one is learned cleanly.
 	d.peerTTL.Store(0)
 	d.peerTTLSeen.Store(0)
+	d.ttlAltRun.Store(0)
 }
 
 // noteRTT records a round-trip sample from the in-tunnel probe exchange.
