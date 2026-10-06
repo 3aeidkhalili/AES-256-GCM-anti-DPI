@@ -5,6 +5,7 @@
   "listen": "0.0.0.0:51820",
   "peer": "PUBLIC_IP_OF_SERVER_B:51820",
   "transport": "udp",
+  "reverse": false,
   "obfs": "quic2",
   "sni": "www.cloudflare.com",
   "shape": true,

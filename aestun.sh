@@ -332,6 +332,7 @@ write_config() {
   "listen": "0.0.0.0:${CFG_LISTEN_PORT}",
   "peer": "${CFG_PEER}",
   "transport": "${CFG_TRANSPORT:-udp}",
+  "reverse": ${CFG_REVERSE:-false},
   "obfs": "${CFG_OBFS:-none}",
   "sni": "${CFG_SNI:-www.cloudflare.com}",
   "tun_name": "${CFG_TUN}",
@@ -367,24 +368,58 @@ write_config() {
     "id_pool": ${CFG_ICMP_POOL:-1},
     "id_rotate_sec": ${CFG_ICMP_ROT:-60},
     "mimic_ping": ${CFG_ICMP_MIMIC:-false}
-  }
+  }${WS_BLOCK}
 }
 EOF
   chmod 600 "$CONF"
   msg "Config written: $CONF"
 }
 
-open_firewall() { # open_firewall PORT
-  local port="$1"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
-    ufw allow "${port}/udp" >/dev/null 2>&1 && msg "UFW rule added for ${port}/udp."
+# ws_setup_questions — the WebSocket carrier's endpoints. Both servers answer with the same domain
+# and port, so the ws block comes out identical on the two; the request path is derived from the
+# key by the binary, so it never has to be copied across.
+ws_setup_questions() {
+  local dials=false origin="FOREIGN"
+  if [[ "$CFG_ROLE" == a && "$CFG_REVERSE" != true ]] || [[ "$CFG_ROLE" == b && "$CFG_REVERSE" == true ]]; then
+    dials=true
+  fi
+  [[ "$CFG_REVERSE" == true ]] && origin="IRAN"
+  printf '\n%sCloudflare%s — once, in the dashboard of the domain:\n' "$BOLD" "$N"
+  printf '  1. DNS: an A record for a (sub)domain -> the %s server'"'"'s public IP, %sProxied%s (orange cloud)\n' "$origin" "$Y" "$N"
+  printf '  2. SSL/TLS mode %sFull%s (the listener makes its own certificate); Flexible works too\n' "$Y" "$N"
+  printf '  3. Network > WebSockets: On\n'
+  CFG_WS_DOMAIN="$(ask_req "Domain proxied by Cloudflare to the $origin server")" || return 1
+  printf '  %sCloudflare carries WebSocket over TLS on 443, 2053, 2083, 2087, 2096 and 8443, and connects\n' "$D"
+  printf '  to the origin on the SAME port — pick one that nothing else uses on the %s server.%s\n' "$origin" "$N"
+  CFG_WS_PORT="$(ask "Cloudflare port" "8443")"
+  case "$CFG_WS_PORT" in
+    443|2053|2083|2087|2096|8443) ;;
+    *) warn "$CFG_WS_PORT is not one of Cloudflare's TLS ports — using 8443."; CFG_WS_PORT=8443 ;;
+  esac
+  CFG_LISTEN_PORT="$CFG_WS_PORT"
+  CFG_WS_CONNECT=""
+  if [[ "$dials" == true ]]; then
+    printf '  %sOptional: a Cloudflare IP to dial instead of resolving the domain — for when this server'"'"'s\n' "$D"
+    printf '  DNS cannot resolve it, or some Cloudflare ranges are filtered. SNI and Host stay the domain.%s\n' "$N"
+    CFG_WS_CONNECT="$(ask "Cloudflare IP to dial (empty = resolve the domain)" "")"
+  fi
+  CFG_PEER="${CFG_WS_DOMAIN}:${CFG_WS_PORT}"
+  WS_BLOCK=",
+
+  \"ws\": { \"url\": \"wss://${CFG_WS_DOMAIN}:${CFG_WS_PORT}\", \"connect\": \"${CFG_WS_CONNECT}\" }"
+}
+
+open_firewall() { # open_firewall PORT [udp|tcp]
+  local port="$1" proto="${2:-udp}"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+    ufw allow "${port}/${proto}" >/dev/null 2>&1 && msg "UFW rule added for ${port}/${proto}."
   fi
 }
 # open_firewall_icmp — the ICMP carrier has no port to open, only a message type. Many cloud
 # images ship a UFW policy that drops inbound ICMP echo, which makes the tunnel look blocked
 # by the ISP when it is being blocked by the host itself.
 open_firewall_icmp() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
     ufw allow proto icmp >/dev/null 2>&1 && msg "UFW rule added for ICMP." \
       || warn "Could not add a UFW ICMP rule; allow ICMP echo manually or the carrier will not receive."
   fi
@@ -579,11 +614,35 @@ interactive_setup() {
   printf '        lost ~42%% of everything offered, in ~94 ms blackouts every ~345 ms, at any\n'
   printf '        rate — and ICMP echo crossed the same path at the same moment at 30 Mbit/s\n'
   printf '        with 0.4%% loss. Needs CAP_NET_RAW and takes no obfs and no port hopping.\n'
-  CFG_TRANSPORT="$(ask "Transport (udp/tcp/icmp)" "udp")"
+  printf '  %sws%s  : WebSocket over TLS through a CDN (Cloudflare). The Iran server talks only to\n' "$C" "$N"
+  printf '        Cloudflare'"'"'s edge, never to the foreign IP — for paths that cut every flow\n'
+  printf '        addressed to the foreign server. Needs a domain proxied by Cloudflare (orange\n'
+  printf '        cloud) pointing at the foreign server. A stream, like tcp.\n'
+  CFG_TRANSPORT="$(ask "Transport (udp/tcp/icmp/ws)" "udp")"
   case "$CFG_TRANSPORT" in
-    udp|tcp|icmp) ;;
+    udp|tcp|icmp|ws) ;;
     *) warn "Unknown transport '$CFG_TRANSPORT' — using udp."; CFG_TRANSPORT="udp" ;;
   esac
+
+  # --- direction (UDP and ws) ---
+  # Who opens the carrier flow. Normally the Iran server does; reverse hands that to the
+  # foreign server, and the Iran server then never sends first — every packet it emits is a
+  # reply to a flow opened from abroad. It is not negotiated, so both ends must agree.
+  CFG_REVERSE=false; WS_BLOCK=""
+  if [[ "$CFG_TRANSPORT" == "udp" ]]; then
+    printf '\n%sConnection direction%s — must match on BOTH servers.\n' "$BOLD" "$N"
+    printf '  %snormal%s : the Iran server opens the UDP flow to the foreign server (default)\n' "$C" "$N"
+    printf '  %sreverse%s: the foreign server opens the flow to the Iran server, which never sends\n' "$C" "$N"
+    printf '           first — for paths that refuse or flag flows opened from inside. The Iran\n'
+    printf '           server'"'"'s UDP port must then be open inbound, in its cloud firewall too.\n'
+    ask_yn "Reverse UDP (the foreign server dials the Iran server)" "N" && CFG_REVERSE=true
+  elif [[ "$CFG_TRANSPORT" == "ws" ]]; then
+    printf '\n%sConnection direction%s — must match on BOTH servers.\n' "$BOLD" "$N"
+    printf '  %snormal%s : the Iran server dials wss://<domain of the FOREIGN server> (default)\n' "$C" "$N"
+    printf '  %sreverse%s: the foreign server dials wss://<domain of the IRAN server>; the Iran server\n' "$C" "$N"
+    printf '           is the origin behind Cloudflare and only answers.\n'
+    ask_yn "Reverse (the foreign server dials, through Cloudflare, to the Iran server)" "N" && CFG_REVERSE=true
+  fi
 
   # --- wire obfuscation ---
   # The payload is already indistinguishable from random, which is the problem: nothing
@@ -595,6 +654,11 @@ interactive_setup() {
     # anomalous thing about an otherwise ordinary packet. The binary refuses the combination.
     CFG_OBFS="none"
     printf '\n%sWire obfuscation%s: not applicable to the ICMP carrier — the cover *is* the ping.\n' "$BOLD" "$N"
+  elif [[ "$CFG_TRANSPORT" == "ws" ]]; then
+    # The disguise is the TLS connection to the CDN itself; a QUIC or DTLS header inside a
+    # WebSocket message would be invisible to the censor and is refused by the binary.
+    CFG_OBFS="none"
+    printf '\n%sWire obfuscation%s: not applicable to ws — the cover is the TLS connection to Cloudflare.\n' "$BOLD" "$N"
   else
   printf '\n%sWire obfuscation%s — must match on BOTH servers.\n' "$BOLD" "$N"
   printf '  %snone%s : raw high-entropy datagrams (compatible with older builds)\n' "$C" "$N"
@@ -629,10 +693,16 @@ interactive_setup() {
     phost="$(ask_req "Public IPv4 of the OTHER server")" || return 1
     CFG_PEER="${phost}"
     printf '  %sThe ICMP carrier is IPv4-only and needs the peer address on BOTH ends.%s\n' "$D" "$N"
+  elif [[ "$CFG_TRANSPORT" == "ws" ]]; then
+    ws_setup_questions || return 1
   else
     CFG_LISTEN_PORT="$(ask "${CFG_TRANSPORT^^} listen port on THIS server" "51820")"
     is_port "$CFG_LISTEN_PORT" || { CFG_LISTEN_PORT=51820; warn "Invalid port, using 51820."; }
     local pport
+    if [[ "$CFG_REVERSE" == true && "$CFG_ROLE" == a ]]; then
+      printf '  %sReverse: this server never dials the address below — the foreign server dials\n' "$D"
+      printf '  here. It is still recorded for the tools that need the far end (auto-test, zapret).%s\n' "$N"
+    fi
     phost="$(ask_req "Public IP/host of the OTHER server")" || return 1
     pport="$(ask "${CFG_TRANSPORT^^} port of the OTHER server" "$CFG_LISTEN_PORT")"
     is_port "$pport" || pport="$CFG_LISTEN_PORT"
@@ -691,7 +761,11 @@ interactive_setup() {
     ask_yn "  also IP-fragment the fakes (split)" "N" && CFG_SPLIT=true
   fi
   ask_yn "Flow-start cover traffic (junk: a burst of cover packets when the flow opens)" "N" && CFG_JUNK=true
-  if ask_yn "Keyed port hopping (rotate the UDP port; defeats 5-tuple blocks; needs the ports open on BOTH ends; disables offload)" "N"; then
+  if [[ "$CFG_REVERSE" == true ]]; then
+    # Hopping moves both ends on a shared schedule, so there is no fixed point to dial; the
+    # binary refuses the pair, so do not offer it.
+    printf '  %sPort hopping is not offered with reverse UDP — the two cannot be combined.%s\n' "$D" "$N"
+  elif ask_yn "Keyed port hopping (rotate the UDP port; defeats 5-tuple blocks; needs the ports open on BOTH ends; disables offload)" "N"; then
     CFG_HOP=true
     local hp; hp="$(ask "  port set — comma separated, IDENTICAL and in the same order on both servers" "443,8443,2053,2083,2087,2096")"
     CFG_HOP_PORTS="$(printf '%s' "$hp" | tr -d ' ' | sed 's/,/, /g')"
@@ -705,6 +779,14 @@ interactive_setup() {
   systemctl enable --now "$UNIT" >/dev/null 2>&1 && msg "Service enabled and started."
   if [[ "$CFG_TRANSPORT" == "icmp" ]]; then
     open_firewall_icmp
+  elif [[ "$CFG_TRANSPORT" == "ws" ]]; then
+    # Only the origin takes inbound connections, from Cloudflare's edge.
+    if [[ "$CFG_ROLE" == b && "$CFG_REVERSE" != true ]] || [[ "$CFG_ROLE" == a && "$CFG_REVERSE" == true ]]; then
+      open_firewall "$CFG_LISTEN_PORT" tcp
+      printf '  %sAllow TCP %s inbound in the CLOUD firewall too (ideally from Cloudflare'"'"'s ranges only).%s\n' "$Y" "$CFG_LISTEN_PORT" "$N"
+    fi
+  elif [[ "$CFG_TRANSPORT" == "tcp" ]]; then
+    open_firewall "$CFG_LISTEN_PORT" tcp
   else
     open_firewall "$CFG_LISTEN_PORT"
     if [[ "$CFG_HOP" == true ]]; then
@@ -740,6 +822,9 @@ PY
       chmod 600 "$CONF"
       systemctl restart "$UNIT" >/dev/null 2>&1 && msg "native ICMP desync enabled."
     fi
+  elif [[ "$CFG_TRANSPORT" == "ws" ]]; then
+    printf '%szapret%s: skipped — the ws carrier'"'"'s flow goes to Cloudflare, not to the peer, and is\n' "$BOLD" "$N"
+    printf '  TLS from its first byte; the rules zapret arms are keyed on the peer and would match nothing.\n'
   else
     printf '%sDPI desync (zapret/nfqws) on the carrier port%s — recommended, on by default.\n' "$BOLD" "$N"
     printf '  Builds nfqws from source and desyncs the first few packets of the carrier flow,\n'
@@ -769,6 +854,12 @@ PY
   printf '%sNow run the SAME installer on the other server with:%s\n' "$D" "$N"
   printf '   - the %ssame key%s\n   - the opposite role (%s)\n   - peer = THIS server public IP\n' \
     "$BOLD" "$N" "$([[ $CFG_ROLE == a ]] && echo 'Foreign / b' || echo 'Iran / a')"
+  [[ "$CFG_REVERSE" == true ]] && printf '   - %sreverse: yes%s (the foreign server dials, the Iran server only answers)\n' "$BOLD" "$N"
+  if [[ "$CFG_TRANSPORT" == "ws" ]]; then
+    printf '   - %stransport ws%s, the same domain (%s) and port (%s)\n' "$BOLD" "$N" "$CFG_WS_DOMAIN" "$CFG_WS_PORT"
+    printf '%sCheck the Cloudflare path from the dialing server at any time with:%s\n' "$D" "$N"
+    printf '   %s ws-check -config %s\n' "$BIN_DST" "$CONF"
+  fi
   return 0
 }
 # ------------------------------------------------------------------ service control
@@ -898,7 +989,7 @@ aestun_units() {
 read_stats() {
   S_TXB=0; S_RXB=0; S_TXP=0; S_RXP=0; S_AF=0; S_RD=0; S_UP=0; S_LASTRX=0; S_NOW=0
   S_PROBES=0; S_SCANS=0; S_INJ=0; S_REPL=0; S_TTLA=0; S_BH=""; S_DPI=""
-  S_PEER=""; S_CIPHER=""; S_REKEY=0; S_LOSS="-"; S_RTT="-"
+  S_PEER=""; S_CIPHER=""; S_REKEY=0; S_LOSS="-"; S_RTT="-"; S_REV=""
   S_CARRIERS=(); S_NAMES=()
   local entry name f v worst
   while IFS= read -r entry; do
@@ -919,6 +1010,7 @@ read_stats() {
     v=${J[rekey_interval]}; (( v > S_REKEY ))  && S_REKEY=$v
     [[ -z "$S_PEER"   ]] && S_PEER="${J[peer]-}"
     [[ -z "$S_CIPHER" ]] && S_CIPHER="${J[cipher]-}"
+    [[ -z "$S_REV"    ]] && S_REV="${J[reverse]-}"
     [[ "${J[dpi_enabled]-}"        == true ]] && S_DPI=true
     [[ "${J[dpi_blackholed_now]-}" == true ]] && S_BH=true
     S_CARRIERS+=("$name|${J[rx_bytes]:-0}|${J[tx_bytes]:-0}|${J[auth_fail]:-0}|${J[loss_pct]:--}|${J[rtt_ms]:--}")
@@ -1086,7 +1178,15 @@ monitor() {
     printf '  mode     : %-12s %s%s%s\n' "$mode" "$svc_c" "$svc_state" "$N"
     printf '  uptime   : %-12s last RX: %s%s%s ago   iface %s: %s%s%s\n' \
       "$(fmt_dur "$S_UP")" "$age_c" "$age" "$N" "$iface" "$link_c" "$link" "$N"
-    printf '  peer     : %s%s%s\n' "$W" "${S_PEER:-–}" "$N"
+    # Under reverse an empty peer is not a fault on the listening end, it is the state before the
+    # far end has dialled in — say which, so it is not read as a broken config.
+    local revnote=""
+    case "$S_REV" in
+      listen) if [[ -z "$S_PEER" ]]; then revnote="  ${Y}(reverse: waiting for the far end to dial in)${N}"
+              else revnote="  ${D}(reverse: dialled in from there; this end only answers)${N}"; fi ;;
+      dial)   revnote="  ${D}(reverse: this end dials)${N}" ;;
+    esac
+    printf '  peer     : %s%s%s%s\n' "$W" "${S_PEER:-–}" "$N" "$revnote"
     printf '%s\n' "${C}+-- traffic (all carriers) ----------------------------+${N}"
     printf '  TX : %s%12s%s  (%s%s%s/s)  packets: %s\n' "$W" "$(human "$S_TXB")" "$N" "$G" "$(human "$dtx")" "$N" "$S_TXP"
     printf '  RX : %s%12s%s  (%s%s%s/s)  packets: %s\n' "$W" "$(human "$S_RXB")" "$N" "$G" "$(human "$drx")" "$N" "$S_RXP"
@@ -1274,6 +1374,11 @@ zap_enable() {
 
   local host port qnum=200 transport desync
   IFS='|' read -r host port transport < <(carrier_endpoint)
+  if [[ "$transport" == "ws" ]]; then
+    err "The carrier transport is \"ws\": its flow goes to Cloudflare's edge, not to the peer, and is"
+    err "TLS from the first byte, so rules keyed on the peer would match nothing. Not enabled."
+    $_p; return 1
+  fi
   if [[ "$transport" == "icmp" ]]; then
     # Stated plainly rather than half-applied. zapret's nfqws desyncs TCP and UDP flows via
     # NFQUEUE; it has no ICMP mode, and the carrier here is echo-request payloads. Arming it
@@ -1616,14 +1721,41 @@ c=json.load(open(sys.argv[1]))
 def st(k):
     v=c.get(k,{})
     return "on" if isinstance(v,dict) and v.get("enabled") else "off"
-print("obfs=%s desync=%s junk=%s hop=%s split=%s"%(c.get("obfs","none"),st("desync"),st("junk"),st("hop"),st("split")))
+print("obfs=%s desync=%s junk=%s hop=%s split=%s reverse=%s"%(c.get("obfs","none"),st("desync"),st("junk"),st("hop"),st("split"),
+      "on" if c.get("reverse") else "off"))
 PY
+}
+
+# antidpi_toggle_reverse — flip which end opens the UDP carrier flow. Like obfs it is not
+# negotiated, so it has to be flipped on BOTH servers; the binary refuses it on tcp/icmp and
+# with port hopping, so refuse those here too rather than write a config that cannot start.
+antidpi_toggle_reverse() {
+  [[ -f "$CONF" ]] || { err "No config."; return 1; }
+  python3 - "$CONF" <<'PY' || return 1
+import json,sys
+p=sys.argv[1]; c=json.load(open(p))
+if c.get("transport","udp") not in ("udp","ws"):
+    print("reverse applies to transports udp and ws only; this carrier is %s — unchanged." % c.get("transport")); sys.exit(1)
+if not c.get("reverse") and isinstance(c.get("hop"),dict) and c["hop"].get("enabled"):
+    print("port hopping is on, and reverse cannot be combined with it — turn hopping off first."); sys.exit(1)
+c["reverse"]=not c.get("reverse",False)
+json.dump(c,open(p,"w"),indent=2)
+print("reverse is now %s" % ("ON: the foreign server (role b) dials, the Iran server (role a) only answers"
+                             if c["reverse"] else "off: the Iran server (role a) dials, as before"))
+PY
+  chmod 600 "$CONF"
+  warn "Set the SAME on the other server, then restart both. The foreign server's peer must be"
+  warn "this Iran server's public IP:port, and that UDP port must be open inbound here."
 }
 
 # antidpi_set_obfs — change the wire disguise in place. Must be changed on BOTH servers:
 # the two formats are not negotiated, so a mismatch means every packet fails to open.
 antidpi_set_obfs() {
   [[ -f "$CONF" ]] || { err "No config."; return 1; }
+  if [[ "$(json_get "$CONF" transport)" == "ws" ]]; then
+    err "The ws carrier takes no obfs — its cover is the TLS connection to Cloudflare. Unchanged."
+    return 1
+  fi
   printf '\n%sWire disguise%s (must match on BOTH servers)\n' "$BOLD" "$N"
   printf '  %snone%s  raw high-entropy datagrams\n' "$C" "$N"
   printf '  %squic%s  QUIC v1 cover — note: Iranian carriers were measured dropping every\n' "$C" "$N"
@@ -1800,6 +1932,7 @@ EOF
     printf '%s\n' "${D}  junk   = flow-start cover traffic${N}"
     printf '%s\n' "${D}  hop    = keyed UDP port hopping (open ports on BOTH ends; disables offload)${N}"
     printf '%s\n' "${D}  split  = IP-fragment the desync fakes${N}"
+    printf '%s\n' "${D}  reverse= the foreign server opens the UDP flow; the Iran server only answers${N}"
     cat <<EOF
 
   ${C}1${N}) toggle desync
@@ -1808,13 +1941,17 @@ EOF
   ${C}4${N}) toggle split
   ${C}5${N}) set port-hopping ports
   ${C}6${N}) change wire disguise (none/quic/quic2/dtls)
+  ${C}7${N}) toggle reverse UDP (set on BOTH servers)
   ${C}0${N}) back (restart to apply)
 EOF
     local c; c="$(ask 'Choose' '')" || return
     case "$c" in
       1) if [[ "$state" == *desync=on* ]]; then antidpi_set desync false; else antidpi_set desync true; fi ;;
       2) if [[ "$state" == *junk=on* ]]; then antidpi_set junk false; else antidpi_set junk true; fi ;;
-      3) if [[ "$state" == *hop=on* ]]; then antidpi_set hop false; else
+      3) if [[ "$state" == *hop=on* ]]; then antidpi_set hop false
+         elif [[ "$state" == *reverse=on* ]]; then
+           warn "reverse UDP is on, and port hopping cannot be combined with it — turn reverse off first (7)."; sleep 2
+         else
            antidpi_set hop true
            warn "Port hopping needs the whole port set open on BOTH servers, and disables kernel offload."
            antidpi_set_hop_ports
@@ -1822,6 +1959,7 @@ EOF
       4) if [[ "$state" == *split=on* ]]; then antidpi_set split false; else antidpi_set split true; fi ;;
       5) antidpi_set_hop_ports ;;
       6) antidpi_set_obfs; pause ;;
+      7) antidpi_toggle_reverse; pause ;;
       0) if confirm "Restart aestun now to apply changes?"; then systemctl restart "$UNIT" && msg "restarted."; fi
          return ;;
       *) warn "invalid option"; sleep 1 ;;
@@ -1906,6 +2044,10 @@ autotest() {
   # carriers, quic (v1) is exactly that case — the tunnel runs, the cover does not arrive.
   local variants=(
     "baseline|{}"
+    # The same carrier with the direction swapped: the foreign end opens the flow and this end
+    # only answers. Worth its own row because what it changes is how the path treats the flow,
+    # which nothing but a measurement on the path can say.
+    "reverse-udp|{\"transport\":\"udp\",\"obfs\":\"quic2\",\"reverse\":true}"
     "quic-v1|{\"transport\":\"udp\",\"obfs\":\"quic\"}"
     "dtls|{\"transport\":\"udp\",\"obfs\":\"dtls\"}"
     "desync+split+junk|{\"transport\":\"udp\",\"obfs\":\"quic2\",\"desync\":{\"enabled\":true,\"repeats\":6},\"split\":{\"enabled\":true},\"junk\":{\"enabled\":true}}"
@@ -1942,7 +2084,7 @@ def m(a,b):
 # reset the four method blocks to off first, so each variant is clean
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic2"
+c["transport"]="udp"; c["obfs"]="quic2"; c["reverse"]=False
 m(c,o); json.dump(c,sys.stdout)
 PY
     cp "${CONF}.try" "$CONF"
@@ -1956,13 +2098,12 @@ def m(a,b):
     return a
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic2"
+c["transport"]="udp"; c["obfs"]="quic2"; c["reverse"]=False
 m(c,o); json.dump(c,sys.stdout)
 PY
     $RSSH "cp ${RCONF}.try $RCONF" >/dev/null 2>&1
     printf '%s testing %-20s%s ' "$D" "$name" "$N"
-    $RSSH "systemctl restart $UNIT" >/dev/null 2>&1
-    systemctl restart "$UNIT" >/dev/null 2>&1
+    autotest_restart_pair
     # wait up to ~16s for rx to climb
     local up=0 r1 r2 i
     for i in 1 2 3 4 5 6 7 8; do
@@ -2109,22 +2250,36 @@ PY
       autotest_merge "${CONF}.autotest.bak" "$best_over" "$CONF"
       $RSSH "$(autotest_merge_remote_cmd "${RCONF}.autotest.bak" "$best_over" "$RCONF")" >/dev/null 2>&1
       chmod 600 "$CONF"; $RSSH "chmod 600 $RCONF" >/dev/null 2>&1
-      $RSSH "systemctl restart $UNIT" >/dev/null 2>&1; systemctl restart "$UNIT" >/dev/null 2>&1
+      autotest_restart_pair
       msg "Applied. The tunnel is now running: ${best_name}."
-      echo "Enabled: $(jq -c '{transport,obfs,desync:.desync.enabled,split:.split.enabled,junk:.junk.enabled,hop:.hop.enabled,tcp_rotate:.tcp_rotate.enabled}' "$CONF")"
+      echo "Enabled: $(jq -c '{transport,obfs,reverse,desync:.desync.enabled,split:.split.enabled,junk:.junk.enabled,hop:.hop.enabled,tcp_rotate:.tcp_rotate.enabled}' "$CONF")"
     else
       cp "${CONF}.autotest.bak" "$CONF"; $RSSH "cp ${RCONF}.autotest.bak $RCONF" >/dev/null 2>&1
-      $RSSH "systemctl restart $UNIT" >/dev/null 2>&1; systemctl restart "$UNIT" >/dev/null 2>&1
+      autotest_restart_pair
       warn "Reverted to the pre-test config on both ends."
     fi
   else
     err "No variant came up cleanly; reverting."
     cp "${CONF}.autotest.bak" "$CONF"; $RSSH "cp ${RCONF}.autotest.bak $RCONF" >/dev/null 2>&1
-    $RSSH "systemctl restart $UNIT" >/dev/null 2>&1; systemctl restart "$UNIT" >/dev/null 2>&1
+    autotest_restart_pair
   fi
   shred -u "$pwf" 2>/dev/null || rm -f "$pwf"
   rm -f "${CONF}.try" "${CONF}.best" "$RESULTFILE"
   pause
+}
+
+# autotest_restart_pair — restart both ends of the tunnel under test. Called from autotest,
+# whose $RSSH it uses. The order matters under reverse: the far end then dials, so this end —
+# the listener — has to be up first, or the dialer's opening packets land on a process that is
+# about to be replaced and the variant waits for a keepalive it may not get within the window.
+autotest_restart_pair() {
+  if [[ "$(json_get "$CONF" reverse)" == true ]]; then
+    systemctl restart "$UNIT" >/dev/null 2>&1; sleep 1
+    $RSSH "systemctl restart $UNIT" >/dev/null 2>&1
+  else
+    $RSSH "systemctl restart $UNIT" >/dev/null 2>&1
+    systemctl restart "$UNIT" >/dev/null 2>&1
+  fi
 }
 
 # autotest_merge BASE OVERRIDES OUT — merge the variant overrides onto BASE (an end's own
@@ -2139,7 +2294,7 @@ def m(a,b):
     return a
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic2"
+c["transport"]="udp"; c["obfs"]="quic2"; c["reverse"]=False
 m(c,o); json.dump(c,sys.stdout)
 PY
 }
@@ -2157,7 +2312,7 @@ def m(a,b):
     return a
 for blk in ("desync","junk","hop","split","tcp_rotate"):
     c.setdefault(blk,{})["enabled"]=False
-c["transport"]="udp"; c["obfs"]="quic2"
+c["transport"]="udp"; c["obfs"]="quic2"; c["reverse"]=False
 m(c,o); json.dump(c,open(out,"w"))
 PY
 )
@@ -2175,7 +2330,8 @@ status_line() {
   # The wire format is the thing most likely to be wrong (it has to match on both ends and
   # there are now four of them), so it belongs on the status line rather than three menus in.
   tr="$(json_get "$CONF" transport 2>/dev/null)"; ob="$(json_get "$CONF" obfs 2>/dev/null)"
-  printf '%s\n' "${D}status: ${st_c}${st}${N}${D} | ${ins} | peer: ${peer:-–} | wire: ${tr:-udp}+${ob:-none} | arch: $(arch_tag)${N}"
+  local rv=""; [[ "$(json_get "$CONF" reverse 2>/dev/null)" == true ]] && rv=" (reverse)"
+  printf '%s\n' "${D}status: ${st_c}${st}${N}${D} | ${ins} | peer: ${peer:-–} | wire: ${tr:-udp}+${ob:-none}${rv} | arch: $(arch_tag)${N}"
 }
 
 # =============================================================================
@@ -2543,6 +2699,8 @@ if buf:
 # offer is present in the file rather than silently defaulted inside the binary.
 c.setdefault("tcp_rotate",{"enabled":False,"interval_sec":15})
 c.setdefault("split",{"enabled":False,"frag_pos":24})
+# The direction switch, off: exactly what the binary assumes for a config without it.
+c.setdefault("reverse",False)
 # The ICMP carrier's block. Every value here is the binary's own default, so adding it to an
 # existing config changes nothing about how the tunnel behaves — it just makes the knobs
 # visible to the menus and to anyone reading the file.

@@ -156,6 +156,14 @@ func (u *udpCarrier) Send(pkt []byte) error {
 	return err
 }
 
+// sendTo delivers one datagram to an explicit address instead of to the peer. Only the reverse
+// listener needs it: it answers a dialer's handshake the moment that dialer authenticates,
+// which can be before roaming has made it the peer (reverse.go).
+func (u *udpCarrier) sendTo(pkt []byte, dst netip.AddrPort) error {
+	_, err := u.conn.Load().WriteToUDPAddrPort(pkt, dst)
+	return err
+}
+
 func (u *udpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) { return u.recvInto(u.rd) }
 
 // recvInto is Recv against a caller-owned reader, so N goroutines can share the socket.
@@ -295,7 +303,12 @@ func enableTTLInfo(conn *net.UDPConn) {
 // TCP is a stream, so datagram boundaries have to be restored explicitly:
 // each sealed datagram goes out as a 2-byte big-endian length followed by the bytes.
 type tcpCarrier struct {
+	// mu guards which connection is active, and is never held across I/O. Writers serialise on
+	// wmu instead. They used to share mu, and a write blocked on a full send window then held
+	// the lock the receive loop needs to find its connection: with both directions saturated,
+	// each end stopped reading because it could not write, so neither could ever write again.
 	mu   sync.Mutex
+	wmu  sync.Mutex
 	conn net.Conn
 	// Closed when the connection it belongs to is retired, so the dialer can wait for
 	// its own connection to end without racing against a replacement.
@@ -305,6 +318,14 @@ type tcpCarrier struct {
 	// 2-byte length prefix, and makes Recv skip the synthetic handshake records (tls.go).
 	tlsShape bool
 
+	// ws makes this the WebSocket carrier (ws.go): each datagram travels as one binary message,
+	// and every connection installed is a *wsConn. wsClient marks the dialing end, which masks
+	// what it sends, as RFC 6455 requires of a client; wrng supplies the masks for the sends that
+	// happen under wmu.
+	ws       bool
+	wsClient bool
+	wrng     *csprng
+
 	// Shapes bulk traffic only, and is owned by the TUN pump — keepalives and probes go out
 	// through Send untouched. nil when rate_mbps is 0.
 	pacer *pacer
@@ -312,7 +333,21 @@ type tcpCarrier struct {
 	hdr  [2]byte // length prefix, plain framing
 	rhdr [5]byte // record header, TLS framing
 	buf  []byte
-	wbuf []byte // send scratch: header+payload assembled for a single Write
+	wbuf []byte // send scratch under wmu: header+payload assembled for a single Write
+}
+
+// writeTo writes b to conn under the write lock, provided conn is still the active connection.
+// A connection replaced while the write was in flight is closed by set, which fails the write;
+// that is the replacement working, not an error worth reporting.
+func (c *tcpCarrier) writeTo(conn net.Conn, b []byte) error {
+	if c.current() != conn {
+		return nil // replaced under us; drop rather than write to a dead socket
+	}
+	_, err := conn.Write(b)
+	if err != nil && c.rotatedOut(conn) {
+		return nil
+	}
+	return err
 }
 
 // errTLSDesync means the record framing read a length that cannot be right, so the stream is
@@ -378,16 +413,17 @@ func (c *tcpCarrier) Send(pkt []byte) error {
 	if len(pkt) > 65535 {
 		return fmt.Errorf("datagram too large for framing: %d", len(pkt))
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != conn {
-		return nil // replaced under us; drop rather than write to a dead socket
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.ws {
+		c.wbuf = wsAppendFrame(c.wbuf[:0], wsOpBinary, pkt, c.maskRNG(c.wrng))
+		return c.writeTo(conn, c.wbuf)
 	}
 	// Header and payload go out in ONE write. Two writes on a TCP_NODELAY socket produce
 	// two segments per datagram, and the first is a lone 2- or 5-byte payload — which is
 	// both twice the packet rate on the wire and a signature no real TLS peer produces
 	// (a genuine implementation emits each record as one contiguous buffer). The scratch
-	// buffer is owned by the carrier and only touched under this mutex.
+	// buffer is owned by the carrier and only touched under the write lock.
 	var hdrLen int
 	if c.tlsShape {
 		// TLS application-data record header: type 0x17, version 0x0303, 2-byte length.
@@ -401,13 +437,16 @@ func (c *tcpCarrier) Send(pkt []byte) error {
 		binary.BigEndian.PutUint16(c.wbuf[:2], uint16(len(pkt)))
 	}
 	copy(c.wbuf[hdrLen:], pkt)
-	_, err := c.conn.Write(c.wbuf[:hdrLen+len(pkt)])
-	return err
+	return c.writeTo(conn, c.wbuf[:hdrLen+len(pkt)])
 }
 
 // frameInto appends one framed datagram to dst, using whichever framing this carrier speaks.
-// Split out from Send so the pump can build a run of them and pay for one write, not N.
-func (c *tcpCarrier) frameInto(dst []byte, pkt []byte) []byte {
+// Split out from Send so the pump can build a run of them and pay for one write, not N. rng is
+// the calling pump's own, for the WebSocket client's masks.
+func (c *tcpCarrier) frameInto(dst []byte, pkt []byte, rng *csprng) []byte {
+	if c.ws {
+		return wsAppendFrame(dst, wsOpBinary, pkt, c.maskRNG(rng))
+	}
 	if c.tlsShape {
 		var h [tlsRecordHeaderLen]byte
 		h[0], h[1], h[2] = tlsRecAppData, 0x03, 0x03
@@ -419,6 +458,22 @@ func (c *tcpCarrier) frameInto(dst []byte, pkt []byte) []byte {
 		dst = append(dst, h[:]...)
 	}
 	return append(dst, pkt...)
+}
+
+// maskRNG is rng on the WebSocket client, which masks, and nil on the server, which does not.
+func (c *tcpCarrier) maskRNG(rng *csprng) *csprng {
+	if c.wsClient {
+		return rng
+	}
+	return nil
+}
+
+// sendControl answers a WebSocket control frame on conn, if conn is still the active connection.
+func (c *tcpCarrier) sendControl(conn net.Conn, op byte, payload []byte) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.wbuf = wsAppendFrame(c.wbuf[:0], op, payload, c.maskRNG(c.wrng))
+	return c.writeTo(conn, c.wbuf)
 }
 
 // sendFramed writes an already-framed run of datagrams in a single Write.
@@ -436,13 +491,9 @@ func (c *tcpCarrier) sendFramed(buf []byte) error {
 	if conn == nil {
 		return nil // not connected yet; the inner protocols will retransmit
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != conn {
-		return nil // replaced under us; drop rather than write to a dead socket
-	}
-	_, err := c.conn.Write(buf)
-	return err
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return c.writeTo(conn, buf)
 }
 
 // grow returns b resized to n, reallocating only when the capacity is short.
@@ -454,6 +505,9 @@ func grow(b []byte, n int) []byte {
 }
 
 func (c *tcpCarrier) Recv() ([]byte, netip.AddrPort, uint8, error) {
+	if c.ws {
+		return c.recvWS()
+	}
 	if c.tlsShape {
 		return c.recvTLS()
 	}
@@ -524,6 +578,49 @@ func (c *tcpCarrier) recvTLS() ([]byte, netip.AddrPort, uint8, error) {
 			return c.buf[:n], netip.AddrPort{}, 0, nil
 		}
 		// Handshake, ChangeCipherSpec or Alert: cover records, not tunnel data — skip.
+	}
+}
+
+// recvWS returns the payload of the next binary WebSocket message, answering pings and a close
+// on the way. A message the listener already read to admit the connection comes out first.
+func (c *tcpCarrier) recvWS() ([]byte, netip.AddrPort, uint8, error) {
+	for {
+		conn := c.current()
+		if conn == nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		wc, ok := conn.(*wsConn)
+		if !ok {
+			return nil, netip.AddrPort{}, 0, errWSProtocol
+		}
+		if p := wc.takeFirst(); len(p) > 0 {
+			return p, netip.AddrPort{}, 0, nil
+		}
+		op, p, err := wc.rd.next()
+		if err == nil && op == wsOpClose {
+			// Echo the status code back, as the closing handshake asks, then treat the
+			// connection as gone.
+			c.sendControl(conn, wsOpClose, p[:min(len(p), 2)])
+			err = errWSClosed
+		}
+		if err != nil {
+			if c.rotatedOut(conn) {
+				continue
+			}
+			return nil, netip.AddrPort{}, 0, err
+		}
+		switch op {
+		case wsOpBinary:
+			if len(p) > 0 {
+				return p, netip.AddrPort{}, 0, nil
+			}
+		case wsOpPing:
+			if err := c.sendControl(conn, wsOpPong, p); err != nil {
+				log.Printf("ws: answering a ping failed: %v", err)
+			}
+		}
+		// Pongs and text messages carry nothing for the tunnel.
 	}
 }
 
@@ -656,6 +753,53 @@ func main() {
 				log.Fatalf("%v", err)
 			}
 			return
+		case "ws-check":
+			// Dial the WebSocket carrier's path the way the dialing end would and report each
+			// step — TCP to the CDN, TLS, the upgrade, and the CDN's own status when it fails —
+			// so a broken leg can be found before a server is switched over. It sends the far end
+			// nothing that could displace a running tunnel's connection.
+			fs := flag.NewFlagSet("ws-check", flag.ExitOnError)
+			cfgp := fs.String("config", "/etc/aestun/config.json", "config to take the ws block and key from (optional)")
+			wsURL := fs.String("url", "", "override ws.url, e.g. wss://tunnel.example.com:8443")
+			connect := fs.String("connect", "", "override ws.connect: dial this ip[:port] instead of resolving the URL host")
+			sni := fs.String("sni", "", "override ws.sni")
+			host := fs.String("host", "", "override ws.host")
+			insecure := fs.Bool("insecure", false, "skip certificate verification")
+			count := fs.Int("count", 1, "how many times to dial")
+			fs.Parse(os.Args[2:])
+			var c Config
+			if raw, err := os.ReadFile(*cfgp); err == nil {
+				if err := json.Unmarshal(raw, &c); err != nil {
+					log.Fatalf("ws-check: %s: %v", *cfgp, err)
+				}
+			}
+			c.applyDefaults()
+			psk, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(c.Key))
+			if len(psk) != 32 && c.WS.Path == "" {
+				fmt.Println("note: no key read from a config, so the tunnel's derived path is unknown here; put the real path in -url")
+			}
+			for _, o := range []struct {
+				dst *string
+				v   string
+			}{{&c.WS.URL, *wsURL}, {&c.WS.Connect, *connect}, {&c.WS.SNI, *sni}, {&c.WS.Host, *host}} {
+				if o.v != "" {
+					*o.dst = o.v
+				}
+			}
+			if *insecure {
+				c.WS.Insecure = true
+			}
+			failed := 0
+			for i := 0; i < *count; i++ {
+				if err := wsCheck(&c.WS, psk, os.Stdout); err != nil {
+					fmt.Printf("FAILED: %v\n", err)
+					failed++
+				}
+			}
+			if failed > 0 {
+				os.Exit(1)
+			}
+			return
 		}
 	}
 
@@ -675,8 +819,11 @@ func main() {
 	if cfg.Role != "a" && cfg.Role != "b" {
 		log.Fatalf("role must be \"a\" or \"b\" (different on the two servers)")
 	}
-	if cfg.Transport != "udp" && cfg.Transport != "tcp" && cfg.Transport != "icmp" {
-		log.Fatalf("transport must be \"udp\", \"tcp\" or \"icmp\"")
+	if cfg.Transport != "udp" && cfg.Transport != "tcp" && cfg.Transport != "icmp" && cfg.Transport != "ws" {
+		log.Fatalf("transport must be \"udp\", \"tcp\", \"icmp\" or \"ws\"")
+	}
+	if err := checkWS(&cfg); err != nil {
+		log.Fatalf("%v", err)
 	}
 	// The ICMP carrier is a ping payload, not a datagram protocol with a handshake to
 	// imitate. A QUIC or DTLS header inside an echo request is not cover — no real ping
@@ -696,6 +843,17 @@ func main() {
 	}
 	if cfg.Obfs == obfsDTLS && cfg.Transport == "tcp" {
 		log.Fatalf("obfs %q is a UDP record format; over TCP use obfs %q, which shapes as TLS", obfsDTLS, obfsQUIC)
+	}
+	if err := checkReverse(&cfg); err != nil {
+		log.Fatalf("%v", err)
+	}
+	if cfg.Reverse && cfg.dials() && *cfg.Keepalive == 0 {
+		// Not fatal — an explicit 0 is a choice — but on the dialing end it undoes the point of
+		// the mode: once the flow idles out of a middlebox's state table, the next packet from
+		// the inside server is no longer a reply, it is a fresh flow opened from inside.
+		log.Printf("warning: reverse with keepalive 0 on the dialing end — an idle flow ages out " +
+			"of middlebox state, and the inside server's next packet then opens a flow from inside. " +
+			"Set keepalive on this server.")
 	}
 	if cfg.Cipher != cipherAESGCM && cfg.Cipher != cipherChaCha {
 		log.Fatalf("cipher must be %q or %q (and must match on both servers)", cipherAESGCM, cipherChaCha)
@@ -727,7 +885,7 @@ func main() {
 		// The ICMP carrier's readers are spread over the queues; it uses one pump, so a
 		// second queue would only be drained on the receive side. Keep it at one.
 		queues = 1
-	case "tcp":
+	case "tcp", "ws":
 		// The stream is read back by one goroutine (a byte stream has to be), but the
 		// send side is N pumps feeding one connection: each flushes a whole framed run
 		// under the carrier's mutex, so the framing stays intact and the TUN read — which
@@ -776,6 +934,8 @@ func main() {
 		runTCP(&cfg, t, tuns)
 	case "icmp":
 		runICMP(&cfg, t, tuns)
+	case "ws":
+		runWS(&cfg, t, tuns)
 	default:
 		runUDP(&cfg, t, tuns)
 	}
@@ -982,8 +1142,9 @@ func (u *udpCarrier) rotateOnce() error {
 // Longer than one keepalive interval, so the peer has certainly roamed before it goes.
 const udpRotateGrace = 40 * time.Second
 
-// udpRotateLoop rotates the source port on a jittered timer. Only role a runs it: role b is
-// the fixed point both ends are addressed at, and two ends moving at once could lose each other.
+// udpRotateLoop rotates the source port on a jittered timer. Only the dialing end runs it — role
+// a, or role b under reverse: the listening end is the fixed point both ends are addressed at,
+// and two ends moving at once could lose each other.
 func udpRotateLoop(cfg *Config, t *Tunnel, c *udpCarrier) {
 	base := time.Duration(cfg.UDPRotate.IntervalSec) * time.Second
 	s := newSealer()
@@ -1009,8 +1170,17 @@ func udpRotateLoop(cfg *Config, t *Tunnel, c *udpCarrier) {
 
 func runUDP(cfg *Config, t *Tunnel, tuns []*os.File) {
 	// The peer is needed by every carrier (hopping sends to peer.IP:hop_port, the single
-	// socket sends to the whole AddrPort), so install it before either is built.
-	setPeerFromConfig(cfg, t)
+	// socket sends to the whole AddrPort), so install it before either is built. A reverse
+	// listener is the exception: it may send only to an address that has authenticated, so it
+	// starts with no peer at all and learns it from the first packet that does (reverse.go).
+	if t.passive {
+		if cfg.Peer != "" {
+			log.Printf("reverse: \"peer\" (%s) is not dialled on the listening end; the peer is "+
+				"whoever first authenticates", cfg.Peer)
+		}
+	} else {
+		setPeerFromConfig(cfg, t)
+	}
 
 	// Carrier selection: keyed port hopping when configured, otherwise the single socket.
 	// Port hopping trades the segmentation offload for the ability to move off a blocked
@@ -1036,10 +1206,15 @@ func runUDP(cfg *Config, t *Tunnel, tuns []*os.File) {
 	defer c.Close()
 
 	log.Printf("tunnel up - traffic ready to flow.")
+	if t.passive {
+		log.Printf("reverse: listening on %s and waiting for the peer to dial in — this end "+
+			"sends nothing until it has", cfg.Listen)
+	}
 
-	// Role a opens the flow, so it plays the client half of the synthetic handshake; role b
-	// answers whatever Initial arrives (see the receive loop below).
-	if t.obfs != nil && cfg.Role == "a" {
+	// The dialing end opens the flow, so it plays the client half of the synthetic handshake;
+	// the other end answers whatever Initial arrives (see the receive loop below). That is role
+	// a normally and role b under reverse.
+	if t.obfs != nil && cfg.dials() {
 		switch {
 		case t.obfs.wire == wireDTLS:
 			if err := sendDTLSClientHello(c, cfg.SNI); err != nil {
@@ -1056,6 +1231,12 @@ func runUDP(cfg *Config, t *Tunnel, tuns []*os.File) {
 		}
 	}
 
+	// A reverse listener stays silent until something authenticates, so the dialer says where
+	// it is now rather than at its first keepalive.
+	if cfg.Reverse && cfg.dials() {
+		go announce(c, t)
+	}
+
 	// Anti-DPI extensions (all no-ops unless configured on).
 	startDesync(cfg, t)
 	startJunk(cfg, t, c)
@@ -1065,8 +1246,9 @@ func runUDP(cfg *Config, t *Tunnel, tuns []*os.File) {
 	}
 
 	// Source-port rotation, so no single 5-tuple lives long enough to be blocked for what it
-	// has carried. Role a only, and not under port hopping, which already moves the tuple.
-	if uc, ok := c.(*udpCarrier); ok && cfg.UDPRotate.on() && cfg.Role == "a" && !cfg.Hop.on() {
+	// has carried. The dialing end only, and not under port hopping, which already moves the
+	// tuple.
+	if uc, ok := c.(*udpCarrier); ok && cfg.UDPRotate.on() && cfg.dials() && !cfg.Hop.on() {
 		log.Printf("udp_rotate on: a fresh carrier source port every ~%ds (the destination port never moves)",
 			cfg.UDPRotate.IntervalSec)
 		go udpRotateLoop(cfg, t, uc)
@@ -1077,6 +1259,8 @@ func runUDP(cfg *Config, t *Tunnel, tuns []*os.File) {
 		probe = newProbeAgent(t, c, time.Duration(t.dpi.cfg.ProbeSec)*time.Second)
 		go probe.run()
 	}
+
+	gate := newReverseGate(t, c, helloHold)
 
 	// One pump and one receive loop per TUN queue. A single goroutine doing
 	// read -> seal -> send is one core's worth of work however many cores the box has, and
@@ -1092,16 +1276,44 @@ func runUDP(cfg *Config, t *Tunnel, tuns []*os.File) {
 		wg.Add(1)
 		go func(tun *os.File) {
 			defer wg.Done()
-			udpReceiveLoop(cfg, t, c, tun, probe)
+			udpReceiveLoop(cfg, t, c, tun, probe, gate)
 		}(tuns[i])
 	}
 	wg.Wait()
 }
 
+// newReverseGate builds the reverse listener's hello gate (reverse.go), or returns nil on any
+// end that has no use for one: a dialer, a tunnel with no handshake cover to answer, or a
+// carrier other than the plain socket — checkReverse has already refused hopping under reverse.
+// A hello nobody vouches for goes to the DPI observer; one that is vouched for is answered
+// straight to its sender, which may not have become the peer yet.
+func newReverseGate(t *Tunnel, c carrier, hold time.Duration) *helloGate {
+	uc, ok := c.(*udpCarrier)
+	if !ok || !t.passive || t.obfs == nil {
+		return nil
+	}
+	return newHelloGate(hold,
+		func(h heldHello) { t.dpi.observeStranger(h.class, h.src, h.pkt, h.ttl, h.sni) },
+		func(h heldHello) error {
+			pkt, err := t.helloAnswer(h)
+			if err != nil || pkt == nil {
+				return err
+			}
+			if err := uc.sendTo(pkt, h.src); err != nil {
+				return err
+			}
+			log.Printf("reverse: answered the handshake %s opened the flow with", h.src)
+			return nil
+		})
+}
+
 // udpReceiveLoop is one receive goroutine: take a datagram off the carrier, authenticate it,
 // and write it to a TUN queue. Several run at once, each with its own reader and opener.
-func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *probeAgent) {
+// gate is the reverse listener's hello gate, nil everywhere else.
+func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *probeAgent, gate *helloGate) {
 	op := newOpener()
+	// The end that does not dial is the one that answers the handshake cover.
+	answers := !cfg.dials()
 	// The single-socket carrier can be read by several goroutines at once, each with its own
 	// scratch. The hopping carrier already funnels every socket through one channel, so it
 	// keeps the plain Recv.
@@ -1139,16 +1351,28 @@ func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *prob
 		// Handshake cover only ever appears with obfs on; without it the first byte is
 		// random nonce material and this test would discard half of all real traffic.
 		if t.obfs != nil && t.obfs.wire == wireDTLS && dtlsIsCover(pkt) {
-			// The DTLS disguise's cover flight. Same shape of exchange as the QUIC one:
-			// role b answers at most occasionally, so an unauthenticated packet cannot
+			if gate != nil && !fromPeer {
+				// A reverse listener cannot yet tell its dialer from a prober, so the hello
+				// waits for its sender to authenticate before it is answered (reverse.go).
+				if src.IsValid() {
+					offerHello(gate, t, src, pkt, ttl, evProbeQUIC, "")
+				}
+				continue
+			}
+			// The DTLS disguise's cover flight. Same shape of exchange as the QUIC one: the
+			// listening end answers at most occasionally, so an unauthenticated packet cannot
 			// turn this port into an amplifier.
 			if !fromPeer && src.IsValid() {
 				t.dpi.observeStranger(evProbeQUIC, src, pkt, ttl, "")
 			}
-			if cfg.Role == "b" && time.Since(lastInitialReply) > 30*time.Second {
+			if answers && time.Since(lastInitialReply) > 30*time.Second {
 				lastInitialReply = time.Now()
 				if err := replyDTLSHelloVerify(c); err != nil {
 					log.Printf("warning: handshake reply failed: %v", err)
+				} else if t.passive {
+					// Only the peer reaches this on a reverse listener: a dialer that came back
+					// on the address it already had.
+					log.Printf("reverse: answered the handshake %s opened the flow with", src)
 				}
 			}
 			continue
@@ -1156,6 +1380,19 @@ func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *prob
 		if t.obfs != nil && t.obfs.wire == wireQUIC && quicIsLongHeader(pkt) {
 			v, _ := quicLongVersion(pkt)
 			realQUIC := quicKnownVersion(v)
+			if gate != nil && !fromPeer {
+				// A reverse listener answers nobody it cannot vouch for and takes no connection
+				// ID from them. A real Initial may be the dialer's, so it waits for its sender
+				// to authenticate; noise that merely has the form bit set is just noise.
+				if src.IsValid() {
+					if realQUIC {
+						offerHello(gate, t, src, pkt, ttl, evProbeQUIC, quicPeekInitialSNI(pkt))
+					} else {
+						t.dpi.observeStranger(evScanUnauth, src, pkt, ttl, "")
+					}
+				}
+				continue
+			}
 			switch {
 			case !fromPeer && src.IsValid():
 				// Nobody but the peer has any reason to send this port a QUIC handshake.
@@ -1183,10 +1420,12 @@ func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *prob
 			// Answer at most occasionally: an unauthenticated packet triggers this, so an
 			// unthrottled reply would make the port an amplification source for anyone
 			// willing to spray long-header datagrams at it.
-			if cfg.Role == "b" && time.Since(lastInitialReply) > 30*time.Second {
+			if answers && time.Since(lastInitialReply) > 30*time.Second {
 				lastInitialReply = time.Now()
 				if err := replyServerInitial(c, pkt); err != nil {
 					log.Printf("warning: handshake reply failed: %v", err)
+				} else if t.passive {
+					log.Printf("reverse: answered the handshake %s opened the flow with", src)
 				}
 			}
 			continue
@@ -1215,9 +1454,12 @@ func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *prob
 		}
 
 		// Only now, after the packet has authenticated, is the source trusted enough
-		// to move the tunnel to it.
+		// to move the tunnel to it — and, on a reverse listener, to be answered.
 		if src.IsValid() {
 			t.maybeRoam(src)
+			if gate != nil {
+				confirmHello(gate, src)
+			}
 		}
 		t.dpi.observePeerPacket(seq, ttl)
 
@@ -1236,7 +1478,6 @@ func udpReceiveLoop(cfg *Config, t *Tunnel, c carrier, tun *os.File, probe *prob
 func runTCP(cfg *Config, t *Tunnel, tuns []*os.File) {
 	// The receive side reads one connection, so it writes into one queue; the send side gets
 	// a pump per queue (see the queue-count comment in main).
-	tun := tuns[0]
 	c := &tcpCarrier{buf: make([]byte, maxPktSize), tlsShape: t.tlsShape}
 	if t.tlsShape {
 		log.Printf("tcp carrier shaped as TLS (records + synthetic handshake, sni=%s)", cfg.SNI)
@@ -1288,6 +1529,14 @@ func runTCP(cfg *Config, t *Tunnel, tuns []*os.File) {
 		}()
 	}
 
+	runStream(cfg, t, c, tuns)
+}
+
+// runStream is everything a stream carrier does once its connections are being looked after —
+// by the TCP dial and accept loops above, or the WebSocket ones (wscarrier.go): the keepalive,
+// the probes, one pump per TUN queue, and the single receive loop a byte stream allows.
+func runStream(cfg *Config, t *Tunnel, c *tcpCarrier, tuns []*os.File) {
+	tun := tuns[0]
 	log.Printf("tunnel up - traffic ready to flow.")
 	startJunk(cfg, t, c)
 	if *cfg.Keepalive > 0 {
@@ -1451,7 +1700,7 @@ func pumpTCP(bc *tcpCarrier, t *Tunnel, tun *os.File) {
 		if n == 0 {
 			continue
 		}
-		batch = bc.frameInto(batch, t.sealInto(s, buf[:n]))
+		batch = bc.frameInto(batch, t.sealInto(s, buf[:n]), s.rng)
 		// Drain whatever else is already queued, but never wait for it: on a quiet link the
 		// first attempt returns nothing and the packet goes out on its own.
 		for len(batch) < maxBatchBytes {
@@ -1459,7 +1708,7 @@ func pumpTCP(bc *tcpCarrier, t *Tunnel, tun *os.File) {
 			if err != nil || m == 0 {
 				break
 			}
-			batch = bc.frameInto(batch, t.sealInto(s, buf[:m]))
+			batch = bc.frameInto(batch, t.sealInto(s, buf[:m]), s.rng)
 		}
 		flush()
 	}

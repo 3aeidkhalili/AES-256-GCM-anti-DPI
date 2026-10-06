@@ -57,9 +57,9 @@ answer here:
 | A bimodal size distribution — full-MTU bulk plus a cluster of tiny ACKs | Pads small datagrams onto size buckets, inside the encryption (§5) |
 | A perfectly periodic keepalive, which is a clean clock signature | Jitters the keepalive by ±40 % |
 
-Three values **must be identical on both servers**: `key`, `cipher`, and `obfs`. There is no
-handshake to negotiate them in — that is deliberate, because a handshake is a signature.
-Everything else is per-server.
+Three values **must be identical on both servers**: `key`, `cipher`, and `obfs` — four when the
+UDP carrier runs `reverse` (§6.4). There is no handshake to negotiate them in — that is
+deliberate, because a handshake is a signature. Everything else is per-server.
 
 ### Recommended defaults
 
@@ -137,7 +137,8 @@ sudo ./aestun.sh install
 
 The installer asks for everything, writes `/etc/aestun/config.json`, installs a systemd unit,
 and applies network tuning. Choose the Iran side as role `a` (it opens the conversation) and
-the foreign side as role `b`. Generate the key on the first server and paste the same one on
+the foreign side as role `b` — under reverse UDP (§6.4) the foreign side opens it instead, and
+the roles stay as they are. Generate the key on the first server and paste the same one on
 the second.
 
 It **compiles from the sources in the directory** whenever a Go toolchain is available or can
@@ -163,7 +164,8 @@ To run four carriers at once instead of one, see §7.
 | `role` | — | `a` or `b`; **must differ** on the two servers |
 | `key` | — | base64 of 32 bytes; **identical** on both (`aestun keygen`) |
 | `cipher` | `aes-gcm` | `aes-gcm` or `chacha20-poly1305`; **identical** on both (§10.1) |
-| `transport` | `udp` | `udp`, `tcp` or `icmp` (§6) |
+| `transport` | `udp` | `udp`, `tcp`, `icmp` or `ws` (§6) |
+| `reverse` | `false` | UDP and ws: role `b` (foreign) opens the flow and role `a` (Iran) only answers; **identical** on both (§6.4) |
 | `obfs` | `none` | `none`, `quic`, `quic2` or `dtls`; **identical** on both (§5) |
 | `listen` | `0.0.0.0:51820` | local carrier address |
 | `peer` | — | the other server's `host:port`; learned from traffic if empty |
@@ -247,6 +249,23 @@ they must be identical on both servers or every packet fails to authenticate.
 | `id_pool` | `1` | identifiers to rotate through, max 8 |
 | `id_rotate_sec` | `60` | seconds per identifier epoch |
 | `mimic_ping` | `false` | prepend the 16-byte timeval `ping(8)` sends |
+
+### `ws` — the WebSocket carrier (§6.5)
+
+One block serves both servers: each end reads the fields that apply to it.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `url` | — | dialing end: `wss://domain[:port][/path]` (or `ws://` on Cloudflare's plain-HTTP ports) |
+| `connect` | — | dialing end: dial these `ip[:port]` (comma-separated, tried in turn from the last that worked) instead of resolving the URL host; SNI/Host unchanged |
+| `host` | URL host | `Host` header |
+| `sni` | URL host | TLS server name (separate from the top-level `sni`, which is cover for `obfs`) |
+| `insecure` | `false` | skip certificate checks — only for dialling a self-signed origin directly |
+| `path` | derived from the key | request path; a path in `url` overrides it; empty or `/` derives it |
+| `rotate_sec` | `0` | replace the connection make-before-break this often, jittered; min 10 |
+| `idle_sec` | 3 × `keepalive`, ≥ 45 | redial when nothing authenticated arrives for this long; negative = off |
+| `user_agent` | desktop Chrome | the upgrade request's `User-Agent` |
+| `cert` / `cert_key` | self-signed | listening end: PEM certificate and key (Cloudflare "Full (strict)") |
 
 ---
 
@@ -345,6 +364,12 @@ payload is exactly what an inspector expects there.
 Role `a` dials and role `b` listens. `tcp_rotate` (§8.5) periodically moves the connection to a
 fresh 5-tuple, make-before-break, to dodge volumetric throttling.
 
+Fixed on 2026-10-05: the stream carrier's writers and its reader used to share one lock, and a
+write blocked on a full send window held the lock the receive loop needed to find its connection.
+With both directions saturated at once, each end stopped reading because it could not write, and the
+tunnel froze for good — reproduced 3 of 3 times in a loopback test. Writers now serialise on a lock
+of their own.
+
 ### 6.3 `icmp` — when UDP is not blocked but is broken
 
 This exists because of a measurement. On the reference link the path does something a policer
@@ -382,6 +407,184 @@ Three details make it work rather than merely look like it should:
 
 `obfs` must be `none` on this carrier: no real ping carries a QUIC header, so it would be the
 one anomalous thing about an otherwise ordinary packet. Port hopping does not apply either.
+
+### 6.4 `reverse` — the foreign server opens the flow (UDP)
+
+By default the Iran server (role `a`) dials: it sends the first packet of every carrier flow,
+plays the client side of the synthetic handshake, and is the end `udp_rotate` moves — so every
+flow on the wire is one opened from inside Iran toward a foreign address. Reverse tunnels
+(Backhaul, rathole, frp) exist because a censor does not have to treat the two directions alike:
+a flow opened from inside toward a foreign address is the kind that gets flagged or cut when the
+filter tightens, while a foreign host reaching a server inside looks like a visitor reaching a
+domestic service. `"reverse": true` gives the UDP carrier that shape and changes nothing else:
+
+| | normal | `reverse: true` |
+|---|---|---|
+| opens the flow (first packet, client hello) | role `a` — Iran | role `b` — foreign |
+| answers the handshake cover | role `b` | role `a` |
+| needs `peer` | role `a` (role `b` may learn it) | role `b` only; role `a` never dials it |
+| moves its source port (`udp_rotate`) | role `a` | role `b` |
+| must accept inbound UDP on its port | role `b` | role `a` — in the cloud firewall too |
+
+The roles keep everything else — key directions, tunnel addresses, everything the scripts derive
+from them — so the Iran server is still `a` and still `10.8.0.1`. Like `key`, `cipher` and `obfs`
+the switch is not negotiated: set it the same on **both** servers (wizard, or menu `x` → `7`).
+
+Iran server:
+
+```json
+"role": "a", "transport": "udp", "reverse": true, "listen": "0.0.0.0:51820"
+```
+
+Foreign server:
+
+```json
+"role": "b", "transport": "udp", "reverse": true, "peer": "IRAN_PUBLIC_IP:51820"
+```
+
+**The listening end is strictly passive.** It sends nothing — no keepalive, no probe, no
+handshake reply, no traffic — to an address that has not first sent it an authenticated packet,
+so every datagram it emits is the reply direction of a flow opened from abroad. Its `peer` is not
+dialled; the peer is learned from the first authenticated packet, by the same roaming that already
+follows a moving source port. The dialer sends a few sealed keepalives right behind its hello, so
+the listener learns where it is within a round trip rather than at the first keepalive.
+
+**The handshake cover still completes.** The listener has to answer the dialer's Initial (or DTLS
+ClientHello) the way a server would — an Initial nobody answers is exactly the "Unknown QUIC
+connection" a stateful classifier keys on — but the hello arrives before the dialer has
+authenticated, from an address as anonymous as a prober's. So the listener holds it until an
+authenticated packet arrives from that exact address, and only then answers it and adopts the
+connection ID it carried. A prober that sends the port a perfectly good Initial gets nothing back,
+and is filed in the DPI log as `probe.quic_initial` once the 40 s hold runs out.
+
+Limits, stated plainly:
+
+* **UDP only.** The binary refuses `reverse` with `tcp` or `icmp` — ICMP has no direction to
+  reverse, both ends send echo requests — and with `hop`, which moves both ends on a shared
+  schedule and so leaves no fixed point to dial. `aestun-mp.sh` keeps it on its two UDP carriers.
+* **The listener waits.** After it restarts it cannot send until the dialer's next packet: at most
+  one keepalive interval, ≤ 35 s at the default 25 s. Keep `keepalive` on at the dialing end — a
+  flow that idles out of a middlebox's state table turns the listener's next packet into a flow
+  opened from inside.
+* **It changes who opens the flow, not what the path does to the packets.** Measured on the
+  reference pair on 2026-10-04, while every carrier was down: the path cut each new UDP flow after
+  its first few datagrams. Inside → outside delivered ~1 % whichever end had opened the flow;
+  outside → inside delivered ~1 % when the outside opened it and 100 % as replies to a flow the
+  inside opened. ICMP and bulk TCP from inside were dropped too. Reverse cannot help a path that
+  drops the inside's packets whatever their direction; it helps where the path treats the two
+  directions differently. Auto-test (menu `t`) measures a `reverse-udp` variant on your own path.
+
+zapret (menu `z`) queues packets sent *to* the configured peer port, so under reverse it acts on
+the foreign end — the end that now opens the flow.
+
+### 6.5 `ws` — WebSocket through a CDN (Cloudflare)
+
+Every carrier above talks to the peer's own address, and on the reference path that address is
+the problem: measured on 2026-10-05, every flow the Iran server opened toward the foreign server —
+UDP, ICMP or TCP, on any port — was cut after its first ~6 packets or 8688 bytes. No disguise
+changes the destination address. A CDN does:
+
+```
+Iran (dialer) --TLS, SNI=your domain--> CDN edge --HTTP(S), same port--> foreign (listener, the origin)
+```
+
+The Iran server only ever talks to the CDN's edge — addresses it shares with a large part of the
+ordinary web — and the edge carries the bytes on over a path the censor never sees. On the wire
+it is an ordinary TLS connection carrying an HTTP/1.1 upgrade to WebSocket, then binary messages,
+one sealed tunnel datagram per message. The tunnel's own AEAD still protects every byte end to
+end; the edge terminates the TLS layer and learns nothing it can use.
+
+**Cloudflare, once:**
+
+1. DNS: an `A` record for a (sub)domain → the foreign server's IP, **Proxied** (orange cloud).
+2. SSL/TLS mode **Full** — the listener makes itself a certificate at start-up, which Full accepts.
+   Flexible works too (the listener speaks TLS and plain HTTP on the same port, told apart by the
+   first byte); Full (strict) needs a real certificate in `ws.cert` / `ws.cert_key`, e.g. a
+   Cloudflare Origin CA one.
+3. Network → WebSockets: On (the default).
+4. Pick a port from Cloudflare's TLS list — **443, 2053, 2083, 2087, 2096, 8443** — that nothing else
+   uses on the foreign server. Cloudflare connects to the origin on the port the visitor used, so the
+   listener's `listen` is that same port. Allow it inbound (TCP) on the foreign server.
+
+**Both servers** carry the same `ws` block; each end reads what applies to it:
+
+```json
+"role": "a", "transport": "ws", "obfs": "none",
+"ws": { "url": "wss://tunnel.example.com:8443" }
+```
+```json
+"role": "b", "transport": "ws", "obfs": "none", "listen": "0.0.0.0:8443",
+"ws": { "url": "wss://tunnel.example.com:8443" }
+```
+
+The request path is derived from the key, so the two ends agree without being told (the listener
+prints it at start-up); a path in the URL or in `ws.path` overrides it. `ws.connect` dials specific
+Cloudflare addresses instead of resolving the domain — for a server whose DNS cannot resolve it, or
+when some Cloudflare ranges are filtered — while SNI and `Host` stay the domain. It takes a list
+(`"104.26.8.173, 172.67.68.133"`): an address that cannot be reached is skipped and the one that
+worked is tried first next time. Measured from one Iranian network on 2026-10-05, one Cloudflare
+range timed out while another passed, and the two exited through different countries to different
+Cloudflare PoPs — so which address you dial changes both whether and how well it works.
+
+**Check before switching anything over.** On the dialing server:
+
+```bash
+aestun ws-check -config /etc/aestun/config.json            # or -url / -connect / -sni to try variants
+```
+
+It dials exactly as the carrier would and reports each step — TCP, TLS (version, ALPN, certificate),
+the upgrade — and, when the upgrade fails, the CDN's status and which leg it means: `521` nothing
+listens on the origin port (or its firewall refuses Cloudflare), `522` Cloudflare's packets to the
+origin are dropped, `525`/`526` origin TLS versus the SSL mode, `404` the path or key differ, `301`
+plain HTTP redirected (use `wss://`). It closes politely without sending data, so it never disturbs
+a running tunnel and is not filed as a probe.
+
+**Admission.** The path is a secret, but it is not what lets a connection carry the tunnel. The
+listener answers the upgrade, then waits for the first message; only if that message opens under
+the tunnel key — fresh, not a replay — does the connection replace the current one. Anything else is
+answered with nginx's own 404 and filed by the DPI observer: `probe.http` for requests that are not
+the tunnel's upgrade, and `probe.ws_unauth` (severity high) for an upgrade on the right path whose
+first message did not authenticate — whoever sent it has the path but not the key. Behind
+Cloudflare the visitor's address is taken from `CF-Connecting-IP` for the log.
+
+**Staying up.** The dialer redials with backoff when the connection drops. A CDN can keep the
+dialer's leg open after the leg to the origin has died, so the socket looks healthy and nothing
+arrives; the dialer therefore watches the peer's keepalives and replaces a connection that has
+carried nothing authenticated for `ws.idle_sec` (default 3 × keepalive, at least 45 s). Sockets use
+`TCP_USER_TIMEOUT` = 30 s, so a path that swallows a connection mid-flow surfaces in 30 s rather
+than after ~15 minutes of retransmission. `ws.rotate_sec` replaces the connection on a jittered
+timer, make-before-break, like `tcp_rotate`. Cloudflare drops a WebSocket idle for 100 s; the
+default 25 s keepalive stays well inside that.
+
+**Reverse.** `"reverse": true` works here too: the foreign server dials a domain proxied to the
+Iran server, which becomes the origin and only answers connections that authenticate. Measured on
+2026-10-05, Cloudflare could not reach the Iran server's origin (every TLS port timed out), so this
+direction depends on the Iran host accepting connections from Cloudflare's ranges.
+
+**Limits, plainly.** It is a stream carrier: one lost segment stalls every inner connection until
+it is retransmitted, as with `tcp`, so it is not a replacement for UDP where UDP works. The TLS
+ClientHello is Go's `crypto/tls`, not a browser's, so a JA3-style fingerprint tells it apart from
+Chrome. The CDN sees the WebSocket's timing and volume (not its content) and its terms of service
+apply. `obfs` must be `none` and port hopping off — the TLS connection to the CDN is the disguise.
+
+Local system test, with nginx standing in for the edge (three network namespaces, the dialer with
+no route to the origin): ~1 Gbit/s each way through a TLS→TLS edge, 686 Mbit/s with a
+plain-HTTP origin leg; recovery after an origin restart, an edge restart, and a silent outage of the
+edge's leg (watchdog, 15 s); 736 MiB intact across two make-before-break rotations; reverse up.
+
+Through real Cloudflare on 2026-10-05 — dialer on a residential Iranian connection, origin the
+foreign server in Baku, SSL mode Full, port 8443, iperf3 for 12 s:
+
+| path | RTT | up | down, 1 stream | down, 4 streams |
+|---|---|---|---|---|
+| direct, no tunnel (the baseline) | ~62 ms | 1.08 Mbit/s | 10.9 Mbit/s | — |
+| `ws` via Cloudflare 188.114.98.0 (PoP SOF) | 76 ms | 0.83 | 7.17 | 12.6 |
+| `ws` via Cloudflare 104.26.8.173 (PoP FRA) | 215 ms | 0.57 | 5.24 | 6.55 |
+
+Ping through the tunnel lost nothing (0 of 30). The uplink of that connection is ~1 Mbit/s, so the
+up column is the access line, not the carrier. The same afternoon the Iran server itself could reach
+no foreign address at all — not Cloudflare, not the foreign server, not Google — while domestic
+sites answered: no carrier can leave a host in that state, and this one is no exception.
 
 ---
 
@@ -565,9 +768,9 @@ property the protocol already had: the peer learns our address from any authenti
 
 * **nothing is negotiated** — a peer on an older build follows automatically;
 * **the destination port never moves** — no firewall on either end has to be touched;
-* **only role `a` rotates** — role b is the fixed point both ends are addressed at, and two
-  ends moving at once could lose each other. Same rule as `tcp_rotate`, where only the dialer
-  rotates.
+* **only the dialing end rotates** — role `a`, or role `b` under `reverse` (§6.4). The listening
+  end is the fixed point both ends are addressed at, and two ends moving at once could lose each
+  other. Same rule as `tcp_rotate`, where only the dialer rotates.
 
 Unlike `hop` it keeps one socket at a time, so segmentation offload is preserved and there is
 no throughput cost — `hop` measured −38 % for the same idea because it binds a whole port set
@@ -829,7 +1032,7 @@ r) Record live log to file        <- capture that stream for later / to send on 
 8) Generate new key
 9) Network optimization           <- show / apply / remove sysctl tuning
 d) DPI / probe log                <- who is probing, what the path is doing (§9.3)
-x) Anti-DPI hardening             <- desync / junk / port-hop / split (§8)
+x) Anti-DPI hardening             <- desync / junk / port-hop / split (§8), reverse UDP (§6.4)
 i) ICMP carrier settings          <- readers / batching / id rotation / ping mimicry (§6.3)
 t) Auto-test methods              <- sweep every method/protocol, apply the best
 m) Multi-protocol tunnel          <- run 4 carriers at once: failover + multipath (§7)
@@ -850,6 +1053,7 @@ u) Uninstall
 | `auth_fail` climbing | The two ends disagree on the wire: `key`, `cipher`, `obfs`, or `icmp.mimic_ping`. Not a network problem — failover will not fix it. |
 | Tunnel "up" but no traffic on the ICMP carrier | `mimic_ping` mismatch (§7). Also check ICMP echo is allowed inbound in the cloud firewall. |
 | Works, then dies after ~30 s on TCP | Volumetric throttling. Switch to UDP, or enable `tcp_rotate` (§8.5). |
+| `reverse`: the Iran server reports "no peer has dialled in" | The foreign server must run with `reverse: true` and `peer` = the Iran server's public `IP:port`; that UDP port must be open inbound on the Iran server, in the **cloud** firewall too; `key`/`cipher`/`obfs`/`reverse` must match (§6.4). |
 | Good throughput, bad ping under load | Buffers are too large — see §10.3. |
 | Rising `RcvbufErrors` | Buffer too small, or `net.core.rmem_max` below it. Run the network optimization (menu `9`). |
 | Nothing in the dashboard | Nothing is writing `/run/aestun/stats*.json`. Start the tunnel, or the multipath carriers (menu `m` → `5`). |
@@ -868,10 +1072,8 @@ go build -o aestun .                         # plain build
 > Note: `go build ./...` writes its output to `./aestun`, overwriting the shipped binary. Use
 > `go build -o <path> .`.
 
-**The tree ships no test files.** `*_test.go` targets are kept out of the distributed source to
-keep it small; `go test ./...` therefore reports `no test files`. Nothing in the shipped
-program depends on them — test files are never compiled into a binary, which is why removing
-them leaves the build byte-identical.
+This tree ships without test files. Nothing in the program depends on them — test files are
+never compiled into a binary — so their absence leaves the build byte-identical.
 
 Builds are reproducible (`CGO_ENABLED=0`, `-trimpath`), so you can check rather than trust:
 
@@ -959,6 +1161,9 @@ Europe (role `b`) — under real load, not synthesised. The most consequential r
 | `hop.go` | keyed synchronised port hopping |
 | `split.go` | IP-fragmentation of the disposable fakes |
 | `tcprotate.go` | TCP carrier connection rotation |
+| `reverse.go` | reverse UDP: which end dials, the passive listener, the hello gate |
+| `ws.go` | WebSocket carrier: RFC 6455 framing, the upgrade, admission, TLS sniffing, `ws-check` |
+| `wscarrier.go` | WebSocket carrier runtime: dial loop with watchdog and rotation, accept loop |
 | `pprof_on.go` / `pprof_off.go` | profiling endpoints, behind the `pprof` build tag |
 | `aestun.sh` | installer, management TUI, live monitor, zapret, tuning, build, NFQUEUE helper |
 | `aestun-mp.sh` | multi-protocol supervisor: health probing, failover, ECMP (§7) |

@@ -141,6 +141,8 @@ const (
 	evTTLAnomaly  = "anomaly.ttl"         // peer-addressed packet with the wrong hop count
 	evTTLChanged  = "path.ttl_changed"    // the peer's hop count moved and stayed moved
 	evPeerRoam    = "peer.roam"           // authenticated peer moved to a new address
+	evProbeHTTP   = "probe.http"          // a request to the WebSocket carrier that was not the tunnel's upgrade
+	evProbeWS     = "probe.ws_unauth"     // an upgrade on the tunnel's secret path whose first message did not authenticate
 
 	// path behaviour
 	evLossBurst  = "path.loss_burst"
@@ -390,7 +392,7 @@ func (d *dpiLogger) observeStranger(class string, src netip.AddrPort, pkt []byte
 		return
 	}
 	switch class {
-	case evProbeQUIC:
+	case evProbeQUIC, evProbeWS:
 		d.cProbes.Add(1)
 	case evProbeReplay:
 		d.cReplayed.Add(1)
@@ -614,7 +616,7 @@ func severityFor(class string, n uint64) string {
 			return sevHigh
 		}
 		return sevWarn
-	case evTTLAnomaly:
+	case evTTLAnomaly, evProbeWS:
 		return sevHigh
 	default:
 		if n > 1000 {
@@ -634,6 +636,10 @@ func messageFor(class string) string {
 		return "a stranger sent QUIC handshake packets to the carrier port — someone is checking whether this port really speaks QUIC"
 	case evScanUnauth:
 		return "unauthenticated datagrams from a source that is not the peer — background scanning, unless the rate or timing says otherwise"
+	case evProbeHTTP:
+		return "requests that are not the tunnel's upgrade reached the WebSocket carrier and were answered 404 — web scanners, or someone checking what this port serves"
+	case evProbeWS:
+		return "a WebSocket upgrade on the tunnel's secret path whose first message did not authenticate — whoever sent it knows the path but not the key"
 	default:
 		return ""
 	}
@@ -681,6 +687,12 @@ func (d *dpiLogger) pathWatch(t *Tunnel) {
 				if lastRx == 0 {
 					det["ever_received"] = false
 					msg = "sending since start-up and nothing has ever come back — the carrier flow is blocked, or the peer address, port, key or cipher does not match"
+					if t.passive {
+						// A reverse listener sends nothing until it is dialled, so "blocked"
+						// would point the operator at the wrong end entirely.
+						det["reverse"] = "listen"
+						msg = "reverse listener: no peer has dialled in since start-up — check that the far end runs with reverse on, its peer set to this server's public address and port, the same key/cipher/obfs, and that this port is open inbound"
+					}
 				}
 				d.emit(dpiEvent{Event: evBlackhole, Severity: sevHigh, Detail: det, Message: msg})
 			}

@@ -217,9 +217,19 @@ func sendDTLSClientHello(c carrier, sni string) error {
 // contact: a HelloVerifyRequest carrying a cookie, which is the standard anti-amplification
 // step and therefore the least surprising thing to see on the wire.
 func replyDTLSHelloVerify(c carrier) error {
+	rec, err := dtlsHelloVerify()
+	if err != nil {
+		return err
+	}
+	return c.Send(rec)
+}
+
+// dtlsHelloVerify builds that HelloVerifyRequest record. Separate from the send for the same
+// reason as serverInitialFor: a reverse listener addresses it to the client that asked.
+func dtlsHelloVerify() ([]byte, error) {
 	var cookie [20]byte
 	if _, err := rand.Read(cookie[:]); err != nil {
-		return err
+		return nil, err
 	}
 	body := make([]byte, 0, 3+len(cookie))
 	body = append(body, dtlsVersion[0], dtlsVersion[1])
@@ -227,7 +237,7 @@ func replyDTLSHelloVerify(c carrier) error {
 	body = append(body, cookie[:]...)
 	var seed [4]byte
 	if _, err := rand.Read(seed[:]); err != nil {
-		return err
+		return nil, err
 	}
-	return c.Send(dtlsHandshakeRecord(3 /* hello_verify_request */, 0, 0, uint64(binary.BigEndian.Uint32(seed[:])), body))
+	return dtlsHandshakeRecord(3 /* hello_verify_request */, 0, 0, uint64(binary.BigEndian.Uint32(seed[:])), body), nil
 }

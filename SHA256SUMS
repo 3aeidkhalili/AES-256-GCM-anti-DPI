@@ -1,7 +1,7 @@
 # Prebuilt aestun binaries — built from the sources in this directory.
 #
 # Go:      go1.26.5
-# Built:   2026-08-13T06:34:18Z
+# Built:   2026-10-06T19:13:14Z
 # Flags:   CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"
 #
 # The build is reproducible: -trimpath and CGO_ENABLED=0 mean the same Go version
@@ -14,9 +14,9 @@
 # aestun.sh compiles from source whenever a Go toolchain is available or can be
 # fetched; these are the fallback for a box that has neither.
 
-c38b6612c69bc031a5454463eb0845a695112002fb64e25bea816928fe299756  aestun
-c38b6612c69bc031a5454463eb0845a695112002fb64e25bea816928fe299756  aestun-linux-amd64
-3e5bb63440a5db36734d031d6812e20455e4e782676aa230db84bcad1223400a  aestun-linux-arm64
+136de5e876356a017d6f6c083078f58124a50c6cd6682e26b1be1484055acb0a  aestun
+136de5e876356a017d6f6c083078f58124a50c6cd6682e26b1be1484055acb0a  aestun-linux-amd64
+02c80a205ddc6df0cb6cc6dca73a61a001a64722bb709f6b523425d6d2d8c39c  aestun-linux-arm64
 
 # source fingerprint at build time:
-# sources: a17ece7fa763647f626e5f949bad1699ebde6119fb013d065c65bad38fc99d86  -
+# sources: 78aafe0c4d9e3a4fc5836157e4c5a0cdcd3a61b23982975a47300aafd9843da3  -

@@ -274,6 +274,12 @@ for b in ("desync","junk","hop","split","tcp_rotate"):
 # Meaningless on tcp (tcp_rotate does this job) and on icmp (no ports at all).
 c["udp_rotate"] = {"enabled": transport == "udp", "interval_sec": 900}
 
+# reverse (the foreign end opens the flow) is a UDP-carrier setting, and the binary refuses it
+# on tcp and icmp rather than ignore it. Inheriting it from config.json would put those two
+# carriers in a restart loop, so keep it on the UDP carriers only — which, because setup runs
+# on both servers from configs that agree, keeps it identical on both ends of every carrier.
+c["reverse"] = bool(c.get("reverse")) and transport == "udp"
+
 # The ICMP sub-block MUST be byte-identical on both servers. mimic_ping prepends a
 # ping(8)-style timeval to the plaintext (icmp.go), so if one end mimics and the
 # other does not, every packet crosses the network intact and then fails AEAD auth

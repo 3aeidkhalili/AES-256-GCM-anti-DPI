@@ -641,30 +641,37 @@ func sendClientInitial(c carrier, sni string, ver quicVer) ([]byte, error) {
 // unrelated connection IDs would not correspond to any real handshake, which is exactly the
 // kind of incoherence a stateful classifier is looking for.
 func replyServerInitial(c carrier, clientPkt []byte) error {
+	pkt, err := serverInitialFor(clientPkt)
+	if err != nil || pkt == nil {
+		return err
+	}
+	return c.Send(pkt)
+}
+
+// serverInitialFor builds the server Initial that answers clientPkt, or returns nil when the
+// packet is not an Initial this end can answer. Separate from the send so a reverse listener
+// can address the answer to the client that asked, before that client is its peer (reverse.go).
+func serverInitialFor(clientPkt []byte) ([]byte, error) {
 	clientDCID, clientSCID, ok := quicParseLongCIDs(clientPkt)
 	if !ok || len(clientSCID) == 0 || len(clientDCID) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Answer in the version the client opened with, not in whatever this end is configured
 	// to emit. A server that replied to a v2 Initial in v1 would be incoherent to any
 	// stateful classifier — and on a network that drops v1, the reply would simply vanish.
 	v, ok := quicLongVersion(clientPkt)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	ver, ok := quicVerByNumber(v)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	scid := make([]byte, 8)
 	if _, err := rand.Read(scid); err != nil {
-		return err
+		return nil, err
 	}
 	// Header DCID is the client's source ID; the keys still come from the client's original
 	// destination ID, per RFC 9001 §5.2.
-	pkt, err := buildInitial(ver, clientDCID, clientSCID, scid, nil, false)
-	if err != nil || pkt == nil {
-		return err
-	}
-	return c.Send(pkt)
+	return buildInitial(ver, clientDCID, clientSCID, scid, nil, false)
 }

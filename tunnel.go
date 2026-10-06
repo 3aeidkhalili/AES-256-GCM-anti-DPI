@@ -50,7 +50,8 @@ type Config struct {
 	Cipher    string `json:"cipher"`    // "aes-gcm" (default) or "chacha20-poly1305"; must match on both ends
 	Listen    string `json:"listen"`    // listen address, e.g. 0.0.0.0:51820
 	Peer      string `json:"peer"`      // peer address host:port (optional; learned from traffic if empty)
-	Transport string `json:"transport"` // carrier: "udp" (default), "tcp", or "icmp" — see icmp.go
+	Transport string `json:"transport"` // carrier: "udp" (default), "tcp", "icmp" (icmp.go) or "ws" (ws.go)
+	Reverse   bool   `json:"reverse"`   // udp/ws only: role b dials, role a only answers and never sends first — see reverse.go; must match on both ends
 
 	Obfs          string `json:"obfs"`           // "none" (default), "quic", "quic2" or "dtls" — see obfs.go / dtlsobfs.go
 	Shape         *bool  `json:"shape"`          // quantise datagram sizes when obfs is on; default true
@@ -97,6 +98,62 @@ type Config struct {
 
 	// --- ICMP carrier (only consulted when transport is "icmp"; see icmp.go) ---
 	ICMP ICMPConfig `json:"icmp"`
+
+	// --- WebSocket carrier (only consulted when transport is "ws"; see ws.go) ---
+	WS WSConfig `json:"ws"`
+}
+
+// WSConfig configures the WebSocket carrier (ws.go), the one that can ride a CDN such as
+// Cloudflare: the dialing end opens wss://<domain>:<port>/<path> on the CDN's edge, and the edge
+// proxies the upgrade to the listening end, the origin.
+//
+// The block can be copied to both servers unchanged — each end reads the fields that apply to
+// it. Path is the one thing the two ends must agree on, and by default neither has to be told:
+// it is derived from the key.
+type WSConfig struct {
+	// Dialing end. The URL names the CDN host and port the dialer opens; the scheme picks TLS
+	// (wss) or plain HTTP (ws). Cloudflare proxies WebSocket on 443, 2053, 2083, 2087, 2096 and
+	// 8443 with TLS, and on 80, 8080, 8880, 2052, 2082, 2086 and 2095 without.
+	URL       string `json:"url"`        // e.g. wss://tunnel.example.com:8443 — a path here overrides the derived one
+	Connect   string `json:"connect"`    // dial these ip[:port], comma-separated, instead of resolving the URL host; tried in turn
+	Host      string `json:"host"`       // Host header; default the URL host
+	SNI       string `json:"sni"`        // TLS server name; default the URL host (not the top-level sni, which is cover for obfs)
+	Insecure  bool   `json:"insecure"`   // skip certificate verification — only for dialling a self-signed origin directly
+	UserAgent string `json:"user_agent"` // default a current desktop browser
+	RotateSec int    `json:"rotate_sec"` // replace the connection make-before-break this often, jittered; 0 = never
+	IdleSec   int    `json:"idle_sec"`   // redial when nothing authenticated arrives for this long; default 3 x keepalive, at least 45
+
+	// Both ends. The request path; empty (or "/") derives one from the key, so both ends agree
+	// without being told. A path in URL takes its place on the dialing end.
+	Path string `json:"path"`
+
+	// Listening end. It speaks TLS and plain HTTP on the same port, told apart by the first
+	// byte, so it works behind every Cloudflare SSL mode. Without a certificate it makes a
+	// self-signed one at start-up, which "Full" accepts; "Full (strict)" needs a real one, such
+	// as a Cloudflare Origin CA certificate.
+	Cert    string `json:"cert"`     // PEM certificate file
+	CertKey string `json:"cert_key"` // PEM private key file
+}
+
+func (c *WSConfig) applyDefaults(keepalive int) {
+	if c.UserAgent == "" {
+		c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+	}
+	if c.RotateSec < 0 {
+		c.RotateSec = 0
+	} else if c.RotateSec > 0 && c.RotateSec < 10 {
+		c.RotateSec = 10 // faster than this is churn, not cover
+	}
+	if c.IdleSec < 0 {
+		c.IdleSec = 0 // an explicit negative turns the watchdog off
+	} else if c.IdleSec == 0 && keepalive > 0 {
+		// The peer's keepalive is the heartbeat this watches for: jittered, it arrives at most
+		// 1.4 intervals apart, so three intervals is two lost in a row with margin to spare.
+		c.IdleSec = 3 * keepalive
+		if c.IdleSec < 45 {
+			c.IdleSec = 45
+		}
+	}
 }
 
 // ICMPConfig tunes the ICMP carrier (icmp.go).
@@ -432,6 +489,7 @@ func (c *Config) applyDefaults() {
 	c.TCPRotate.applyDefaults()
 	c.UDPRotate.applyDefaults()
 	c.ICMP.applyDefaults()
+	c.WS.applyDefaults(*c.Keepalive)
 }
 
 // derefOr returns *p, or def when p is nil (for callers reached before applyDefaults ran).
@@ -519,6 +577,22 @@ func (r *replayWindow) check(seq uint64) bool {
 	return true
 }
 
+// fresh reports whether check would accept seq, without recording it.
+func (r *replayWindow) fresh(seq uint64) bool {
+	if seq == 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case !r.init, seq > r.last:
+		return true
+	case r.last-seq >= r.size:
+		return false
+	}
+	return !r.get(seq)
+}
+
 // ---------------------------------------------------------------------------
 // Tunnel core: encrypt / decrypt
 // ---------------------------------------------------------------------------
@@ -553,6 +627,12 @@ type Tunnel struct {
 	// When port hopping is on the peer's port changes every epoch by design, so peer identity
 	// is matched by IP alone; otherwise every hop would look like a roam. Set once at startup.
 	hopMode bool
+
+	// reverse is the config switch of the same name; passive marks the end it turns into the
+	// listener, which sends nothing to an address before that address has authenticated
+	// (reverse.go). Both set once at startup.
+	reverse bool
+	passive bool
 
 	// TCP-only: obfs=quic over a TCP carrier is shaped as TLS instead of QUIC (see tls.go),
 	// because QUIC is a UDP protocol. When set, obfs is nil (the seal stays the plain format)
@@ -620,6 +700,8 @@ func newTunnel(cfg *Config, psk []byte) *Tunnel {
 		replay:  newReplayWindow(4096),
 		dpi:     newDPILogger(&cfg.DPILog),
 		hopMode: cfg.Hop.on(),
+		reverse: cfg.Reverse,
+		passive: cfg.Reverse && !cfg.dials(),
 	}
 	if obfsIsQUIC(cfg.Obfs) || cfg.Obfs == obfsDTLS {
 		t.coverVer = quicVerFor(cfg.Obfs)
@@ -934,6 +1016,41 @@ func (t *Tunnel) openSeq(o *opener, pkt []byte) (plain []byte, seq uint64, ok bo
 	return nil, 0, false
 }
 
+// authentic reports whether pkt is a fresh packet from the peer, and consumes nothing doing so:
+// the replay window, the counters and the epoch bookkeeping are left exactly as they were. The
+// WebSocket listener asks this of a new connection's first frame before handing it the carrier,
+// and then delivers that same frame through openSeq, which must still find it fresh.
+func (t *Tunnel) authentic(o *opener, pkt []byte) bool {
+	var nonce, ct []byte
+	if t.obfs != nil {
+		if len(pkt) < obfsHeaderLen+aeadOverhead || !t.obfs.unprotectInto(pkt, &o.nonce, &o.hp) {
+			return false
+		}
+		nonce, ct = o.nonce[:], pkt[obfsHeaderLen:]
+	} else {
+		if len(pkt) < 12+aeadOverhead {
+			return false
+		}
+		nonce, ct = pkt[:12], pkt[12:]
+	}
+	if cap(o.plain) < len(ct) {
+		o.plain = make([]byte, len(ct))
+	}
+	var epochs [4]uint64
+	n := t.recvEpochs(&epochs)
+	for _, epoch := range epochs[:n] {
+		inner, err := t.recvAEAD(epoch).Open(o.plain[:0], nonce, ct, nil)
+		if err != nil {
+			continue
+		}
+		if len(inner) < innerHeaderLen {
+			return false
+		}
+		return t.replay.fresh(binary.BigEndian.Uint64(inner[0:8]))
+	}
+	return false
+}
+
 func (t *Tunnel) setPeer(a netip.AddrPort) {
 	t.peer.Store(&a)
 }
@@ -981,6 +1098,10 @@ func (t *Tunnel) maybeRoam(src netip.AddrPort) {
 	old := ""
 	if p != nil {
 		old = p.String()
+	} else if t.passive {
+		// The first authenticated packet a reverse listener has seen. Until this moment it
+		// has sent nothing at all, so this is the line that says the far end got through.
+		log.Printf("reverse: the peer dialled in from %s", src)
 	}
 	t.setPeer(src)
 	t.dpi.peerRoamed(old, src.String())
@@ -1016,6 +1137,7 @@ func (t *Tunnel) writeStats(path string) {
 			"replay_drop":    atomic.LoadUint64(&t.replayDrop),
 			"last_rx_unix":   atomic.LoadInt64(&t.lastRxUnix),
 			"now_unix":       time.Now().Unix(),
+			"reverse":        t.reverseEnd(),
 		}
 		t.dpi.addStats(s)
 		b, err := json.MarshalIndent(s, "", "  ")
@@ -1047,7 +1169,7 @@ func (t *Tunnel) describe(cfg *Config) string {
 	if cfg.RateMbps > 0 {
 		rate = fmt.Sprintf("%.0f Mbit/s", cfg.RateMbps)
 	}
-	return fmt.Sprintf("role=%s transport=%s cipher=%s obfs=%s listen=%s peer=%s mtu=%d pad_max=%d keepalive=%d rekey=%s dpi_log=%v rate=%s",
-		cfg.Role, cfg.Transport, t.suite, cfg.Obfs, cfg.Listen, cfg.Peer, cfg.MTU,
+	return fmt.Sprintf("role=%s transport=%s reverse=%s cipher=%s obfs=%s listen=%s peer=%s mtu=%d pad_max=%d keepalive=%d rekey=%s dpi_log=%v rate=%s",
+		cfg.Role, cfg.Transport, t.reverseEnd(), t.suite, cfg.Obfs, cfg.Listen, cfg.Peer, cfg.MTU,
 		derefOr(cfg.PadMax, 64), derefOr(cfg.Keepalive, 25), rekeyDesc, t.dpi.enabled(), rate)
 }

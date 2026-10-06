@@ -182,7 +182,7 @@ func newDesyncAgent(t *Tunnel, cfg *Config) *desyncAgent {
 		sni = "www.cloudflare.com"
 	}
 
-	if cfg.UDPRotate.on() && cfg.Role == "a" && cfg.Transport == "udp" && !cfg.Hop.on() {
+	if cfg.UDPRotate.on() && cfg.dials() && cfg.Transport == "udp" && !cfg.Hop.on() {
 		// The fake is pinned to the source port the carrier had when this agent was built.
 		// udp_rotate moves that port on a timer, so after the first rotation the fake shares
 		// the peer and destination port but not the exact tuple — still a plausible QUIC
